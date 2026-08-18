@@ -1,0 +1,34 @@
+[package]
+name = "noct-pool"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "noct-poold"
+path = "src/bin/noct-poold.rs"
+
+[dependencies]
+noct-core = { path = "../core" }
+# Reused for the proof-of-work selection (`NodePow`/`new_pow`) so the pool
+# validates shares with exactly the function the network uses — and so enabling
+# RandomX is one feature flag rather than duplicated wiring.
+noct-node = { path = "../node" }
+# The pool spends its own coinbase to pay miners, so it runs a real wallet.
+noct-wallet = { path = "../wallet" }
+# TLS for the HTTP surfaces. See ../tls for why it is its own crate.
+noct-tls = { path = "../tls" }
+
+hex = "0.4"
+# Generating per-miner credentials needs real randomness (see src/auth.rs), so
+# this is a runtime dependency, not only a test one.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[features]
+# Validate shares against real RandomX (needs the RandomX toolchain), matching a
+# mainnet node. Default builds use the Keccak placeholder.
+randomx = ["noct-node/randomx"]
+
+[dev-dependencies]
+# Only the tests build templates (which need randomness); the library itself is
+# deterministic and does no key generation.
+rand_core = { version = "0.6", features = ["getrandom"] }

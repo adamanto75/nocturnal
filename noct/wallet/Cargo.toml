@@ -1,0 +1,18 @@
+[package]
+name = "noct-wallet"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "noct-cli"
+path = "src/bin/noct-cli.rs"
+
+[dependencies]
+noct-core = { path = "../core" }
+# TLS for talking to a node. See ../tls for why it is its own crate.
+noct-tls = { path = "../tls" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+hex = "0.4"
+# BIP39 mnemonic seed phrases (standard English wordlist + checksum).
+bip39 = "2"

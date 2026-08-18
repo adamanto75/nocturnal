@@ -1,0 +1,56 @@
+[Unit]
+Description=Noct website + read-only block explorer (noct-web)
+Documentation=https://github.com/  # <- your repo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noct-web
+Group=noct-web
+
+# This is the only Noct process meant to be reachable by strangers, so it is the
+# one that must hold nothing worth stealing. It runs as its own user, owns no
+# keys and no chain data, and cannot reach the node's mutating endpoints: the
+# route table is an exhaustive whitelist of three GETs and there is no POST
+# handler in the binary at all.
+#
+# --node is the ADMIN RPC of a node. Point it at a node you control, over
+# loopback or a private network. If that node's RPC needs a token, pass it with
+# --node-token-file (never --node-token: a token on the command line is visible
+# in the process list to every user on the box).
+#
+# TLS: either terminate at a reverse proxy in front of this, or serve directly
+# with --tls-cert/--tls-key. If you use a proxy, also pass --trusted-proxy so
+# rate limiting counts real client IPs rather than the proxy's single address.
+ExecStart=/usr/local/bin/noct-web \
+    --listen 0.0.0.0:8080 \
+    --node 127.0.0.1:9334 \
+    --rate-limit 20
+
+Restart=on-failure
+RestartSec=5
+
+# --- hardening -------------------------------------------------------------
+# Stricter than the node's: this process needs no disk at all. The site is
+# compiled into the binary, so there is no document root to traverse into and
+# nothing to write.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# No StateDirectory / ReadWritePaths on purpose: nothing is written.
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

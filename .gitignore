@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# Secrets and wallets — NEVER commit.
+#
+# A committed private key is permanently public: rewriting history does not
+# un-publish it, because clones and forks keep the old objects. Treat any key
+# that lands here as burned and rotate it, exactly as the founder key was
+# rotated in July after being generated inside a cloud-synced folder.
+#
+# The founder/premine key deliberately lives OUTSIDE this tree
+# (C:\Users\MINE\Noct-Founder\). Keep it that way.
+# ---------------------------------------------------------------------------
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+!**/testdata/*.crt
+.env
+.env.*
+*secret*
+*.token
+rpc-token
+miners.txt
+
+# Wallet state and its pins/caches — per-user, and the address pin identifies you
+*.address
+*.subaddr
+*.cache
+wallet.key*
+
+# The demo wallet: a real private key on a retired chain. Worthless, but a
+# private key in a public repo teaches the wrong habit and confuses readers.
+demo/
+
+# ---------------------------------------------------------------------------
+# Chain and runtime state — machine-specific, large, regenerates from the network
+# ---------------------------------------------------------------------------
+blocks.dat
+blocks.dat.*
+peers.dat
+*.log
+noct/**/data/
+.noct-testnet/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+target/
+**/target/
+node_modules/
+desktop/dist/
+desktop/out/
+*.exe
+*.msi
+*.deb
+*.tgz
+*.tar.gz
+
+# RandomX vendored C++ build tree (built locally; not source we maintain)
+noct/randomx/RandomX/build/
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# Local agent/editor tooling config — machine-specific, not project source
+.claude/

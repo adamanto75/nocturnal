@@ -1,0 +1,44 @@
+[package]
+name = "noct-swap"
+version = "0.1.0"
+edition = "2021"
+
+# ETH<->NOCT atomic-swap crypto: cross-group DLEQ (ed25519<->secp256k1) plus the
+# EVM-side checks the NoctSwap contract performs.
+#
+# **Experimental and unaudited**, and nothing in the node, wallet or pool depends
+# on it — it is groundwork for a swap that is not built yet.
+#
+# It was originally kept OUT of the workspace so an experimental dependency tree
+# could not gate the money-critical build. That was reversed once it became clear
+# the real risk ran the other way: excluded code is never compiled, so it rots
+# unnoticed. It is a workspace member now, resolves against the shared lock with
+# no conflicts, and its tests run with everything else. If this tree ever *does*
+# start blocking the main build, exclude it again — but then schedule the check,
+# rather than losing it silently.
+
+[dependencies]
+# serai cross-group DLEQ. `experimental` = the cross-curve proof; `serialize` =
+# wire-encode a proof to send to the counterparty.
+dleq = { version = "0.4", features = ["experimental", "serialize"] }
+# ed25519 as an ff/group curve (serai wrapper over curve25519-dalek).
+dalek-ff-group = "0.4"
+# secp256k1 as an ff/group curve. `bits` gives Scalar: PrimeFieldBits (cross-group
+# DLEQ needs it); `ecdsa` gives public-key recovery (to replicate the contract's
+# ecrecover-ecmul discrete-log check).
+k256 = { version = "0.13", features = ["arithmetic", "bits", "ecdsa"] }
+# Ethereum keccak256 for the on-chain point commitment.
+tiny-keccak = { version = "2", features = ["keccak"] }
+# Fiat-Shamir transcript used by the proofs (imported as `transcript`, as serai does).
+transcript = { package = "flexible-transcript", version = "0.3", features = ["recommended"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+blake2 = "0.10"
+ff = "0.13"
+group = "0.13"
+hex-literal = "0.4"
+
+# Noct toolchain pins (Rust 1.82, no edition2024). Newer patch releases of these
+# transitive deps switched to edition2024 and won't parse on Cargo 1.82.
+zeroize = "=1.8.1"
+zeroize_derive = "=1.4.2"
+base64ct = "=1.6.0"

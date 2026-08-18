@@ -1,0 +1,34 @@
+[package]
+name = "noct-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# cargo-fuzz targets. This crate is EXCLUDED from the workspace (see the root
+# Cargo.toml) because libFuzzer requires a nightly toolchain, while the project
+# itself is pinned to stable 1.82.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+noct-core = { path = "../core" }
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wire_roundtrip"
+path = "fuzz_targets/wire_roundtrip.rs"
+test = false
+doc = false
+
+# Fuzzing needs debug assertions on (to catch invariant violations) but
+# optimisation for throughput.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true

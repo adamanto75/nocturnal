@@ -1,0 +1,60 @@
+{
+  "name": "noct-wallet-desktop",
+  "version": "0.1.0",
+  "description": "Noct desktop wallet",
+  "author": "Noct",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win",
+    "test": "node test-wallet-guard.js && node test-wallet-setup.js",
+    "test:e2e": "node test-e2e-setup.js"
+  },
+  "devDependencies": {
+    "electron": "^31",
+    "electron-builder": "^26.15.3",
+    "playwright-core": "^1.62.1",
+    "png-to-ico": "^3.0.2",
+    "sharp": "^0.35.3"
+  },
+  "build": {
+    "appId": "com.noct.wallet",
+    "productName": "Noct Wallet",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "wallet-guard.js",
+      "wallet-setup.js",
+      "setup-preload.js",
+      "setup.html",
+      "build/icon.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "../noct/target/release/noctd.exe",
+        "to": "bin/noctd.exe"
+      },
+      {
+        "from": "../noct/target/release/noct-walletd.exe",
+        "to": "bin/noct-walletd.exe"
+      },
+      {
+        "from": "../noct/target/release/noct-cli.exe",
+        "to": "bin/noct-cli.exe"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Noct Wallet"
+    }
+  }
+}

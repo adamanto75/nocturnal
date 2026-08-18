@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>Noct Wallet — Setup</title>
+<style>
+  :root {
+    --bg: #0e1114; --panel: #171b20; --panel2: #1f242b; --line: #2a3038;
+    --fg: #e7edf3; --muted: #8b97a6; --accent: #35d29a; --accent-dim: #1f7f63;
+    --danger: #ff6b6b; --warn: #e8b339; --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; justify-content: center; padding: 34px 20px;
+  }
+  .app { width: 100%; max-width: 540px; }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: .4px; }
+  .lede { color: var(--muted); font-size: 14px; margin: 0 0 22px; }
+  .card { background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 6px; }
+  .card p { color: var(--muted); font-size: 13.5px; margin: 0 0 14px; }
+  button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--fg); padding: 10px 15px; transition: .15s; }
+  button:hover:not(:disabled) { border-color: var(--accent-dim); }
+  button.primary { background: var(--accent); color: #06231a; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { opacity: .45; cursor: default; }
+  textarea { width: 100%; min-height: 104px; resize: vertical; font: 14px/1.6 ui-monospace, Consolas, monospace;
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 11px 12px; }
+  textarea:focus { outline: none; border-color: var(--accent-dim); }
+  .count { color: var(--muted); font-size: 12.5px; margin-top: 7px; min-height: 18px; }
+  .count.ready { color: var(--accent); }
+  .row { display: flex; gap: 9px; margin-top: 13px; flex-wrap: wrap; }
+  .note { font-size: 13px; padding: 11px 13px; border-radius: 10px; margin-top: 13px; white-space: pre-wrap; }
+  .note.err { background: rgba(255,107,107,.1); color: var(--danger); border: 1px solid #5b2b2b; }
+  .note.warn { background: rgba(232,179,57,.1); color: var(--warn); border: 1px solid #574413; }
+  .note.ok { background: rgba(53,210,154,.1); color: var(--accent); border: 1px solid var(--accent-dim); }
+  .addr { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; word-break: break-all;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; margin-top: 9px; }
+  .hide { display: none; }
+  .pinned { background: rgba(232,179,57,.08); border: 1px solid #574413; border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 16px; font-size: 13.5px; }
+  .pinned b { display: block; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; font-weight: 400; word-break: break-all; margin-top: 6px; color: var(--muted); }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Noct Wallet</h1>
+  <p class="lede" id="lede">Set up your wallet.</p>
+
+  <!-- shown only when the app has opened a wallet here before -->
+  <div class="pinned hide" id="pinnedBox">
+    The wallet key is missing, but this app has opened a wallet here before. Your coins belong to
+    that wallet — restore it with its recovery phrase to get back to it.
+    <b id="pinnedAddr"></b>
+  </div>
+
+  <!-- choose -->
+  <div id="choose">
+    <div class="card">
+      <h2>Restore an existing wallet</h2>
+      <p>Enter the 24-word recovery phrase you wrote down. This rebuilds the same wallet
+         and finds its coins on the chain.</p>
+      <button class="primary" id="goRestore">Restore from recovery phrase</button>
+    </div>
+    <div class="card">
+      <h2>Create a new wallet</h2>
+      <p>Starts an empty wallet and generates a fresh recovery phrase. Write it down
+         immediately — it is the only backup.</p>
+      <button id="goCreate">Create a new wallet</button>
+    </div>
+  </div>
+
+  <!-- restore -->
+  <div id="restore" class="hide">
+    <div class="card">
+      <h2>Recovery phrase</h2>
+      <p>Paste or type all 24 words, in order. Numbering and capitalisation are ignored.</p>
+      <textarea id="phrase" spellcheck="false" autocomplete="off" autocapitalize="off"
+                placeholder="word1 word2 word3 …"></textarea>
+      <div class="count" id="count"></div>
+
+      <div id="previewBox" class="hide">
+        <div class="note ok">This phrase opens the wallet:</div>
+        <div class="addr" id="previewAddr"></div>
+      </div>
+      <div class="note warn hide" id="warnBox"></div>
+      <div class="note err hide" id="errBox"></div>
+
+      <div class="row">
+        <button id="check">Check phrase</button>
+        <button class="primary hide" id="confirm">Restore this wallet</button>
+        <button id="back">Back</button>
+      </div>
+    </div>
+    <p class="foot">Your phrase is never sent anywhere. It is handed to the local wallet
+       tool directly, not as a command-line argument.</p>
+  </div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let previewed = null;   // the address the entered phrase opens, once checked
+  let pinned = null;      // the wallet this app was using, if any
+
+  function show(el, on) { el.classList.toggle('hide', !on); }
+
+  function resetPreview() {
+    previewed = null;
+    show($('previewBox'), false);
+    show($('warnBox'), false);
+    show($('errBox'), false);
+    show($('confirm'), false);
+  }
+
+  $('goRestore').onclick = () => { show($('choose'), false); show($('restore'), true); $('phrase').focus(); };
+  $('back').onclick = () => { show($('restore'), false); show($('choose'), true); };
+
+  $('goCreate').onclick = async () => {
+    $('goCreate').disabled = true;
+    $('goCreate').textContent = 'Creating…';
+    const r = await window.noct.create();
+    if (!r.ok) {
+      $('goCreate').disabled = false;
+      $('goCreate').textContent = 'Create a new wallet';
+      alert(r.error);
+    }
+    // on success the main process closes this window and opens the wallet
+  };
+
+  // The word count is answered by the main process, so a burst of keystrokes can
+  // resolve out of order; only the newest reply is allowed to paint.
+  let inputSeq = 0;
+  $('phrase').oninput = async () => {
+    resetPreview();
+    const seq = ++inputSeq;
+    const problem = await window.noct.problem($('phrase').value);
+    if (seq !== inputSeq) return;
+    $('count').textContent = problem || '24 of 24 words — ready to check.';
+    $('count').classList.toggle('ready', !problem);
+    $('check').disabled = !!problem;
+  };
+
+  $('check').onclick = async () => {
+    resetPreview();
+    $('check').disabled = true;
+    $('check').textContent = 'Checking…';
+    const r = await window.noct.preview($('phrase').value);
+    $('check').textContent = 'Check phrase';
+    $('check').disabled = false;
+    if (!r.ok) {
+      $('errBox').textContent = r.error;
+      show($('errBox'), true);
+      return;
+    }
+    previewed = r.address;
+    $('previewAddr').textContent = r.address;
+    show($('previewBox'), true);
+    if (r.warning) {
+      $('warnBox').textContent = r.warning;
+      show($('warnBox'), true);
+    }
+    show($('confirm'), true);
+  };
+
+  $('confirm').onclick = async () => {
+    $('confirm').disabled = true;
+    $('confirm').textContent = 'Restoring…';
+    const r = await window.noct.restore($('phrase').value);
+    if (!r.ok) {
+      $('confirm').disabled = false;
+      $('confirm').textContent = 'Restore this wallet';
+      $('errBox').textContent = r.error;
+      show($('errBox'), true);
+      return;
+    }
+    // on success the main process closes this window and opens the wallet
+  };
+
+  (async () => {
+    const info = await window.noct.info();
+    pinned = info.pinned;
+    if (pinned) {
+      $('pinnedAddr').textContent = pinned;
+      show($('pinnedBox'), true);
+      $('lede').textContent = 'Recover your wallet.';
+    }
+    $('phrase').oninput();
+  })();
+</script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+[package]
+name = "noct-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+bs58 = "0.5"
+
+# Layer 4 (amounts): Monero-compatible Bulletproofs+ over ed25519, built on
+# curve25519-dalek. These reuse Monero's audited construction, generators, and
+# byte formats so a professional audit can diff against Monero rather than
+# review novel cryptography. See amounts.rs.
+# These are the **first-party** crates from `monero-oxide` (the project serai's
+# Monero code was spun out into), published 2026-07-31. They replace the
+# third-party `-mirror` republish we used while serai's own crates.io names were
+# empty placeholders — a republish whose description said it would be deleted,
+# and whose bytes an auditor would have had to verify against serai by hand.
+#
+# Every MSRV here is <= 1.67, comfortably under the pinned 1.82 toolchain.
+#
+# Migration was proven consensus-safe before adoption: `H_p` (which derives key
+# images, `I = x·H_p(P)`) is byte-identical between the mirror's `hash_to_point`
+# and `monero_ed25519::Point::biased_hash` across 35 inputs, so no key image and
+# no historical block changes. See docs/DEPENDENCIES.md §6.
+monero-primitives = "0.1"
+monero-bulletproofs = "0.1"
+# Layer 5 (ring signatures): Monero-compatible CLSAG. Also carries `Decoys`,
+# which used to live in monero-primitives.
+monero-clsag = "0.1"
+# ed25519 types plus `Point::biased_hash` (Monero's `hash_to_ec`/Elligator 2) and
+# `Commitment`. This replaces the old `monero-generators`, which upstream split
+# into `monero-ed25519` + `monero-bulletproofs-generators`.
+monero-ed25519 = "0.1"
+# Pin below versions that require edition2024 (cargo >= 1.85); toolchain is 1.82.
+zeroize = "=1.8.1"
+zeroize_derive = "=1.4.2"
+
+[dev-dependencies]
+hex = "0.4"

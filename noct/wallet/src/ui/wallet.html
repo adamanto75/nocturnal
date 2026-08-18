@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Noct Wallet</title>
+<style>
+  :root {
+    --bg: #0e1114; --panel: #171b20; --panel2: #1f242b; --line: #2a3038;
+    --fg: #e7edf3; --muted: #8b97a6; --accent: #35d29a; --accent-dim: #1f7f63;
+    --danger: #ff6b6b; --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; justify-content: center; padding: 32px 16px;
+  }
+  .app { width: 100%; max-width: 560px; }
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 22px; }
+  header h1 { font-size: 22px; margin: 0; letter-spacing: .5px; }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  header .dot.ok { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  header .status { color: var(--muted); font-size: 13px; margin-left: auto; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 20px; margin-bottom: 16px;
+  }
+  .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+  .balance { font-size: 40px; font-weight: 600; margin: 4px 0 2px; }
+  .balance .unit { font-size: 18px; color: var(--accent); font-weight: 500; margin-left: 6px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .addr-row { display: flex; gap: 8px; align-items: stretch; margin-top: 6px; }
+  .addr {
+    flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; word-break: break-all; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; color: var(--fg);
+  }
+  button {
+    font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--fg); padding: 10px 14px; transition: .15s;
+  }
+  button:hover { border-color: var(--accent-dim); }
+  button.primary { background: var(--accent); color: #06231a; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: default; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 13px; }
+  input {
+    width: 100%; font: inherit; background: var(--panel2); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  }
+  input:focus { outline: none; border-color: var(--accent-dim); }
+  .row { display: flex; gap: 12px; }
+  .row .field { flex: 1; }
+  .send-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .send-head h2 { font-size: 15px; margin: 0; }
+  .msg { margin-top: 12px; font-size: 13.5px; padding: 10px 12px; border-radius: 10px; display: none; }
+  .msg.show { display: block; }
+  .msg.ok { background: rgba(53,210,154,.12); color: var(--accent); border: 1px solid var(--accent-dim); }
+  .msg.err { background: rgba(255,107,107,.1); color: var(--danger); border: 1px solid #5b2b2b; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 8px; }
+  .mine-stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .statval { font-size: 20px; font-weight: 600; margin-top: 4px; }
+  .statval small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .threads { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
+  .threads button { padding: 2px 11px; font-size: 17px; line-height: 1.2; }
+  .threads .statval { margin-top: 0; min-width: 26px; text-align: center; }
+  button.mining { background: var(--danger); color: #2a0a0a; border-color: var(--danger); font-weight: 600; }
+  button.mining:hover { filter: brightness(1.08); }
+  .pow-tag { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 6px; }
+  .seed-box { margin-top: 12px; display: none; }
+  .seed-box.show { display: block; }
+  .seed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .seed-grid span { font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  .seed-grid span b { color: var(--muted); font-weight: 400; margin-right: 6px; }
+  .warn { color: var(--danger); font-size: 12.5px; margin-top: 10px; }
+  .tx-list { display: flex; flex-direction: column; }
+  .tx-row { display: flex; align-items: center; gap: 12px; padding: 11px 2px; border-top: 1px solid var(--line); }
+  .tx-row:first-child { border-top: none; }
+  .tx-ico { width: 30px; height: 30px; flex: 0 0 30px; border-radius: 50%; display: flex;
+    align-items: center; justify-content: center; font-size: 15px; font-weight: 700; }
+  .tx-ico.in { background: rgba(53,210,154,.14); color: var(--accent); }
+  .tx-ico.out { background: rgba(255,107,107,.12); color: var(--danger); }
+  .tx-main { flex: 1; min-width: 0; }
+  .tx-kind { font-size: 14px; }
+  .tx-meta { color: var(--muted); font-size: 12px; margin-top: 1px; }
+  .tx-amt { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+  .tx-amt.in { color: var(--accent); }
+  .tx-amt.out { color: var(--danger); }
+  .tx-empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
+  /* The activity list is capped and scrolls on its own, so a long history
+     cannot push the rest of the wallet off the bottom of the window. */
+  .tx-scroll { max-height: 340px; overflow-y: auto; margin: -2px -4px 0; padding: 2px 4px 0; }
+  .tx-scroll::-webkit-scrollbar { width: 10px; }
+  .tx-scroll::-webkit-scrollbar-track { background: transparent; }
+  .tx-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 6px;
+    border: 3px solid var(--panel); }
+  .tx-scroll::-webkit-scrollbar-thumb:hover { background: #3a424d; }
+  .count { color: var(--muted); font-size: 13px; font-weight: 400; margin-left: 6px; }
+  .more { width: 100%; margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .seed-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .hide { display: none; }
+  /* Testnet banner. Deliberately loud and always on screen: an empty testnet
+     wallet is indistinguishable from an empty mainnet one, and mistaking the two
+     is how someone concludes their coins have vanished. */
+  .netbar { display: none; background: var(--warn, #e8b339); color: #241a00;
+    font-weight: 600; font-size: 13px; text-align: center; padding: 7px 12px;
+    border-radius: 10px; margin-bottom: 16px; letter-spacing: .3px; }
+  .netbar.show { display: block; }
+  .netbar small { display: block; font-weight: 400; opacity: .85; margin-top: 2px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="netbar" id="netbar"></div>
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1>Noct Wallet</h1>
+    <span class="status" id="status">connecting…</span>
+  </header>
+
+  <div class="card">
+    <div class="label">Balance</div>
+    <div class="balance"><span id="balance">—</span><span class="unit">NOCT</span></div>
+    <div class="sub"><span id="outputs">—</span> outputs · synced to height <span id="height">—</span></div>
+    <div class="label" style="margin-top:18px">Your address</div>
+    <div class="addr-row">
+      <div class="addr mono" id="address">—</div>
+      <button id="copy" title="Copy">Copy</button>
+    </div>
+    <div style="margin-top:12px; display:flex; align-items:center; gap:10px;">
+      <button id="newSub">New subaddress</button>
+      <span class="sub" id="subHint">a fresh, unlinkable receiving address</span>
+    </div>
+    <div class="addr-row" id="subRow" style="display:none; margin-top:8px;">
+      <div class="addr mono" id="subAddr"></div>
+      <button id="copySub" title="Copy">Copy</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="send-head">
+      <h2>Mining<span class="pow-tag" id="powname"></span></h2>
+      <button id="mineToggle">Start mining</button>
+    </div>
+    <div class="mine-stats">
+      <div>
+        <div class="label">Hashrate</div>
+        <div class="statval" id="hashrate">—</div>
+      </div>
+      <div>
+        <div class="label">Threads</div>
+        <div class="threads">
+          <button id="tMinus" title="Fewer threads">−</button>
+          <span class="statval" id="threads">—</span>
+          <button id="tPlus" title="More threads">+</button>
+        </div>
+      </div>
+      <div>
+        <div class="label">Blocks found</div>
+        <div class="statval" id="blocksFound">—</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="send-head">
+      <h2>Send</h2>
+      <button id="refresh">Refresh</button>
+    </div>
+    <div class="field">
+      <label for="to">Destination address</label>
+      <input id="to" class="mono" placeholder="C…" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="amount">Amount (NOCT)</label>
+        <input id="amount" inputmode="decimal" placeholder="0.00">
+      </div>
+      <div class="field">
+        <label for="fee">Fee (NOCT)</label>
+        <input id="fee" inputmode="decimal" value="0.01">
+      </div>
+    </div>
+    <button class="primary" id="send" style="width:100%">Send payment</button>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="send-head">
+      <h2>Activity<span class="count" id="txCount"></span></h2>
+      <button id="txToggle" aria-expanded="true" aria-controls="txScroll">Hide</button>
+    </div>
+    <div class="tx-scroll" id="txScroll">
+      <div class="tx-list" id="txList">
+        <div class="tx-empty">No transactions yet.</div>
+      </div>
+      <button class="more" id="txMore" style="display:none"></button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="send-head">
+      <h2>Backup</h2>
+      <button id="revealSeed">Reveal seed phrase</button>
+    </div>
+    <div class="sub">Your 24-word recovery phrase restores this wallet on any device.</div>
+    <div class="seed-box" id="seedBox">
+      <div class="seed-grid" id="seedGrid"></div>
+      <div class="seed-actions">
+        <button id="copySeed">Copy phrase</button>
+        <button id="checkBackup">Check my written copy</button>
+      </div>
+      <!-- Verifying a backup is only useful while the original is still in front
+           of you. A phrase with two words swapped usually still passes the BIP39
+           checksum and simply opens a different, empty wallet — which at recovery
+           time is indistinguishable from the coins being gone. -->
+      <div id="checkBox" class="hide" style="margin-top:12px">
+        <div class="sub">Type what you wrote down — don't paste it from here, or you'll
+          only be checking this screen against itself.</div>
+        <textarea id="checkPhrase" spellcheck="false" autocomplete="off" autocapitalize="off"
+                  placeholder="word1 word2 word3 …"
+                  style="width:100%;min-height:80px;resize:vertical;font:13px/1.6 ui-monospace,Consolas,monospace;background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:8px"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="primary" id="runCheck">Check it</button>
+        </div>
+        <div class="note hide" id="checkResult" style="margin-top:10px"></div>
+      </div>
+      <div class="warn">Write these words down and store them offline. Anyone who has them can spend your funds — never type them into a website or share them.</div>
+    </div>
+  </div>
+
+  <div class="foot">Local wallet · keys never leave this machine</div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  async function loadState() {
+    try {
+      const r = await fetch('/api/state');
+      const s = await r.json();
+      // Label the network before anything else. On mainnet the bar stays hidden;
+      // on a testnet it is permanent, because a balance with no chain named is
+      // how a testnet wallet gets mistaken for an emptied mainnet one.
+      if (s.network && s.network !== 'mainnet') {
+        $('netbar').textContent = s.network.toUpperCase() + ' — these coins are not real';
+        const note = document.createElement('small');
+        note.textContent = 'Test network. Nothing here has value, and these addresses do not work on mainnet.';
+        $('netbar').appendChild(note);
+        $('netbar').classList.add('show');
+        document.title = 'Noct Wallet — ' + s.network;
+      } else {
+        $('netbar').classList.remove('show');
+      }
+      $('address').textContent = s.address || '—';
+      if (s.ok) {
+        $('balance').textContent = s.balance;
+        $('outputs').textContent = s.outputs + ' (' + s.unspent + ' unspent)';
+        $('height').textContent = s.height;
+        $('dot').classList.add('ok');
+        $('status').textContent = 'synced';
+        renderHistory(s.history || []);
+      } else {
+        $('dot').classList.remove('ok');
+        $('status').textContent = s.error || 'node unreachable';
+      }
+    } catch (e) {
+      $('dot').classList.remove('ok');
+      $('status').textContent = 'daemon unreachable';
+    }
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  }
+
+  // --- activity list --------------------------------------------------------
+  // Long histories are shown a page at a time inside their own scroll area, and
+  // only re-rendered when they actually change: state is polled every 5s, and
+  // rebuilding the list on every poll would throw away the scroll position (and
+  // any partially-read row) while you were looking at it.
+  const TX_PAGE = 50;
+  let txShown = TX_PAGE;
+  let txSig = null;
+
+  function txRow(e) {
+    const inbound = e.direction === 'received';
+    const dir = inbound ? 'in' : 'out';
+    const sign = inbound ? '+' : '−';
+    let kind, meta = 'block ' + e.height;
+    if (e.coinbase) { kind = 'Mining reward'; }
+    else if (inbound) { kind = 'Received'; }
+    else { kind = 'Sent'; meta += ' · fee ' + esc(e.fee); }
+    return '<div class="tx-row">'
+      + '<div class="tx-ico ' + dir + '">' + (inbound ? '↓' : '↑') + '</div>'
+      + '<div class="tx-main"><div class="tx-kind">' + kind + '</div>'
+      + '<div class="tx-meta">' + meta + '</div></div>'
+      + '<div class="tx-amt ' + dir + '">' + sign + esc(e.amount) + ' NOCT</div>'
+      + '</div>';
+  }
+
+  /// Cheap fingerprint: length plus the ends. Enough to catch a new entry, a
+  /// reorg dropping one, or a resync replacing them.
+  function historySig(h) {
+    if (!h.length) return '0';
+    const a = h[0], b = h[h.length - 1];
+    return h.length + '|' + a.height + '|' + a.amount + '|' + b.height + '|' + b.amount;
+  }
+
+  function renderHistory(history) {
+    const sig = historySig(history) + '|' + txShown;
+    if (sig === txSig) return; // unchanged — leave the DOM (and the scroll) alone
+    txSig = sig;
+
+    $('txCount').textContent = history.length ? history.length : '';
+    const list = $('txList'), more = $('txMore');
+    if (!history.length) {
+      list.innerHTML = '<div class="tx-empty">No transactions yet.</div>';
+      more.style.display = 'none';
+      return;
+    }
+    list.innerHTML = history.slice(0, txShown).map(txRow).join('');
+    const rest = history.length - txShown;
+    more.style.display = rest > 0 ? 'block' : 'none';
+    if (rest > 0) {
+      more.textContent = 'Show ' + Math.min(TX_PAGE, rest) + ' more · ' + rest + ' older';
+    }
+    $('txMore').onclick = () => { txShown += TX_PAGE; renderHistory(history); };
+  }
+
+  function setTxCollapsed(collapsed) {
+    $('txScroll').style.display = collapsed ? 'none' : '';
+    $('txToggle').textContent = collapsed ? 'Show' : 'Hide';
+    $('txToggle').setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    try { localStorage.setItem('noct.tx.collapsed', collapsed ? '1' : '0'); } catch (e) {}
+  }
+
+  $('txToggle').onclick = () => setTxCollapsed($('txScroll').style.display !== 'none');
+
+  /// Put `text` on the clipboard, reporting whether it worked.
+  ///
+  /// `navigator.clipboard` needs both a secure context and a live user gesture,
+  /// and refuses outright in some embeddings. Falling back to a throwaway
+  /// textarea keeps the button honest: it either copies or says it did not.
+  async function copyText(text) {
+    if (!text) return false;
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) { /* fall through to the legacy path */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) { return false; }
+  }
+
+  /// Copy, then say so on the button itself and put it back after a moment.
+  async function copyToButton(btn, text, label, done) {
+    const ok = await copyText(text);
+    btn.textContent = ok ? (done || 'Copied') : 'Copy failed';
+    setTimeout(() => { btn.textContent = label; }, ok ? 1600 : 2200);
+  }
+
+  function showMsg(text, ok) {
+    const m = $('msg');
+    m.textContent = text;
+    m.className = 'msg show ' + (ok ? 'ok' : 'err');
+  }
+
+  $('copy').onclick = () => copyToButton($('copy'), $('address').textContent, 'Copy');
+
+  $('newSub').onclick = async () => {
+    $('newSub').disabled = true;
+    try {
+      const r = await (await fetch('/api/subaddress', { method: 'POST' })).json();
+      if (r.ok) {
+        $('subAddr').textContent = r.address;
+        $('subHint').textContent = 'subaddress #' + r.index + ' — share it to receive privately';
+        $('subRow').style.display = 'flex';
+      } else {
+        showMsg('Could not create subaddress: ' + (r.error || 'unknown'), false);
+      }
+    } catch (e) {
+      showMsg('Could not create subaddress: ' + e, false);
+    } finally {
+      $('newSub').disabled = false;
+    }
+  };
+
+  $('copySub').onclick = () => copyToButton($('copySub'), $('subAddr').textContent, 'Copy');
+
+  $('refresh').onclick = loadState;
+
+  $('send').onclick = async () => {
+    const to = $('to').value.trim();
+    const amount = $('amount').value.trim();
+    const fee = $('fee').value.trim() || '0.01';
+    if (!to || !amount) { showMsg('Enter a destination and amount.', false); return; }
+    $('send').disabled = true; $('send').textContent = 'Sending…';
+    try {
+      const body = 'to=' + encodeURIComponent(to) + '&amount=' + encodeURIComponent(amount) + '&fee=' + encodeURIComponent(fee);
+      const r = await fetch('/api/send', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+      const res = await r.json();
+      if (res.ok) {
+        showMsg(res.message + '  (txid ' + res.txid.slice(0, 16) + '…)', true);
+        $('to').value = ''; $('amount').value = '';
+        loadState();
+      } else {
+        showMsg('Error: ' + res.error, false);
+      }
+    } catch (e) {
+      showMsg('Request failed: ' + e, false);
+    } finally {
+      $('send').disabled = false; $('send').textContent = 'Send payment';
+    }
+  };
+
+  // --- mining ---------------------------------------------------------------
+  const hwThreads = navigator.hardwareConcurrency || 8;
+  let mineActive = false;
+  let curThreads = 1;
+
+  function fmtRate(h) {
+    if (h >= 1e6) return (h / 1e6).toFixed(2) + ' <small>MH/s</small>';
+    if (h >= 1e3) return (h / 1e3).toFixed(2) + ' <small>kH/s</small>';
+    return h + ' <small>H/s</small>';
+  }
+
+  async function loadMining() {
+    try {
+      const m = await (await fetch('/api/mining')).json();
+      if (m.error !== undefined) return;
+      mineActive = !!m.active;
+      curThreads = m.threads;
+      $('hashrate').innerHTML = mineActive ? fmtRate(m.hashrate) : '<small>idle</small>';
+      $('threads').textContent = m.threads;
+      $('blocksFound').textContent = m.blocks_found;
+      if (m.pow) $('powname').textContent = '· ' + m.pow;
+      const btn = $('mineToggle');
+      btn.textContent = mineActive ? 'Stop mining' : 'Start mining';
+      btn.className = mineActive ? 'mining' : '';
+    } catch (e) { /* keep last values */ }
+  }
+
+  $('mineToggle').onclick = async () => {
+    const path = mineActive ? '/api/mining/stop' : '/api/mining/start';
+    const body = mineActive ? '' : String(curThreads);
+    $('mineToggle').disabled = true;
+    try { await fetch(path, { method: 'POST', body }); await loadMining(); }
+    finally { $('mineToggle').disabled = false; }
+  };
+
+  async function setThreads(n) {
+    n = Math.max(1, Math.min(hwThreads, n));
+    await fetch('/api/mining/threads', { method: 'POST', body: String(n) });
+    await loadMining();
+  }
+  $('tMinus').onclick = () => setThreads(curThreads - 1);
+  $('tPlus').onclick = () => setThreads(curThreads + 1);
+
+  // --- backup: reveal seed phrase ------------------------------------------
+  // Held only while the phrase is on screen; hiding it drops the copy too, so
+  // the button cannot put a concealed phrase on the clipboard.
+  let seedPhrase = '';
+
+  $('revealSeed').onclick = async () => {
+    const box = $('seedBox'), grid = $('seedGrid'), btn = $('revealSeed');
+    if (box.classList.contains('show')) {
+      box.classList.remove('show'); grid.innerHTML = ''; seedPhrase = '';
+      btn.textContent = 'Reveal seed phrase';
+      return;
+    }
+    try {
+      const r = await (await fetch('/api/seed')).json();
+      const words = (r.phrase || '').split(/\s+/).filter(Boolean);
+      seedPhrase = words.join(' ');
+      grid.innerHTML = words.map((w, i) => '<span><b>' + (i + 1) + '</b>' + esc(w) + '</span>').join('');
+      box.classList.add('show');
+      btn.textContent = 'Hide';
+    } catch (e) { showMsg('Could not load seed phrase: ' + e, false); }
+  };
+
+  $('copySeed').onclick = () =>
+    copyToButton($('copySeed'), seedPhrase, 'Copy phrase', 'Copied — paste it somewhere offline');
+
+  // --- verify a written backup ----------------------------------------------
+  $('checkBackup').onclick = () => {
+    const box = $('checkBox');
+    const opening = box.classList.contains('hide');
+    box.classList.toggle('hide', !opening);
+    $('checkBackup').textContent = opening ? 'Hide check' : 'Check my written copy';
+    if (opening) $('checkPhrase').focus();
+  };
+
+  $('runCheck').onclick = async () => {
+    const res = $('checkResult'), btn = $('runCheck');
+    btn.disabled = true; btn.textContent = 'Checking…';
+    try {
+      const body = 'phrase=' + encodeURIComponent($('checkPhrase').value);
+      const r = await (await fetch('/api/verify-seed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      })).json();
+      res.textContent = r.ok ? r.message : (r.error || 'Could not check that.');
+      res.className = 'note ' + (r.ok && r.matches ? 'ok' : 'err');
+      res.classList.remove('hide');
+      // Clear what was typed once it has served its purpose — no reason to leave
+      // a second copy of the phrase sitting in the page.
+      if (r.ok && r.matches) $('checkPhrase').value = '';
+    } catch (e) {
+      res.textContent = 'Could not check that: ' + e;
+      res.className = 'note err';
+      res.classList.remove('hide');
+    } finally {
+      btn.disabled = false; btn.textContent = 'Check it';
+    }
+  };
+
+  try { setTxCollapsed(localStorage.getItem('noct.tx.collapsed') === '1'); }
+  catch (e) { setTxCollapsed(false); }
+  loadState();
+  setInterval(loadState, 5000);
+  loadMining();
+  setInterval(loadMining, 1000);
+</script>
+</body>
+</html>

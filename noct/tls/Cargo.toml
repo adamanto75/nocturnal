@@ -1,0 +1,31 @@
+[package]
+name = "noct-tls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# TLS itself. rustls rather than OpenSSL: a memory-safe implementation with a
+# far smaller attack surface, no system library to keep patched, and no C build
+# step on the platforms Noct ships to.
+#
+# `ring` rather than the default `aws-lc-rs` backend purely for buildability:
+# aws-lc-rs needs cmake + nasm on Windows, and this crate has to build in the
+# same plain shell as the rest of the workspace.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+# The operating system's trust store, so a pool with an ordinary Let's Encrypt
+# certificate is verified the same way a browser would verify it.
+rustls-native-certs = "0.8"
+# Certificate fingerprints for the pinned-trust path.
+sha2 = "0.10"
+# Self-signed certificate generation, so an operator without a domain name can
+# still turn TLS on. See `selfsigned`.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+hex = "0.4"
+
+# --- pins, not preferences --------------------------------------------------
+# Both of these publish releases requiring Cargo's `edition2024` feature, which
+# does not exist in the pinned 1.82 toolchain. Pinned to the last version that
+# builds; see docs/DEPENDENCIES.md.
+zeroize = "=1.8.1"
+time = "=0.3.36"

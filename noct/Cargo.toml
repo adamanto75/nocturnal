@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["core", "tls", "wallet", "node", "pool", "swap", "web"]
+# `randomx` builds the RandomX C++ library (needs cmake + a C++ toolchain), so it
+# is excluded from the default workspace: `cargo test` and the three binaries all
+# build in a plain shell. Build it explicitly from an MSVC/cmake environment.
+# `fuzz` holds the cargo-fuzz (libFuzzer) targets, which require a **nightly**
+# toolchain; excluded so the stable 1.82 build and `cargo test` are unaffected.
+#
+# `swap` used to be excluded too (experimental cross-group DLEQ). It is a member
+# again: nothing depends on it, so exclusion meant it was never compiled and
+# could rot unnoticed — the worse failure of the two.
+exclude = ["randomx", "fuzz"]

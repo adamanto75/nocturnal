@@ -1,0 +1,51 @@
+[Unit]
+Description=Noct seed node (noctd)
+Documentation=https://github.com/  # <- your repo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noct
+Group=noct
+
+# Public P2P so peers can reach this seed; RPC bound to localhost ONLY.
+# The RPC controls mining and accepts blocks and transactions — keep it local and
+# manage it over SSH / a localhost tunnel.
+#
+# If you must serve the RPC off-box (e.g. remote miners or a pool), you MUST
+# authenticate it: noctd refuses to start on a non-loopback RPC address without a
+# token. Add a token file readable only by the noct user, e.g.
+#     --rpc 0.0.0.0:9334 \
+#     --rpc-token-file /etc/noct/rpc-token \
+# and create it with:  install -o noct -g noct -m 0400 <(openssl rand -hex 32) /etc/noct/rpc-token
+# Prefer --rpc-token-file over --rpc-token: a token on the command line is
+# visible in the process list.
+#
+# To peer this seed with other known seeds, add one `--seed HOST:9333` per seed
+# on its own continuation line (backslash-terminated), e.g.:
+#     --seed 203.0.113.20:9333 \
+ExecStart=/usr/local/bin/noctd \
+    --p2p 0.0.0.0:9333 \
+    --rpc 127.0.0.1:9334 \
+    --data-dir /var/lib/noct \
+    --max-outbound 24
+
+Restart=on-failure
+RestartSec=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+StateDirectory=noct
+ReadWritePaths=/var/lib/noct
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

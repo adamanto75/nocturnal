@@ -1,0 +1,12 @@
+[package]
+name = "noct-randomx"
+version = "0.1.0"
+edition = "2021"
+
+# Real RandomX proof of work for Noct. Kept out of the default workspace because
+# building it compiles the RandomX C++ library (cmake + a C++ toolchain).
+
+[dependencies]
+noct-core = { path = "../core" }
+randomx-rs = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }

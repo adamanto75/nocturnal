@@ -1,0 +1,18 @@
+[package]
+name = "noct-web"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "noct-web"
+path = "src/main.rs"
+
+[dependencies]
+# Decoding blocks so the explorer can show real fields rather than raw hex.
+noct-core = { path = "../core" }
+# `NodeClient` — the same authenticated client the wallet uses to reach a node.
+noct-wallet = { path = "../wallet" }
+# TLS for the public listener, and the rate limiter comes from the node.
+noct-tls = { path = "../tls" }
+noct-node = { path = "../node" }
+hex = "0.4"

@@ -1,0 +1,28 @@
+[package]
+name = "noct-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "noctd"
+path = "src/bin/noctd.rs"
+
+[[bin]]
+name = "noct-miner"
+path = "src/bin/noct-miner.rs"
+
+[dependencies]
+noct-core = { path = "../core" }
+noct-wallet = { path = "../wallet" }
+# TLS for the HTTP surfaces. See ../tls for why it is its own crate.
+noct-tls = { path = "../tls" }
+
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+# Optional: real RandomX PoW. Off by default so `noctd` builds in a plain shell;
+# enabling it pulls in the RandomX C++ build (needs cmake + a C++ toolchain).
+noct-randomx = { path = "../randomx", optional = true }
+
+[features]
+# Build the node on real RandomX instead of the Keccak placeholder.
+randomx = ["dep:noct-randomx"]
