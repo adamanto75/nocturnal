@@ -93,10 +93,15 @@ pub fn client_ip(
 /// denial-of-service lever — so they cost proportionally more. A client can make
 /// ~200 template requests per second at the default rate, but ~2000 status reads.
 fn request_cost(method: &str, path: &str) -> u32 {
+    // Strip any query defensively. Routing already passes a clean path, but this
+    // function decides how much an endpoint costs to serve, and under-charging an
+    // expensive one is a denial-of-service hole rather than a cosmetic slip. It
+    // must be correct for whatever it is handed, not only for today's caller.
+    let path = path.split('?').next().unwrap_or(path);
     match (method, path) {
         // Builds a coinbase (elliptic-curve work) and selects mempool
         // transactions, all under the consensus lock.
-        (_, p) if p.starts_with("/getblocktemplate") => 10,
+        (_, "/getblocktemplate") => 10,
         // Full block validation, then a flood to peers.
         ("POST", "/submitblock") | ("POST", "/mine") => 10,
         // Full transaction validation (range proof + ring signatures).
@@ -300,7 +305,23 @@ fn handle_client(
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
+
+    // Split the query off ONCE, and route on the path alone.
+    //
+    // These were previously matched together, so every arm had to remember to
+    // accept its own query string. `/getblocktemplate` did; `/submitblock` did
+    // not — and `noct-miner` always posts `/submitblock?address=...`, so every
+    // solved block it submitted was answered with 404 and thrown away. External
+    // mining had never once worked, and the symptom was a chain that simply
+    // stopped advancing.
+    //
+    // Routing on the path makes that impossible to reintroduce for any future
+    // endpoint rather than fixing the one that happened to be broken.
+    let raw_target = parts.next().unwrap_or("").to_string();
+    let (path, query) = match raw_target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (raw_target.clone(), String::new()),
+    };
 
     // Rate-limit before authenticating, so an unauthenticated flood is bounded
     // too — otherwise anyone able to reach the port could spend our CPU on
@@ -478,10 +499,8 @@ fn handle_client(
         // own miner address). The miner varies `header.nonce`, computes the PoW
         // hash (keyed to `seed_hash`), and submits the solved block to
         // /submitblock once it meets `difficulty`.
-        ("GET", p) if p == "/getblocktemplate" || p.starts_with("/getblocktemplate?") => {
-            let address_param = p
-                .split_once('?')
-                .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("address=")));
+        ("GET", "/getblocktemplate") => {
+            let address_param = query.split('&').find_map(|kv| kv.strip_prefix("address="));
             let address = match address_param {
                 Some(a) => match Address::decode(a) {
                     Ok(addr) => Some(addr),
@@ -638,6 +657,45 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         // ~50 units should have refilled; ask for fewer to stay clear of timer slop.
         assert!(limiter.allow(client, 10), "bucket refills as time passes");
+    }
+
+    /// A query string must not change which endpoint is reached.
+    ///
+    /// `noct-miner` posts `/submitblock?address=...`. That used to miss the
+    /// `("POST", "/submitblock")` arm entirely and 404, so every block it solved
+    /// was discarded and external mining silently did nothing at all. Routing now
+    /// happens on the path alone; this pins that.
+    #[test]
+    fn a_query_string_does_not_change_the_route() {
+        let split = |t: &str| -> (String, String) {
+            match t.split_once('?') {
+                Some((p, q)) => (p.to_string(), q.to_string()),
+                None => (t.to_string(), String::new()),
+            }
+        };
+
+        for (target, expect_path) in [
+            ("/submitblock?address=Xabc&worker=rig1", "/submitblock"),
+            ("/submitblock", "/submitblock"),
+            ("/getblocktemplate?address=Xabc", "/getblocktemplate"),
+            ("/getblocktemplate", "/getblocktemplate"),
+            ("/info?x=1", "/info"),
+        ] {
+            let (path, _q) = split(target);
+            assert_eq!(path, expect_path, "`{target}` routed to `{path}`");
+        }
+
+        // And the query must still be readable where an endpoint needs it.
+        let (_, q) = split("/getblocktemplate?address=Xabc&worker=rig1");
+        assert_eq!(
+            q.split('&').find_map(|kv| kv.strip_prefix("address=")),
+            Some("Xabc")
+        );
+
+        // Cost must not collapse to the cheap default just because a query was
+        // appended — that would make the expensive endpoints unmetered.
+        assert_eq!(request_cost("POST", "/submitblock"), 10);
+        assert_eq!(request_cost("GET", "/getblocktemplate"), 10);
     }
 
     #[test]

@@ -74,7 +74,7 @@ allocation independently verifiable and gives the network coins to move around
 without waiting to mine them.
 
 ```
-address: C8g2g3XDmz3N3dgXLgBSwqVNt77cHWHsUp5fzVcGv7sJktzY4J9Vh2Ahrj4G2rnD6nFH5uU2HcaueNMfGixCS1Bn6SfCDY
+address: XmQRpMcRB9BFGfjhZuSzCs1n9yhLZN9QjscBoJd4ron1RtnHT85HptEAFybRLMEGAWyCWBPWXDj61kBCPTmhY8AQCMbSE1
 
 phrase:  solve leave enact inform twin bleak picture swarm slim animal spell
          evidence memory share index lemon soft drama hire utility scorpion
@@ -94,7 +94,7 @@ The genesis constants derived from that address are checked into `params.rs` and
 are reproducible — anyone can regenerate and compare them:
 
 ```bash
-NOCT_TESTNET_ADDRESS=C8g2g3XDmz3N3dgXLgBSwqVNt77cHWHsUp5fzVcGv7sJktzY4J9Vh2Ahrj4G2rnD6nFH5uU2HcaueNMfGixCS1Bn6SfCDY \
+NOCT_TESTNET_ADDRESS=XmQRpMcRB9BFGfjhZuSzCs1n9yhLZN9QjscBoJd4ron1RtnHT85HptEAFybRLMEGAWyCWBPWXDj61kBCPTmhY8AQCMbSE1 \
   cargo test -p noct-core print_testnet_genesis_params -- --ignored --nocapture
 ```
 
