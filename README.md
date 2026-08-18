@@ -15,9 +15,12 @@ unlinkable one-time recipient addresses, CPU-friendly proof of work.
 >   review is not a substitute for a professional audit, and none has been
 >   commissioned.
 > * **50% premine.** The planned mainnet genesis mints 500,000 NOCT — half the
->   supply parameter — to the founder. This is a deliberate policy decision, and
->   it is the single most consequential economic parameter here. Judge it
->   accordingly.
+>   supply parameter — to the founder, earmarked for a professional audit,
+>   community work, marketing and running costs. That is a stated intention: the
+>   allocation sits in one wallet, with no vesting, multisig or published
+>   accounting enforcing it yet. It is the single most consequential economic
+>   parameter here — judge it accordingly, and see the whitepaper for the argument
+>   both ways.
 > * **Placeholder parameters.** Mainnet genesis timestamp, address tags and the
 >   RandomX seed schedule are not final.
 

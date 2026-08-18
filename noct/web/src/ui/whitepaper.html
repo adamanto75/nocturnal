@@ -104,10 +104,51 @@
      website, the README, the specification and the security review — rather than discovered later
      by someone reading a genesis block. It is a fixed, verifiable, one-time number rather than an
      ongoing founder's reward or a permanent tax on every block. There is no sale, no allocation
-     round, no private round at a better price, and nothing being offered to anyone.</p>
-  <p><b>What is not yet decided.</b> Whether the allocation vests, burns down over time, or funds
-     anything specific. Until that question is answered publicly and verifiably, the honest
-     description is the plain one: half the coin, held by one person.</p>
+     round, no private round at a better price, and nothing being offered to anyone. And it is
+     earmarked for work the project genuinely cannot do without — an audit above all, which costs
+     real money and which no volunteer effort substitutes for.</p>
+  <p><b>What it is for.</b> The allocation exists to fund the project rather than
+     to enrich its author, and specifically to pay for:</p>
+  <ul>
+    <li><b>A professional security audit.</b> The largest single line item and the
+        one the project most needs. An audit of a chain this size is a five-figure
+        engagement, it cannot be done with goodwill, and shipping money software
+        without one would be indefensible.</li>
+    <li><b>Community.</b> Faucets, bounties for people who find real bugs, grants
+        for wallet and tooling work, and paying contributors who are not the
+        founder.</li>
+    <li><b>Marketing and listings.</b> Making the coin findable by the people it is
+        for, and meeting the costs exchanges and aggregators charge.</li>
+    <li><b>Infrastructure.</b> Seed nodes, explorers, build and release
+        machinery — the parts that must keep running whether or not anyone is
+        paying attention.</li>
+    <li><b>Ongoing development</b> and the project's other operating costs.</li>
+  </ul>
+
+  <p><b>What that is worth, stated honestly.</b> The paragraph above is a
+     <em>stated intention</em>, not an enforceable commitment, and you should read
+     it as exactly that. Today the allocation sits in a single wallet controlled by
+     one person. Nothing on-chain compels it to be spent this way, no schedule
+     releases it gradually, no second signature is required, and no third party can
+     block a transaction. A reader who treats "it is for the community" as a
+     guarantee has misread the situation; a reader who treats it as a claim to be
+     verified later has it right.</p>
+
+  <p><b>What would make it verifiable.</b> Intentions become checkable when they
+     leave the prose and enter the chain. None of the following is in place yet,
+     and each is a fair thing to ask for before extending trust:</p>
+  <ul>
+    <li>Publishing the premine address so that every movement out of it can be
+        watched by anyone.</li>
+    <li>A vesting or time-lock schedule, so the whole balance cannot move at once.</li>
+    <li>Multisig control, so no single person — including the founder — can spend
+        it alone.</li>
+    <li>Published accounting of what was spent and on what.</li>
+  </ul>
+  <p>Until those exist, the accurate description remains the plain one: half the
+     coin, held by one person, with a stated purpose and no mechanism enforcing it.
+     That is a weaker claim than most projects make, and it is the true one.</p>
+
   <p class="muted">On testnet the premine is a tenth of this and its seed phrase is published in the
      repository, so the mechanism is independently verifiable and the coins are unmistakably
      worthless.</p>
@@ -140,7 +181,9 @@
     <li>A long and genuinely adversarial testnet</li>
     <li>A professional third-party audit, which has not been commissioned</li>
     <li>Gamma-calibrated decoy selection</li>
-    <li>A published, verifiable decision on the premine's disposition</li>
+    <li>A <em>mechanism</em> binding the premine to its stated purpose — a published
+        address, vesting, multisig, and spending accounts. The intention is now on
+        the record; nothing yet enforces it.</li>
   </ul>
   <p>Until those are done, Nocturnal is a research chain with a working implementation. It is not
      money, and nothing here is an offer or investment advice. It is published now so that it can
