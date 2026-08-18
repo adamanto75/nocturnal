@@ -147,7 +147,7 @@ function pinMismatchMessage(pinned, found) {
     'The wallet key on disk is NOT the wallet this app has been using.\n\n' +
     'Previously:  ' + pinned + '\n' +
     'Key file is: ' + found + '\n\n' +
-    'Noct Wallet did NOT open. Opening would show the balance of a different ' +
+    'Nocturnal Wallet did NOT open. Opening would show the balance of a different ' +
     'wallet — which looks exactly like funds going missing, and could lead you to ' +
     'believe the original wallet is empty.\n\n' +
     'Your coins live in the key that produced the first address above. Restore ' +
@@ -167,7 +167,7 @@ function missingKeyMessage(pinned, dataDir) {
     'balance as though your coins had disappeared — they have not; they belong to ' +
     'the key above.\n\n' +
     'If the folder is simply unavailable right now (antivirus, backup or sync ' +
-    'software can hide it briefly), close this and start Noct Wallet again. ' +
+    'software can hide it briefly), close this and start Nocturnal Wallet again. ' +
     'Otherwise restore wallet.key, or recover it from your 24-word seed phrase.'
   );
 }
@@ -179,10 +179,10 @@ function wrongWalletMessage(expected, actual) {
     'different wallet than the one on disk.\n\n' +
     'Your wallet:   ' + expected + '\n' +
     'Being served:  ' + (actual || '(unknown)') + '\n\n' +
-    'Noct Wallet did NOT open, because showing you the wrong balance would be ' +
+    'Nocturnal Wallet did NOT open, because showing you the wrong balance would be ' +
     'misleading — this is not a sign that anything happened to your coins.\n\n' +
-    'Close any other Noct Wallet window, or end leftover "noct-walletd.exe" and ' +
-    '"noctd.exe" processes in Task Manager, then start Noct Wallet again.'
+    'Close any other Nocturnal Wallet window, or end leftover "noct-walletd.exe" and ' +
+    '"noctd.exe" processes in Task Manager, then start Nocturnal Wallet again.'
   );
 }
 

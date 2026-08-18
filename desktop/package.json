@@ -18,8 +18,8 @@
     "sharp": "^0.35.3"
   },
   "build": {
-    "appId": "com.noct.wallet",
-    "productName": "Noct Wallet",
+    "appId": "com.nocturnal.wallet",
+    "productName": "Nocturnal Wallet",
     "directories": {
       "output": "dist"
     },
@@ -54,7 +54,7 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "shortcutName": "Noct Wallet"
+      "shortcutName": "Nocturnal Wallet"
     }
   }
 }

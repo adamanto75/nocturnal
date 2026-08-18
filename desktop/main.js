@@ -44,7 +44,7 @@ const NETWORKS = {
 /// Window title, naming the network unless it is mainnet. Shared by both windows
 /// so they can never disagree about which chain is open.
 function windowTitle(network) {
-  return network && network !== 'mainnet' ? 'Noct Wallet — ' + network : 'Noct Wallet';
+  return network && network !== 'mainnet' ? 'Nocturnal Wallet — ' + network : 'Nocturnal Wallet';
 }
 
 /// Which network to open. `--testnet` (or NOCT_NETWORK=testnet) selects it;
@@ -313,7 +313,7 @@ app.whenReady().then(async () => {
     }
   } catch (e) {
     dialog.showErrorBox(
-      'Noct Wallet',
+      'Nocturnal Wallet',
       'Could not find or create the wallet.\n\nExpected the Noct binaries under:\n' +
         P.bin +
         '\n\n(When running from source, build them with:  cargo build --release)\n\n' +
@@ -328,7 +328,7 @@ app.whenReady().then(async () => {
   // would notice.
   if (checkPin(fs, wallet.pins, wallet.address) === 'mismatch') {
     dialog.showErrorBox(
-      'Noct Wallet',
+      'Nocturnal Wallet',
       pinMismatchMessage(readPin(fs, wallet.pins), wallet.address)
     );
     app.quit();
@@ -342,7 +342,7 @@ app.whenReady().then(async () => {
   const existing = await fetchState(walletUrl(P));
   if (existing) {
     if (!servesWallet(existing, wallet.address)) {
-      dialog.showErrorBox('Noct Wallet', wrongWalletMessage(wallet.address, existing.address));
+      dialog.showErrorBox('Nocturnal Wallet', wrongWalletMessage(wallet.address, existing.address));
       app.quit();
       return;
     }
@@ -360,7 +360,7 @@ app.whenReady().then(async () => {
       'data:text/html,' +
         encodeURIComponent(
           '<body style="background:#0e1114;color:#e7edf3;font-family:sans-serif;padding:40px">' +
-            '<h2>Noct Wallet</h2><p>The wallet service did not start. Check the Noct binaries ' +
+            '<h2>Nocturnal Wallet</h2><p>The wallet service did not start. Check the Noct binaries ' +
             'under <code>' + P.bin + '</code>.</p></body>'
         )
     );
@@ -369,7 +369,7 @@ app.whenReady().then(async () => {
   // Belt and braces: whatever ended up answering must be serving the key we
   // loaded. Never display an unverified wallet.
   if (!servesWallet(state, wallet.address)) {
-    dialog.showErrorBox('Noct Wallet', wrongWalletMessage(wallet.address, state.address));
+    dialog.showErrorBox('Nocturnal Wallet', wrongWalletMessage(wallet.address, state.address));
     stopDaemons();
     app.quit();
   }

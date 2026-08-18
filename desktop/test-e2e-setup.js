@@ -58,7 +58,7 @@ async function run() {
     await win.waitForLoadState('domcontentloaded');
 
     // 1. It opened the SETUP window, not the wallet, and did not create a key.
-    assert.strictEqual(await win.title(), 'Noct Wallet — Setup', 'the setup window must open');
+    assert.strictEqual(await win.title(), 'Nocturnal Wallet — Setup', 'the setup window must open');
     assert(!fs.existsSync(KEY), 'no wallet may be created while the pin says one exists');
 
     // 2. It names the wallet whose coins are at stake.
