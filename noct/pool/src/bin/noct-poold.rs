@@ -149,6 +149,16 @@ struct Assignment {
     last_share: Option<std::time::Instant>,
     /// Smoothed interval between its shares, in seconds.
     ewma_secs: f64,
+    /// Rejections in a row, reset by any accepted share.
+    ///
+    /// A rig whose every submission is refused is burning real electricity for
+    /// no credit, and it cannot tell: from the miner's side the pool is
+    /// answering normally. Observed live — two rigs at ~99% CPU for 45 minutes
+    /// with every share rejected, while the only outward sign was a share count
+    /// that had quietly stopped moving.
+    rejected_streak: u32,
+    /// Why the run of rejections is happening, so the warning can say.
+    last_rejection: &'static str,
 }
 
 struct Shared {
@@ -694,6 +704,8 @@ fn issue_difficulty(
         previous: base,
         last_share: None,
         ewma_secs: f64::NAN, // no measurement yet
+        rejected_streak: 0,
+        last_rejection: "",
     });
     // Nothing measured yet — a new miner keeps the starting target until it has
     // actually produced a share to time.
@@ -1007,6 +1019,10 @@ fn submit_share(
         if matches!(outcome, ShareOutcome::Accepted | ShareOutcome::Block(_)) {
             if let Some(a) = s.assignments.get_mut(&who.session) {
                 record_share_timing(a, std::time::Instant::now());
+                // Work is being credited again: whatever the run of refusals
+                // was, it is over.
+                a.rejected_streak = 0;
+                a.last_rejection = "";
             }
             // Display-only, so an operator (and a miner running several rigs)
             // can see them apart. Never consulted for payment.
@@ -1073,9 +1089,52 @@ fn submit_share(
                 "{{\"status\":\"accepted\",\"share\":true,\"block\":true,\"submitted\":{accepted},\"id\":\"{id}\"}}"
             )
         }
-        ShareOutcome::TooEasy => err("share does not meet the target"),
-        ShareOutcome::Duplicate => err("duplicate share"),
-        ShareOutcome::UnknownJob => err("stale job"),
+        ShareOutcome::TooEasy => {
+            note_rejection(shared, &who.session, "share does not meet the target");
+            err("share does not meet the target")
+        }
+        ShareOutcome::Duplicate => {
+            note_rejection(shared, &who.session, "duplicate share");
+            err("duplicate share")
+        }
+        ShareOutcome::UnknownJob => {
+            note_rejection(shared, &who.session, "stale job");
+            err("stale job")
+        }
+    }
+}
+
+/// Warn after this many refusals in a row from one session.
+///
+/// Occasional rejections are ordinary — a share found just as the tip moves is
+/// stale through nobody's fault. An unbroken *run* is not: it means the rig has
+/// been working for nothing since the run began.
+const REJECTION_STREAK_WARN: u32 = 25;
+
+/// Record a rejection, and say something once the run is long enough to mean
+/// the miner is earning nothing.
+///
+/// This exists because the failure it reports was invisible for 45 minutes on
+/// the live testnet. Two rigs sat at ~99% CPU with every submission refused;
+/// `/stats` showed a share count that had simply stopped rising, which looks
+/// identical to nobody mining. The pool knew the reason on every single
+/// request and never said it.
+fn note_rejection(shared: &Arc<Mutex<Shared>>, session: &str, reason: &'static str) {
+    let mut s = shared.lock().unwrap();
+    let Some(a) = s.assignments.get_mut(session) else { return };
+    if a.last_rejection != reason {
+        a.rejected_streak = 0;
+        a.last_rejection = reason;
+    }
+    a.rejected_streak += 1;
+    // Once at the threshold, then once per further threshold's worth, so a
+    // stuck rig keeps reminding the operator without flooding the log.
+    if a.rejected_streak % REJECTION_STREAK_WARN == 0 {
+        let n = a.rejected_streak;
+        eprintln!(
+            "WARNING: {session} has had {n} submissions refused in a row ({reason}). \
+             It is doing work it is not being paid for — check that it is on the current job."
+        );
     }
 }
 
@@ -1271,7 +1330,13 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps) -> String {
     let worker_entries: Vec<String> = workers
         .iter()
         .take(200)
-        .map(|(id, w)| format!("{{\"session\":\"{}\",\"work\":{w}}}", escape(id)))
+        // `rejected_streak` is published because a rig earning nothing looks
+        // exactly like a rig that stopped: both show work that stops rising.
+        // The streak tells the two apart without reading the log.
+        .map(|(id, w)| {
+            let streak = s.assignments.get(*id).map(|a| a.rejected_streak).unwrap_or(0);
+            format!("{{\"session\":\"{}\",\"work\":{w},\"rejected_streak\":{streak}}}", escape(id))
+        })
         .collect();
     let owed: Vec<String> = s
         .ledger
@@ -1868,6 +1933,8 @@ mod vardiff_daemon_tests {
             previous: 1_000,
             last_share: None,
             ewma_secs: f64::NAN,
+            rejected_streak: 0,
+            last_rejection: "",
         };
         let t0 = std::time::Instant::now();
         // First share: nothing to measure against yet.
@@ -1939,5 +2006,94 @@ mod payout_network_tests {
             assert_eq!(network_of(&t), Network::Testnet);
             assert_ne!(m, t);
         }
+    }
+}
+
+/// A rig whose every submission is refused earns nothing while spending real
+/// electricity, and cannot tell — the pool answers each request normally, and
+/// `/stats` just shows work that stopped rising, which is what an idle rig also
+/// looks like. Observed live: two rigs at ~99% CPU for 45 minutes, every share
+/// rejected, no warning anywhere.
+#[cfg(test)]
+mod rejection_streak_tests {
+    use super::*;
+
+    fn assignment() -> Assignment {
+        Assignment {
+            current: 200,
+            previous: 200,
+            last_share: None,
+            ewma_secs: f64::NAN,
+            rejected_streak: 0,
+            last_rejection: "",
+        }
+    }
+
+    /// Isolated model of the streak rules, so the thresholds are pinned without
+    /// standing up a pool: count runs, reset on success, restart on a new reason.
+    fn reject(a: &mut Assignment, reason: &'static str) -> bool {
+        if a.last_rejection != reason {
+            a.rejected_streak = 0;
+            a.last_rejection = reason;
+        }
+        a.rejected_streak += 1;
+        a.rejected_streak % REJECTION_STREAK_WARN == 0
+    }
+    fn accept(a: &mut Assignment) {
+        a.rejected_streak = 0;
+        a.last_rejection = "";
+    }
+
+    /// The point of the threshold: ordinary life must stay silent. A share found
+    /// just as the tip moves is stale through nobody's fault, and warning on it
+    /// would train the operator to ignore the message that matters.
+    #[test]
+    fn occasional_rejections_never_warn() {
+        let mut a = assignment();
+        for _ in 0..200 {
+            for _ in 0..(REJECTION_STREAK_WARN - 1) {
+                assert!(!reject(&mut a, "stale job"), "a short run must stay quiet");
+            }
+            accept(&mut a);
+        }
+        assert_eq!(a.rejected_streak, 0);
+    }
+
+    #[test]
+    fn an_unbroken_run_warns_and_keeps_reminding() {
+        let mut a = assignment();
+        let mut warned = 0;
+        for _ in 0..(REJECTION_STREAK_WARN * 4) {
+            if reject(&mut a, "duplicate share") {
+                warned += 1;
+            }
+        }
+        assert_eq!(warned, 4, "once at the threshold, then once per threshold after");
+    }
+
+    /// An accepted share means work is being credited again, whatever came
+    /// before — so the run is genuinely over, not merely paused.
+    #[test]
+    fn one_accepted_share_clears_the_run() {
+        let mut a = assignment();
+        for _ in 0..(REJECTION_STREAK_WARN - 1) {
+            reject(&mut a, "duplicate share");
+        }
+        accept(&mut a);
+        assert_eq!(a.rejected_streak, 0);
+        assert!(!reject(&mut a, "duplicate share"), "the count starts over");
+    }
+
+    /// A changed reason is a different fault, and counting them together would
+    /// hide both: 24 stale + 24 duplicate is not one run of 48.
+    #[test]
+    fn a_different_reason_starts_a_new_run() {
+        let mut a = assignment();
+        for _ in 0..(REJECTION_STREAK_WARN - 1) {
+            reject(&mut a, "stale job");
+        }
+        assert!(!reject(&mut a, "duplicate share"), "a new reason restarts the count");
+        assert_eq!(a.rejected_streak, 1);
+        assert_eq!(a.last_rejection, "duplicate share");
     }
 }
