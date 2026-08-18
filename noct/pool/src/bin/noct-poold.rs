@@ -326,6 +326,43 @@ fn main() {
         .unwrap_or_else(|e| fail(&format!("opening the window log {window_log_path}: {e}")));
     let recovered = recovered_shares.len();
 
+    // Refuse to run against a chain using a different proof-of-work.
+    //
+    // The pool re-hashes every share to validate it. If this binary was built
+    // with a different PoW than the node's — the default build uses the Keccak
+    // placeholder, and mainnet uses RandomX — then every hash it computes is of
+    // the wrong function: valid shares get rejected, and anything it did accept
+    // would credit work that was never done. Observed live: a pool started
+    // without `--features randomx` against a RandomX testnet, whose only symptom
+    // was miners connecting and nothing ever being accepted, which reads as a
+    // network problem rather than a build one.
+    //
+    // Checked against the node rather than assumed from a build flag, because
+    // the flag only tells us what WE are; the mismatch is what actually breaks.
+    // A node too old to report its PoW is allowed through with a warning — this
+    // must not stop a pool working against an older node.
+    match http_get(&node, "/info", &token) {
+        Ok(info) => match json_str(&info, "pow") {
+            Some(node_pow) if node_pow != pow_name() => {
+                fail(&format!(
+                    "proof-of-work mismatch: this pool validates shares with {}, but the node at {} runs {}.
+       Every share would be hashed with the wrong function, so valid shares are rejected and
+       anything accepted would credit work that was never done.
+       Rebuild with: cargo build --release -p noct-pool --bins --features randomx",
+                    pow_name(),
+                    node.endpoint.display(),
+                    node_pow
+                ));
+            }
+            Some(_) => {}
+            None => eprintln!(
+                "  warning:          node did not report its proof-of-work; cannot verify it                  matches this build ({})",
+                pow_name()
+            ),
+        },
+        Err(e) => eprintln!("  warning:          could not reach the node to check its proof-of-work: {e}"),
+    }
+
     eprintln!("noct-poold starting");
     eprintln!("  pow:              {}", pow_name());
     eprintln!("  node:             {}{}", node.endpoint.display(), if node.pin.is_some() { " (pinned certificate)" } else { "" });

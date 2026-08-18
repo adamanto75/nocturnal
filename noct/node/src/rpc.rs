@@ -380,7 +380,7 @@ fn handle_client(
             let peer_count = peers.count();
             let node = state.lock().unwrap();
             let json = format!(
-                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"peers\":{},\"tip\":\"{}\"}}",
+                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\"}}",
                 node.height(),
                 node.num_outputs(),
                 node.emitted(),
@@ -388,6 +388,13 @@ fn handle_client(
                 node.mempool_len(),
                 peer_count,
                 hex::encode(node.tip_id()),
+                // Which proof-of-work this binary was built with. A pool or miner
+                // built against a different one re-hashes shares with a function
+                // the chain does not use, so every share it validates is
+                // meaningless — and the only symptom is "nothing gets accepted",
+                // which looks like a network fault rather than a build mistake.
+                // Publishing it lets a client refuse to start instead of guessing.
+                crate::pow_name(),
             );
             respond(reader.get_mut(), "200 OK", &json)
         }
