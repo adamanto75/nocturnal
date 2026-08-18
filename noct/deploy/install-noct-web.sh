@@ -32,6 +32,7 @@ while [ $# -gt 0 ]; do
     # container on the seeds' own LAN could not connect to them by public
     # address, but reached one directly on its LAN address immediately. So pass
     # the LAN address when installing alongside your own seeds.
+    # (Public seeds are seed1.nocturnalcoin.com / seed2.nocturnalcoin.com:19333.)
     --seed)   SEEDS="$SEEDS --seed $2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac

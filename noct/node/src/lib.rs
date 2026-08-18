@@ -286,10 +286,23 @@ pub const BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 /// can be repointed in seconds (entries are resolved at startup, so either form
 /// works).
 pub const TESTNET_SEEDS: &[&str] = &[
-    "32.217.18.220:19333", // seed1 — line 1
-    "47.166.169.30:19333", // seed2 — line 2
+    "seed1.nocturnalcoin.com:19333",
+    "seed2.nocturnalcoin.com:19333",
 ];
 
+/// **Names, not literals, on purpose.** A hardcoded IP is frozen into every copy
+/// of the software the moment it ships: move the machine, change ISP, or lose the
+/// address, and the seed is dead for everyone still running that binary — and a
+/// node that cannot reach a seed cannot join the network at all. A name is
+/// repointed in DNS in seconds and every existing binary follows.
+///
+/// This does not hide the addresses; DNS resolves to them and that is public.
+/// It decouples *where the infrastructure lives* from *what has been released*.
+///
+/// The records must be **DNS-only**, never proxied: this is raw TCP on 19333,
+/// and an HTTP proxy in front of it would resolve to the proxy's addresses and
+/// break peering entirely.
+///
 /// Seed nodes for **mainnet**. Deliberately empty: mainnet has not launched, and
 /// a seed list pointing at machines that are not yet running the real chain would
 /// be worse than none at all. Populate with **hostnames** before launch.
@@ -1659,6 +1672,22 @@ mod seed_tests {
             assert!(!host.is_empty(), "{s} has no host");
             let port: u16 = port.parse().unwrap_or_else(|_| panic!("{s} has a bad port"));
             assert_eq!(port, expected, "{s} is not on the testnet p2p port {expected}");
+        }
+    }
+
+    /// Seeds are **names, not IP literals**, so a seed can move without shipping
+    /// a new binary to everyone already running the network. A hardcoded address
+    /// is frozen at release: change ISP or lose the address and that seed is dead
+    /// for every existing install, and a node that reaches no seed cannot join at
+    /// all. Putting a literal back here would silently undo that, so it fails.
+    #[test]
+    fn testnet_seeds_are_names_so_they_can_be_repointed() {
+        for s in default_seeds(Network::Testnet) {
+            let host = s.rsplit_once(':').unwrap().0;
+            assert!(
+                host.parse::<std::net::IpAddr>().is_err(),
+                "`{host}` is a literal address — use a hostname so DNS can repoint it"
+            );
         }
     }
 

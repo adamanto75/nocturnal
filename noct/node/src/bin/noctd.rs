@@ -64,11 +64,11 @@ fn main() {
             }
             "--peer" => {
                 i += 1;
-                peers.push(parse_addr(&args, i, "--peer"));
+                peers.extend(parse_dial_addrs(&args, i, "--peer"));
             }
             "--seed" => {
                 i += 1;
-                seeds.push(parse_addr(&args, i, "--seed"));
+                seeds.extend(parse_dial_addrs(&args, i, "--seed"));
             }
             "--max-outbound" => {
                 i += 1;
@@ -211,6 +211,34 @@ fn main() {
         },
     }) {
         fail(&format!("fatal: {e}"));
+    }
+}
+
+/// Resolve a **dial** target, which may be a hostname.
+///
+/// `--p2p` and `--rpc` are bind addresses and stay IP literals — you bind to an
+/// interface you hold, not to a name. But `--peer` and `--seed` name someone
+/// else's machine, and an operator should be able to write
+/// `seed1.nocturnalcoin.com:19333` there. The baked-in default seeds already go
+/// through `to_socket_addrs`, so without this the flag was stricter than the
+/// constant it overrides — the same address worked compiled in and failed on the
+/// command line.
+///
+/// A name may resolve to several addresses (A and AAAA); all are kept, so a
+/// seed reachable over either family is dialled over whichever works.
+fn parse_dial_addrs(args: &[String], i: usize, flag: &str) -> Vec<SocketAddr> {
+    let raw = args
+        .get(i)
+        .unwrap_or_else(|| fail(&format!("{flag} needs an address")));
+    match raw.to_socket_addrs() {
+        Ok(addrs) => {
+            let v: Vec<SocketAddr> = addrs.collect();
+            if v.is_empty() {
+                fail(&format!("{flag}: `{raw}` resolved to no addresses"));
+            }
+            v
+        }
+        Err(e) => fail(&format!("{flag}: could not resolve `{raw}`: {e}")),
     }
 }
 
