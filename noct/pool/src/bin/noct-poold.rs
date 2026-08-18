@@ -246,9 +246,15 @@ fn main() {
     // Validate at startup rather than discovering a typo later: every block this
     // pool finds pays this address, and an unspendable one would be found only
     // after the rewards were already mined.
-    if Address::decode(pool_address_str.trim()).is_err() {
-        fail("invalid --address (must be a Noct address the pool controls)");
-    }
+    //
+    // The address also *decides the network*. Every block reward is paid to it,
+    // so the chain the pool is working on is by definition the one this address
+    // belongs to. Taking the network from here rather than from a separate flag
+    // means the two cannot disagree — there is no second value to set wrong.
+    let pool_network = match Address::decode(pool_address_str.trim()) {
+        Ok(a) => a.network,
+        Err(_) => fail("invalid --address (must be a Noct address the pool controls)"),
+    };
     let share_difficulty = flag(&args, "--share-difficulty")
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SHARE_DIFFICULTY);
@@ -410,6 +416,13 @@ fn main() {
         None => eprintln!("  miners:           open (anonymous; --miner-auth <FILE> to register them)"),
     }
     eprintln!("  pool address:     {}", &pool_address_str[..pool_address_str.len().min(16)]);
+    eprintln!(
+        "  network:          {} (from the pool address)",
+        match pool_network {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet — coins here are worthless",
+        }
+    );
     eprintln!("  share difficulty: {share_difficulty}");
     eprintln!("  ledger:           {ledger_path}");
     eprintln!(
@@ -478,7 +491,7 @@ fn main() {
         let token = token.clone();
         thread::spawn(move || loop {
             thread::sleep(PAYOUT_INTERVAL);
-            run_payouts(&shared, &node, &token, &key_path, threshold, fee);
+            run_payouts(&shared, &node, &token, &key_path, threshold, fee, pool_network);
         });
     }
 
@@ -1081,6 +1094,7 @@ fn run_payouts(
     key_path: &str,
     threshold: u64,
     fee: u64,
+    network: Network,
 ) {
     let client = NodeClient::with_token(node.endpoint.clone(), token.clone()).with_pin(node.pin);
     let Ok(height) = client.height() else { return };
@@ -1111,7 +1125,12 @@ fn run_payouts(
         return;
     };
     let cache = format!("{key_path}.cache");
-    let (chain, wallet, _h) = match load_synced_wallet(&client, account, Network::Mainnet, cache) {
+    // NOT a constant: syncing with the wrong network builds the wrong genesis,
+    // so the very first block the wallet validates fails with BadPrevId and the
+    // pool can never pay anyone. Hardcoding Mainnet here meant a testnet pool
+    // credited miners forever and paid out nothing — it fails safe, but it fails
+    // totally, and only on the network you would test payouts on.
+    let (chain, wallet, _h) = match load_synced_wallet(&client, account, network, cache) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("payout skipped: wallet sync failed: {e}");
@@ -1874,5 +1893,51 @@ mod vardiff_daemon_tests {
         issue_difficulty(&mut a, "m", 100, &p);
         a.get_mut("m").unwrap().ewma_secs = 10_000.0; // absurdly slow
         assert!(issue_difficulty(&mut a, "m", 100, &p) >= 500);
+    }
+}
+
+/// The pool must sync its own wallet against the network it is actually mining
+/// on. This was hardcoded to mainnet, which is invisible on mainnet and fatal
+/// on testnet: the wallet builds the wrong genesis, the first block it
+/// validates fails `BadPrevId`, and every payout is skipped forever while the
+/// ledger keeps crediting miners. Found on the live testnet, where the pool had
+/// booked 53 NOCT to two miners and sent nothing.
+#[cfg(test)]
+mod payout_network_tests {
+    use noct_core::address::{Address, Network};
+    use noct_wallet::Wallet;
+    use rand_core::OsRng;
+
+    /// The property that makes the bug unrepresentable: the network is read off
+    /// the pool's own payout address, so it cannot disagree with the chain whose
+    /// rewards are being paid to that address.
+    fn network_of(addr: &str) -> Network {
+        Address::decode(addr.trim()).expect("valid address").network
+    }
+
+    #[test]
+    fn the_network_comes_from_the_pool_address_not_a_constant() {
+        let m = Wallet::random(&mut OsRng, Network::Mainnet).address().encode();
+        let t = Wallet::random(&mut OsRng, Network::Testnet).address().encode();
+
+        assert_eq!(network_of(&m), Network::Mainnet);
+        assert_eq!(
+            network_of(&t),
+            Network::Testnet,
+            "a testnet pool must resolve to Testnet; resolving to Mainnet is the payout bug"
+        );
+    }
+
+    /// The tags stay distinguishable across many keys. If they ever collided,
+    /// deriving the network from the address would silently break.
+    #[test]
+    fn mainnet_and_testnet_addresses_are_never_confusable() {
+        for _ in 0..32 {
+            let m = Wallet::random(&mut OsRng, Network::Mainnet).address().encode();
+            let t = Wallet::random(&mut OsRng, Network::Testnet).address().encode();
+            assert_eq!(network_of(&m), Network::Mainnet);
+            assert_eq!(network_of(&t), Network::Testnet);
+            assert_ne!(m, t);
+        }
     }
 }
