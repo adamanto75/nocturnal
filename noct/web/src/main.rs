@@ -39,6 +39,28 @@ use noct_wallet::client::NodeClient;
 const STYLE_CSS:  &str = include_str!("ui/style.css");
 const LOGO_SVG:   &str = include_str!("ui/logo.svg");
 const FAVICON_SVG:&str = include_str!("ui/favicon.svg");
+const REVEAL_JS:  &str = include_str!("ui/reveal.js");
+
+/// A short content fingerprint, used to version asset URLs.
+///
+/// Cloudflare caches `.css` at the edge for four hours by default. A deploy that
+/// changes the stylesheet is therefore invisible to visitors — and worse, it is
+/// invisible *inconsistently*: fresh HTML paired with a stale stylesheet, which
+/// is how a site ends up looking broken for reasons no amount of reading the
+/// origin will explain. Measured here: `cf-cache-status: HIT`, `Age: 1496`,
+/// origin serving the new file, edge serving the old one.
+///
+/// Putting the content hash in the path means a changed asset is a changed URL,
+/// so a deploy is live immediately and the old URL can be cached forever.
+fn asset_tag(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
+}
+
+fn style_path() -> String { format!("/style.{}.css", asset_tag(STYLE_CSS)) }
+fn favicon_path() -> String { format!("/favicon.{}.svg", asset_tag(FAVICON_SVG)) }
 
 const HOME_HTML:       &str = include_str!("ui/home.html");
 const ABOUT_HTML:      &str = include_str!("ui/about.html");
@@ -353,8 +375,10 @@ fn route(path: &str) -> Route {
     }
 
     match trimmed {
-        "/style.css" => Route::Style,
-        "/favicon.svg" => Route::Favicon,
+        // Both the fingerprinted and the plain name resolve, so an old bookmark
+        // or a hand-typed URL still works.
+        p if p == style_path() || p == "/style.css" => Route::Style,
+        p if p == favicon_path() || p == "/favicon.svg" => Route::Favicon,
         "/api/info" => Route::Info,
         "/api/blocks" => Route::Recent,
         _ => match trimmed.strip_prefix("/api/block/") {
@@ -396,19 +420,23 @@ fn shell(active: Page) -> String {
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
          <title>{title}</title>
          <meta name=\"description\" content=\"Nocturnal (NOCT) is a Monero-style privacy coin:          confidential amounts, ring signatures, stealth addresses. Testnet only.\">
-         <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">
-         <link rel=\"stylesheet\" href=\"/style.css\">
+         <link rel=\"icon\" href=\"{favicon}\" type=\"image/svg+xml\">
+         <link rel=\"stylesheet\" href=\"{style}\">
          </head>
 <body>
          <div class=\"alert\"><div class=\"wrap\">         <b>Testnet only.</b> Nocturnal has not launched. Coins on this network have no value and          the chain will be reset. The code is <b>unaudited</b>, and the planned launch includes a          <b>50% genesis premine</b> held by the founder.          <a href=\"/whitepaper\">Read the whitepaper</a> before doing anything else.         </div></div>
          <nav class=\"nav\"><div class=\"wrap\">         <a class=\"brand\" href=\"/\">{logo}<span class=\"name\">Nocturnal</span>         <span class=\"tick\">NOCT</span></a>{nav}         </div></nav>
          <main>{body}</main>
-         <footer><div class=\"wrap\">         <p>Nocturnal is experimental software. No warranty; no offer; nothing here is investment          advice. Source on <a href=\"https://github.com/adamanto75/nocturnal\"          rel=\"noopener noreferrer\">GitHub</a>, MIT licensed.</p>         </div></footer>
+         <script>{reveal}</script>
+\n         <footer><div class=\"wrap\">         <p>Nocturnal is experimental software. No warranty; no offer; nothing here is investment          advice. Source on <a href=\"https://github.com/adamanto75/nocturnal\"          rel=\"noopener noreferrer\">GitHub</a>, MIT licensed.</p>         </div></footer>
 </body>
 </html>
 ",
         title = title,
         logo = LOGO_SVG,
+        style = style_path(),
+        favicon = favicon_path(),
+        reveal = REVEAL_JS,
         nav = nav,
         body = active.body(),
     )
@@ -528,8 +556,8 @@ fn emit_static_site(ctx: &Ctx, dir: &Path) -> Result<usize, String> {
         // Relative links, because a static bundle may not be served from a root.
         let html = shell(page)
             .replace(SOURCE_MARKER, SOURCE_SNAPSHOT)
-            .replace("href=\"/style.css\"", "href=\"style.css\"")
-            .replace("href=\"/favicon.svg\"", "href=\"favicon.svg\"")
+            .replace(&format!("href=\"{}\"", style_path()), "href=\"style.css\"")
+            .replace(&format!("href=\"{}\"", favicon_path()), "href=\"favicon.svg\"")
             .replace("href=\"/\"", "href=\"index.html\"");
         let html = Page::all().iter().fold(html, |acc, p| {
             let (href, _, _) = p.meta();
@@ -745,6 +773,43 @@ mod tests {
             // Exactly one nav item is marked current.
             assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{path} current-page marker");
         }
+    }
+
+    /// Content must never depend on JavaScript to become visible.
+    ///
+    /// The first version of the scroll animation put `opacity:0` on `.reveal`
+    /// unconditionally and relied on a script to add it back. Every failure of
+    /// that script — blocked, errored, no IntersectionObserver, a renderer that
+    /// does not run transitions — produces a page that loads successfully and
+    /// shows nothing. For a site whose entire job is disclosing risk, silently
+    /// blank is the worst possible failure.
+    ///
+    /// So the hidden state is gated behind `.js-reveal`, which the script adds
+    /// only after confirming it can animate. This asserts the gate exists: a bare
+    /// `.reveal { opacity:0 }` would reintroduce the blank-page failure.
+    #[test]
+    fn no_content_is_hidden_without_javascript() {
+        for line in STYLE_CSS.lines() {
+            let l = line.trim();
+            if l.starts_with(".reveal") && l.contains("opacity:0") {
+                panic!(
+                    "`{l}` hides content with no JS gate — if the script fails the page is blank.                      Gate it behind .js-reveal instead."
+                );
+            }
+        }
+        assert!(
+            STYLE_CSS.contains(".js-reveal .reveal"),
+            "the gated reveal rule is missing entirely"
+        );
+        assert!(
+            REVEAL_JS.contains("js-reveal"),
+            "the script never opts in, so gated content would stay hidden forever"
+        );
+        // The opt-in must come AFTER the bail-outs, or a reduced-motion visitor
+        // gets the hidden state with nothing left to reveal it.
+        let optin = REVEAL_JS.find("classList.add('js-reveal')").expect("no opt-in");
+        let bail = REVEAL_JS.find("if (reduce ||").expect("no bail-out");
+        assert!(bail < optin, "the script hides content before checking it can reveal it");
     }
 
     /// The CSP must actually permit every resource the pages reference.

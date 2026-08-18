@@ -3,7 +3,7 @@
   <p>Borrowed cryptography, a new chain, published reasoning. Version 0.1 — draft, pre-mainnet.</p>
 </div></div>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>Abstract</h2>
   <p>Nocturnal is a proof-of-work chain with confidential amounts, sender ambiguity and unlinkable
      recipients. It deliberately contributes no new cryptography: commitments, range proofs and
@@ -17,7 +17,7 @@
      authoritative.</p>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>1. The problem</h2>
   <p>A transparent ledger publishes every payment forever. Anyone who learns one address learns a
      balance, a set of counterparties, and — by intersecting timing and amounts — often an
@@ -31,7 +31,7 @@
      dependency rather than an achievement?</p>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>2. Design</h2>
 
   <h3>2.1 Confidential amounts</h3>
@@ -64,7 +64,7 @@
      requires a fabrication plant.</p>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>3. Consensus</h2>
   <p>Blocks target 120 seconds. Difficulty retargets over a windowed average with a lag, outlier
      trimming at both ends, and a per-step clamp — three independent defences, because an unbounded
@@ -80,7 +80,7 @@
      already-spent fresh coinbase.</p>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>4. Economics</h2>
   <p>Supply approaches <b>1,000,000 NOCT</b> asymptotically along a smooth emission curve, followed
      by a <b>0.03 NOCT</b> tail emission that never terminates. A permanent tail is deliberate: a
@@ -113,7 +113,7 @@
      worthless.</p>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>5. What is not claimed</h2>
   <ul>
     <li><b>No audit.</b> Nineteen internal review passes and one independent model review have found
@@ -132,7 +132,7 @@
   </ul>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>6. Status, and what has to happen next</h2>
   <p>A public testnet is running. Mainnet parameters — genesis timestamp, address tags, the RandomX
      seed schedule — are still placeholders.</p>

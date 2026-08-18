@@ -1,5 +1,6 @@
 <div class="hero">
   <div class="wrap">
+   <div>
     <h1>A privacy coin that hides amounts,<br>senders and recipients.</h1>
     <p>Nocturnal is a Monero-style chain in Rust. Confidential amounts, ring signatures over a
        fixed ring of 16, one-time stealth addresses, and proof of work that runs on the CPU you
@@ -9,10 +10,22 @@
       <a class="btn" href="/whitepaper">Read the whitepaper</a>
       <a class="btn" href="/explorer">Testnet explorer</a>
     </div>
+   </div>
+   <div class="hero-art" aria-hidden="true">
+     <span class="halo"></span>
+     <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+       <defs><linearGradient id="hero-moon" x1="0" y1="0" x2="1" y2="1">
+         <stop offset="0" stop-color="#c3b6ff"/><stop offset="1" stop-color="#5b45d6"/>
+       </linearGradient></defs>
+       <circle cx="32" cy="32" r="28" fill="none" stroke="url(#hero-moon)" stroke-width="2"
+               stroke-linecap="round" stroke-dasharray="72 16" opacity=".9"/>
+       <path d="M46 17.5 A19 19 0 1 0 46 46.5 A15.5 15.5 0 1 1 46 17.5 Z" fill="url(#hero-moon)"/>
+     </svg>
+   </div>
   </div>
 </div>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>What it is</h2>
   <p>Amounts are hidden by Pedersen commitments with Bulletproofs+ range proofs, senders by CLSAG
      ring signatures, and recipients by one-time stealth addresses derived per output. Proof of
@@ -29,7 +42,7 @@
   </div>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>Where it stands</h2>
   <p>Stated plainly, because you should not have to dig for it.</p>
   <ul>

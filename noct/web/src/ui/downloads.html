@@ -4,7 +4,7 @@
      checksums.</p>
 </div></div>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <div class="note">
     <p><b>Testnet only.</b> Coins obtained with these tools have no value and the chain will be
        reset before mainnet. Do not buy NOCT from anyone: there is nothing to buy, and anyone
@@ -21,7 +21,7 @@
      It takes about a minute.</p>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>Build from source</h2>
   <p>Rust is pinned to <b>1.82</b>. The <code>randomx</code> feature needs <code>cmake</code> and a
      C++ toolchain.</p>
@@ -38,7 +38,7 @@ cargo build --release -p noct-node --features randomx # noctd, real PoW</pre>
   </div>
 </div></section>
 
-<section><div class="wrap">
+<section class="reveal"><div class="wrap">
   <h2>Run a testnet node</h2>
 <pre>noctd --network testnet --data-dir ~/.noct-testnet
 noct-cli new --network testnet --wallet testnet.key

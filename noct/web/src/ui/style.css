@@ -1,88 +1,272 @@
+/* Nocturnal — night sky, moonlight, depth.
+   Everything here is self-contained: no fonts, no images, no CDN. The look is
+   built from gradients and shadows because a privacy coin's site that fetches a
+   webfont reports every visitor to whoever serves it. */
+
 :root {
-  --bg:#0d0f13; --panel:#151920; --line:#232a35;
-  --ink:#e6e9ef; --dim:#98a2b3; --accent:#8b7cf6; --warn:#e8b339; --good:#4ade80;
+  --bg:#08090d;
+  --bg-2:#0d0f16;
+  --panel:rgba(22,26,37,.72);
+  --panel-solid:#151a25;
+  --line:rgba(120,134,168,.16);
+  --line-bright:rgba(139,124,246,.34);
+  --ink:#eef1f7;
+  --dim:#98a2b8;
+  --accent:#8b7cf6;
+  --accent-2:#5b45d6;
+  --accent-lift:#b5a6ff;
+  --warn:#e8b339;
+  --good:#4ade80;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --wrap: 960px;
+  --wrap: 1060px;
+  --ease: cubic-bezier(.22,.61,.36,1);
 }
+
 * { box-sizing:border-box; }
+
+html { scroll-behavior:smooth; }
+
 body {
-  margin:0; background:var(--bg); color:var(--ink);
-  font:16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin:0;
+  color:var(--ink);
+  background:var(--bg);
+  font:16px/1.7 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing:antialiased;
+  overflow-x:hidden;
 }
-a { color:var(--accent); }
-.wrap { max-width:var(--wrap); margin:0 auto; padding:0 20px; }
 
-/* The warning sits above the navigation, on every page, deliberately. */
-.alert { background:#2a2109; border-bottom:1px solid #4a3c10; color:#f3d99b;
-         padding:13px 0; font-size:14.5px; }
+/* The night sky. Three fixed layers: two soft moonlight glows and a starfield
+   drawn entirely with radial-gradients, so it costs no request and no image. */
+body::before {
+  content:""; position:fixed; inset:0; z-index:-2; pointer-events:none;
+  background:
+    radial-gradient(900px 620px at 78% -8%, rgba(139,124,246,.20), transparent 62%),
+    radial-gradient(760px 520px at 12% 4%, rgba(91,69,214,.16), transparent 60%),
+    linear-gradient(180deg, var(--bg-2), var(--bg) 46%);
+}
+body::after {
+  content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  opacity:.55;
+  background-image:
+    radial-gradient(1.4px 1.4px at 12% 18%, #fff, transparent),
+    radial-gradient(1.2px 1.2px at 27% 62%, #dcd7ff, transparent),
+    radial-gradient(1.6px 1.6px at 41% 12%, #fff, transparent),
+    radial-gradient(1.1px 1.1px at 58% 44%, #cfc6ff, transparent),
+    radial-gradient(1.5px 1.5px at 69% 22%, #fff, transparent),
+    radial-gradient(1.2px 1.2px at 83% 58%, #e6e1ff, transparent),
+    radial-gradient(1.3px 1.3px at 92% 14%, #fff, transparent),
+    radial-gradient(1.1px 1.1px at 8%  78%, #d8d2ff, transparent),
+    radial-gradient(1.4px 1.4px at 35% 88%, #fff, transparent),
+    radial-gradient(1.2px 1.2px at 74% 84%, #ded8ff, transparent);
+  background-size:1400px 900px;
+  animation:drift 190s linear infinite;
+}
+@keyframes drift { to { background-position:1400px 900px; } }
+
+a { color:var(--accent); text-decoration-color:rgba(139,124,246,.4); text-underline-offset:3px; }
+a:hover { color:var(--accent-lift); }
+.wrap { max-width:var(--wrap); margin:0 auto; padding:0 22px; }
+
+/* ---- disclosure ---------------------------------------------------------- */
+/* Deliberately the loudest thing above the fold. Any redesign that quietens
+   this has broken the point of the page, not improved it. */
+.alert {
+  background:linear-gradient(90deg, rgba(70,54,10,.96), rgba(48,38,10,.96));
+  border-bottom:1px solid rgba(232,179,57,.28);
+  color:#f6e2b0; padding:13px 0; font-size:14.5px; position:relative; z-index:20;
+}
 .alert b { color:var(--warn); }
+.alert a { color:#ffd98a; }
 
-/* ---- navigation --------------------------------------------------------- */
-.nav { border-bottom:1px solid var(--line); position:sticky; top:0;
-       background:rgba(13,15,19,.92); backdrop-filter:blur(8px); z-index:10; }
-.nav .wrap { display:flex; align-items:center; gap:10px; height:62px; }
-.brand { display:flex; align-items:center; gap:10px; text-decoration:none; color:var(--ink); margin-right:auto; }
-.brand svg { width:30px; height:30px; flex:none; }
-.brand .name { font-size:18px; font-weight:600; letter-spacing:-.01em; }
-.brand .tick { font-family:var(--mono); font-size:10.5px; font-weight:600; color:var(--accent);
-  background:rgba(139,124,246,.13); border:1px solid rgba(139,124,246,.35);
-  border-radius:5px; padding:1px 5px; letter-spacing:.04em; }
-.nav a.link { color:var(--dim); text-decoration:none; font-size:14.5px; padding:7px 11px;
-  border-radius:8px; white-space:nowrap; }
-.nav a.link:hover { color:var(--ink); background:var(--panel); }
-.nav a.link[aria-current="page"] { color:var(--ink); background:var(--panel);
-  box-shadow:inset 0 0 0 1px var(--line); }
-.nav .ext::after { content:"↗"; font-size:11px; margin-left:4px; opacity:.6; }
-@media (max-width:760px){
-  .nav .wrap{height:auto;flex-wrap:wrap;padding-top:10px;padding-bottom:10px;gap:6px}
-  .brand{width:100%;margin-bottom:4px}
+/* ---- navigation ---------------------------------------------------------- */
+.nav {
+  position:sticky; top:0; z-index:15;
+  background:rgba(8,9,13,.72); backdrop-filter:blur(14px) saturate(140%);
+  border-bottom:1px solid var(--line);
+}
+.nav .wrap { display:flex; align-items:center; gap:8px; height:68px; }
+.brand { display:flex; align-items:center; gap:11px; text-decoration:none; color:var(--ink); margin-right:auto; }
+.brand svg { width:32px; height:32px; flex:none; filter:drop-shadow(0 0 12px rgba(139,124,246,.55)); }
+.brand .name { font-size:19px; font-weight:650; letter-spacing:-.015em; }
+.brand .tick {
+  font-family:var(--mono); font-size:10px; font-weight:700; color:var(--accent-lift);
+  background:rgba(139,124,246,.14); border:1px solid var(--line-bright);
+  border-radius:5px; padding:2px 6px; letter-spacing:.08em;
+}
+.nav a.link {
+  color:var(--dim); text-decoration:none; font-size:14.5px; padding:8px 13px;
+  border-radius:9px; white-space:nowrap; transition:color .2s var(--ease), background .2s var(--ease);
+}
+.nav a.link:hover { color:var(--ink); background:rgba(139,124,246,.10); }
+.nav a.link[aria-current="page"] {
+  color:var(--ink); background:rgba(139,124,246,.14); box-shadow:inset 0 0 0 1px var(--line-bright);
+}
+.nav .ext::after { content:"↗"; font-size:11px; margin-left:5px; opacity:.6; }
+@media (max-width:820px){
+  .nav .wrap{height:auto;flex-wrap:wrap;padding-top:12px;padding-bottom:12px;gap:4px}
+  .brand{width:100%;margin-bottom:6px}
+  .nav a.link{padding:7px 10px;font-size:14px}
 }
 
-/* ---- page furniture ----------------------------------------------------- */
-main { padding:14px 0 10px; }
-.hero { padding:44px 0 30px; border-bottom:1px solid var(--line); }
-.hero h1 { font-size:38px; margin:0 0 12px; letter-spacing:-.025em; line-height:1.15; }
-.hero p { color:var(--dim); font-size:19px; margin:0; max-width:60ch; }
-section { padding:34px 0; border-bottom:1px solid var(--line); }
-section:last-of-type { border-bottom:0; }
-h2 { font-size:21px; margin:0 0 14px; letter-spacing:-.01em; }
-h3 { font-size:16px; margin:22px 0 8px; }
-p, li { color:#cbd3e0; }
-ul { padding-left:22px; }
+/* ---- hero ---------------------------------------------------------------- */
+.hero { position:relative; padding:86px 0 66px; }
+.hero::after {
+  content:""; position:absolute; left:0; right:0; bottom:0; height:1px;
+  background:linear-gradient(90deg, transparent, var(--line-bright) 22%, var(--line-bright) 78%, transparent);
+}
+.hero .wrap { display:grid; grid-template-columns:1.35fr .65fr; gap:40px; align-items:center; }
+@media (max-width:900px){ .hero .wrap{grid-template-columns:1fr} .hero-art{display:none} }
 
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:14px; }
-.card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
-.card h3 { margin:0 0 6px; font-size:15px; }
+.hero h1 {
+  font-size:clamp(34px, 5vw, 56px); line-height:1.08; margin:0 0 18px;
+  letter-spacing:-.035em; font-weight:700;
+  background:linear-gradient(180deg, #ffffff 28%, #b9b2e8 100%);
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+}
+.hero p { color:var(--dim); font-size:19px; margin:0; max-width:56ch; }
+
+/* The moon, large and glowing. Pure CSS + the inline SVG mark. */
+.hero-art { position:relative; display:grid; place-items:center; min-height:250px; }
+.hero-art .halo {
+  position:absolute; width:280px; height:280px; border-radius:50%;
+  background:radial-gradient(circle, rgba(139,124,246,.34), transparent 66%);
+  filter:blur(18px); animation:breathe 7s ease-in-out infinite;
+}
+.hero-art svg { width:210px; height:210px; position:relative; filter:drop-shadow(0 0 28px rgba(139,124,246,.5)); }
+.hero-art svg circle { animation:spin 44s linear infinite; transform-origin:32px 32px; }
+@keyframes breathe { 0%,100%{opacity:.72;transform:scale(1)} 50%{opacity:1;transform:scale(1.06)} }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* ---- sections ------------------------------------------------------------ */
+main { position:relative; }
+section { padding:56px 0; position:relative; }
+section + section::before {
+  content:""; position:absolute; top:0; left:22px; right:22px; height:1px;
+  background:linear-gradient(90deg, transparent, var(--line) 18%, var(--line) 82%, transparent);
+}
+h2 {
+  font-size:26px; margin:0 0 16px; letter-spacing:-.022em; font-weight:650;
+  display:flex; align-items:center; gap:11px;
+}
+h2::before {
+  content:""; width:3px; height:19px; border-radius:2px; flex:none;
+  background:linear-gradient(180deg, var(--accent-lift), var(--accent-2));
+  box-shadow:0 0 12px rgba(139,124,246,.6);
+}
+h3 { font-size:16.5px; margin:26px 0 8px; font-weight:620; }
+p, li { color:#c6cddc; }
+ul { padding-left:22px; }
+li { margin:5px 0; }
+
+/* ---- cards --------------------------------------------------------------- */
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:16px; }
+.card {
+  background:var(--panel); border:1px solid var(--line); border-radius:15px; padding:20px;
+  backdrop-filter:blur(9px);
+  transition:transform .28s var(--ease), border-color .28s var(--ease), box-shadow .28s var(--ease);
+}
+.card:hover {
+  transform:translateY(-4px); border-color:var(--line-bright);
+  box-shadow:0 14px 40px -14px rgba(91,69,214,.55);
+}
+.card h3 { margin:0 0 7px; font-size:15.5px; }
 .card p { margin:0; color:var(--dim); font-size:14px; }
 
-.stat { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
-.stat .k { color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
-.stat .v { font-family:var(--mono); font-size:20px; margin-top:4px; word-break:break-all; }
+.stat {
+  background:var(--panel); border:1px solid var(--line); border-radius:15px; padding:17px 19px;
+  backdrop-filter:blur(9px); position:relative; overflow:hidden;
+}
+.stat::before {
+  content:""; position:absolute; inset:0 auto auto 0; width:100%; height:1px;
+  background:linear-gradient(90deg, transparent, var(--line-bright), transparent);
+}
+.stat .k { color:var(--dim); font-size:11.5px; text-transform:uppercase; letter-spacing:.09em; }
+.stat .v {
+  font-family:var(--mono); font-size:24px; margin-top:5px; word-break:break-all; font-weight:600;
+  background:linear-gradient(180deg,#fff,#b9b2e8); -webkit-background-clip:text; background-clip:text; color:transparent;
+}
 
+/* ---- tables -------------------------------------------------------------- */
+.scroll {
+  overflow-x:auto; border:1px solid var(--line); border-radius:15px;
+  background:var(--panel); backdrop-filter:blur(9px);
+}
 table { width:100%; border-collapse:collapse; font-size:14px; }
-th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); }
-th { color:var(--dim); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+th, td { text-align:left; padding:12px 15px; border-bottom:1px solid var(--line); }
+tr:last-child td { border-bottom:0; }
+th { color:var(--dim); font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.09em; }
+tbody tr { transition:background .18s var(--ease); }
+tbody tr:hover { background:rgba(139,124,246,.06); }
 td.mono, .mono { font-family:var(--mono); }
 .hash { color:var(--dim); }
-.scroll { overflow-x:auto; }
 
-pre { background:var(--panel); border:1px solid var(--line); border-radius:10px;
-      padding:14px; overflow-x:auto; font-family:var(--mono); font-size:13.5px; color:#d7deea; }
-code { font-family:var(--mono); font-size:.94em; }
-p code, li code, td code { background:var(--panel); border:1px solid var(--line);
-      border-radius:5px; padding:1px 5px; }
+/* ---- code ---------------------------------------------------------------- */
+pre {
+  background:linear-gradient(180deg, rgba(18,22,32,.92), rgba(13,16,24,.92));
+  border:1px solid var(--line); border-radius:13px;
+  padding:17px 19px; overflow-x:auto; font-family:var(--mono); font-size:13.5px;
+  color:#d7deea; line-height:1.65;
+}
+code { font-family:var(--mono); font-size:.93em; }
+p code, li code, td code {
+  background:rgba(139,124,246,.11); border:1px solid var(--line-bright);
+  border-radius:5px; padding:1px 6px; color:#cfc6ff;
+}
 
-.btn { display:inline-block; text-decoration:none; font-size:14.5px; font-weight:500;
-  padding:10px 16px; border-radius:9px; border:1px solid var(--line);
-  background:var(--panel); color:var(--ink); }
-.btn:hover { border-color:var(--accent); }
-.btn.primary { background:linear-gradient(145deg,#7c6af0,#5b45d6); border-color:transparent; color:#fff; }
-.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top:18px; }
+/* ---- buttons ------------------------------------------------------------- */
+.btns { display:flex; gap:12px; flex-wrap:wrap; margin-top:26px; }
+.btn {
+  display:inline-block; text-decoration:none; font-size:14.5px; font-weight:560;
+  padding:12px 20px; border-radius:11px; border:1px solid var(--line);
+  background:var(--panel); color:var(--ink); backdrop-filter:blur(9px);
+  transition:transform .22s var(--ease), border-color .22s var(--ease), box-shadow .22s var(--ease);
+}
+.btn:hover { transform:translateY(-2px); border-color:var(--line-bright); color:var(--ink); }
+.btn.primary {
+  background:linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-color:transparent; color:#fff;
+  box-shadow:0 8px 26px -8px rgba(139,124,246,.75);
+}
+.btn.primary:hover { box-shadow:0 14px 36px -8px rgba(139,124,246,.95); color:#fff; }
 
-.note { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--warn);
-        border-radius:0 10px 10px 0; padding:14px 16px; margin:18px 0; }
+/* ---- notes --------------------------------------------------------------- */
+.note {
+  background:linear-gradient(90deg, rgba(232,179,57,.09), rgba(232,179,57,.02));
+  border:1px solid rgba(232,179,57,.24); border-left:3px solid var(--warn);
+  border-radius:0 13px 13px 0; padding:16px 19px; margin:20px 0;
+}
 .note p:last-child { margin-bottom:0; }
-.dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--good); margin-right:7px; }
+
+.dot {
+  display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--good);
+  margin-right:8px; box-shadow:0 0 10px rgba(74,222,128,.85);
+  animation:pulse 2.4s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
 .muted { color:var(--dim); }
-footer { padding:28px 0 56px; color:var(--dim); font-size:14px; border-top:1px solid var(--line); }
+
+footer {
+  padding:34px 0 64px; color:var(--dim); font-size:14px;
+  border-top:1px solid var(--line); margin-top:26px;
+}
 footer a { color:var(--dim); }
+
+/* ---- entrance ------------------------------------------------------------ */
+/* Content is VISIBLE by default. The hidden-then-revealed state is gated behind
+   `.js-reveal`, which the script adds to <html> only once it has confirmed it can
+   actually animate. So every failure mode — script blocked, script errored, no
+   IntersectionObserver, reduced-motion, a renderer that never runs transitions —
+   leaves a fully readable page instead of a blank one.
+   Starting at opacity:0 unconditionally is the version of this that ships an
+   invisible website the first time anything goes wrong. */
+.js-reveal .reveal { opacity:0; transform:translateY(18px); transition:opacity .7s var(--ease), transform .7s var(--ease); }
+.js-reveal .reveal.in { opacity:1; transform:none; }
+
+/* Motion is decoration. Anyone who has asked their OS to stop it gets a static
+   page — the content is identical either way. */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior:auto; }
+  body::after, .hero-art .halo, .hero-art svg circle, .dot { animation:none; }
+  .js-reveal .reveal { opacity:1; transform:none; transition:none; }
+  .card:hover, .btn:hover { transform:none; }
+}
