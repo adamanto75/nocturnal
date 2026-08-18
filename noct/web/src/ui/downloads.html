@@ -1,0 +1,53 @@
+<div class="hero"><div class="wrap">
+  <h1>Downloads</h1>
+  <p>Everything is built from source you can read. Binaries are published on GitHub Releases with
+     checksums.</p>
+</div></div>
+
+<section><div class="wrap">
+  <div class="note">
+    <p><b>Testnet only.</b> Coins obtained with these tools have no value and the chain will be
+       reset before mainnet. Do not buy NOCT from anyone: there is nothing to buy, and anyone
+       selling it is defrauding you.</p>
+  </div>
+  <h2>Releases</h2>
+  <p>Builds and checksums are published on GitHub. Verify the checksum before running anything
+     that will touch your keys.</p>
+  <div class="btns">
+    <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
+    <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
+  </div>
+  <p class="muted" style="margin-top:14px">No release is cut yet. Until one is, build from source.
+     It takes about a minute.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Build from source</h2>
+  <p>Rust is pinned to <b>1.82</b>. The <code>randomx</code> feature needs <code>cmake</code> and a
+     C++ toolchain.</p>
+<pre>git clone https://github.com/adamanto75/nocturnal
+cd nocturnal/noct
+
+cargo test --workspace                                # 290 tests
+cargo build --release -p noct-wallet --bins           # noct-cli, noct-walletd
+cargo build --release -p noct-node --features randomx # noctd, real PoW</pre>
+  <div class="note">
+    <p>Without <code>--features randomx</code>, <code>noctd</code> builds with a Keccak placeholder
+       proof of work and <b>cannot validate the real chain</b>. It will reject every block. To sync
+       a live network you need the RandomX build.</p>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Run a testnet node</h2>
+<pre>noctd --network testnet --data-dir ~/.noct-testnet
+noct-cli new --network testnet --wallet testnet.key
+noct-miner --address &lt;YOUR_TESTNET_ADDRESS&gt; --node 127.0.0.1:19334</pre>
+  <p class="muted">The node RPC is an <b>administrative</b> interface: it can start mining and
+     submit blocks. Keep it on loopback, or set a token and serve it over TLS.
+     <code>noctd</code> refuses to start with an unauthenticated RPC bound to a non-loopback
+     address.</p>
+  <h3>Back up your seed phrase</h3>
+  <p>A new wallet prints a 24-word phrase. It is the only way to recover the key. Write it down
+     offline. Anyone holding it holds the coins.</p>
+</div></section>

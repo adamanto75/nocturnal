@@ -36,7 +36,19 @@ use noct_wallet::client::NodeClient;
 
 /// The whole site, compiled in. One binary to deploy, and no directory of
 /// assets that can be served by accident or go missing.
-const INDEX_HTML: &str = include_str!("ui/index.html");
+const STYLE_CSS:  &str = include_str!("ui/style.css");
+const LOGO_SVG:   &str = include_str!("ui/logo.svg");
+const FAVICON_SVG:&str = include_str!("ui/favicon.svg");
+
+const HOME_HTML:       &str = include_str!("ui/home.html");
+const ABOUT_HTML:      &str = include_str!("ui/about.html");
+const WHITEPAPER_HTML: &str = include_str!("ui/whitepaper.html");
+const DOWNLOADS_HTML:  &str = include_str!("ui/downloads.html");
+const EXPLORER_HTML:   &str = include_str!("ui/explorer.html");
+
+/// The explorer is the only page carrying the live/snapshot switch, so it is
+/// the one `--emit-static` rewrites.
+const INDEX_HTML: &str = EXPLORER_HTML;
 
 /// Per-IP request budget, in cost units per second. Explorer reads are cheap but
 /// they each cost the node a round trip, so an unmetered page could be used to
@@ -124,7 +136,7 @@ fn main() {
         let ctx = Ctx { node, token, node_pin, trusted_proxies: HashSet::new() };
         match emit_static_site(&ctx, Path::new(&dir)) {
             Ok(n) => {
-                eprintln!("wrote {dir}/index.html and {dir}/chain.json ({n} blocks)");
+                eprintln!("wrote the site to {dir}/ (5 pages + chain.json, {n} blocks)");
                 return;
             }
             Err(e) => fail(&format!("--emit-static: {e}")),
@@ -254,7 +266,9 @@ fn handle(stream: Stream, ctx: &Ctx, limiter: &RateLimiter) -> std::io::Result<(
 
     // The whitelist. Everything not named here 404s.
     match route(&path) {
-        Route::Index => respond(&mut out, "200 OK", "text/html; charset=utf-8", INDEX_HTML),
+        Route::Page(p) => respond(&mut out, "200 OK", "text/html; charset=utf-8", &shell(p)),
+        Route::Style => respond(&mut out, "200 OK", "text/css; charset=utf-8", STYLE_CSS),
+        Route::Favicon => respond(&mut out, "200 OK", "image/svg+xml", FAVICON_SVG),
         Route::Info => {
             let body = ctx.client().info().unwrap_or_else(|e| err_json(&e));
             respond(&mut out, "200 OK", "application/json", &body)
@@ -272,11 +286,51 @@ fn handle(stream: Stream, ctx: &Ctx, limiter: &RateLimiter) -> std::io::Result<(
 }
 
 enum Route {
-    Index,
+    Page(Page),
+    Style,
+    Favicon,
     Info,
     Recent,
     Block(u64),
     NotFound,
+}
+
+/// Every page the site has. Adding a variant forces a match arm in `page_body`
+/// and a nav entry, so a page cannot be half-added.
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Home,
+    About,
+    Whitepaper,
+    Downloads,
+    Explorer,
+}
+
+impl Page {
+    /// (path, nav label, document title)
+    fn meta(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Page::Home => ("/", "Home", "Nocturnal — a privacy coin"),
+            Page::About => ("/about", "About", "About — Nocturnal"),
+            Page::Whitepaper => ("/whitepaper", "Whitepaper", "Whitepaper — Nocturnal"),
+            Page::Downloads => ("/downloads", "Downloads", "Downloads — Nocturnal"),
+            Page::Explorer => ("/explorer", "Explorer", "Testnet explorer — Nocturnal"),
+        }
+    }
+
+    fn body(self) -> &'static str {
+        match self {
+            Page::Home => HOME_HTML,
+            Page::About => ABOUT_HTML,
+            Page::Whitepaper => WHITEPAPER_HTML,
+            Page::Downloads => DOWNLOADS_HTML,
+            Page::Explorer => EXPLORER_HTML,
+        }
+    }
+
+    fn all() -> [Page; 5] {
+        [Page::Home, Page::About, Page::Whitepaper, Page::Downloads, Page::Explorer]
+    }
 }
 
 /// Map a request path to one of a fixed set of read-only actions.
@@ -287,11 +341,23 @@ enum Route {
 /// `/api/../mining/start` into a real problem.
 fn route(path: &str) -> Route {
     let path = path.split('?').next().unwrap_or("");
-    match path {
-        "/" | "/index.html" => Route::Index,
+    // Trailing slash tolerated on pages only, so /about/ and /about are one page
+    // rather than one working and one 404.
+    let trimmed = if path.len() > 1 { path.trim_end_matches('/') } else { path };
+
+    for page in Page::all() {
+        let (p, _, _) = page.meta();
+        if trimmed == p || (page == Page::Home && (path == "/" || path == "/index.html")) {
+            return Route::Page(page);
+        }
+    }
+
+    match trimmed {
+        "/style.css" => Route::Style,
+        "/favicon.svg" => Route::Favicon,
         "/api/info" => Route::Info,
         "/api/blocks" => Route::Recent,
-        _ => match path.strip_prefix("/api/block/") {
+        _ => match trimmed.strip_prefix("/api/block/") {
             // Parsed as a number, so nothing but digits can ever reach the node.
             Some(rest) => match rest.parse::<u64>() {
                 Ok(h) => Route::Block(h),
@@ -300,6 +366,52 @@ fn route(path: &str) -> Route {
             None => Route::NotFound,
         },
     }
+}
+
+/// Wrap a page fragment in the shared document: head, disclosure banner,
+/// navigation, footer.
+///
+/// One shell for every page, in code rather than copied into each HTML file.
+/// Duplicated navigation is how a site ends up with a link that exists on four
+/// pages out of five, and the disclosure banner in particular must not be
+/// something a new page can forget to include.
+fn shell(active: Page) -> String {
+    let (_, _, title) = active.meta();
+
+    let mut nav = String::new();
+    for page in Page::all() {
+        let (href, label, _) = page.meta();
+        let current = if page == active { " aria-current=\"page\"" } else { "" };
+        nav.push_str(&format!("<a class=\"link\" href=\"{href}\"{current}>{label}</a>"));
+    }
+    nav.push_str(
+        "<a class=\"link ext\" href=\"https://github.com/adamanto75/nocturnal\"          rel=\"noopener noreferrer\">GitHub</a>",
+    );
+
+    format!(
+        "<!doctype html>
+<html lang=\"en\">
+<head>
+         <meta charset=\"utf-8\">
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+         <title>{title}</title>
+         <meta name=\"description\" content=\"Nocturnal (NOCT) is a Monero-style privacy coin:          confidential amounts, ring signatures, stealth addresses. Testnet only.\">
+         <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">
+         <link rel=\"stylesheet\" href=\"/style.css\">
+         </head>
+<body>
+         <div class=\"alert\"><div class=\"wrap\">         <b>Testnet only.</b> Nocturnal has not launched. Coins on this network have no value and          the chain will be reset. The code is <b>unaudited</b>, and the planned launch includes a          <b>50% genesis premine</b> held by the founder.          <a href=\"/whitepaper\">Read the whitepaper</a> before doing anything else.         </div></div>
+         <nav class=\"nav\"><div class=\"wrap\">         <a class=\"brand\" href=\"/\">{logo}<span class=\"name\">Nocturnal</span>         <span class=\"tick\">NOCT</span></a>{nav}         </div></nav>
+         <main>{body}</main>
+         <footer><div class=\"wrap\">         <p>Nocturnal is experimental software. No warranty; no offer; nothing here is investment          advice. Source on <a href=\"https://github.com/adamanto75/nocturnal\"          rel=\"noopener noreferrer\">GitHub</a>, MIT licensed.</p>         </div></footer>
+</body>
+</html>
+",
+        title = title,
+        logo = LOGO_SVG,
+        nav = nav,
+        body = active.body(),
+    )
 }
 
 /// The most recent blocks, newest first.
@@ -406,12 +518,32 @@ fn emit_static_site(ctx: &Ctx, dir: &Path) -> Result<usize, String> {
              the page and the emitter have drifted apart"
         ));
     }
-    let page = INDEX_HTML.replace(SOURCE_MARKER, SOURCE_SNAPSHOT);
-
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+
+    // Every page, so a static publish is the whole site rather than one page
+    // with links that 404.
+    for page in Page::all() {
+        let (path, _, _) = page.meta();
+        let file = if path == "/" { "index.html".to_string() } else { format!("{}.html", path.trim_start_matches('/')) };
+        // Relative links, because a static bundle may not be served from a root.
+        let html = shell(page)
+            .replace(SOURCE_MARKER, SOURCE_SNAPSHOT)
+            .replace("href=\"/style.css\"", "href=\"style.css\"")
+            .replace("href=\"/favicon.svg\"", "href=\"favicon.svg\"")
+            .replace("href=\"/\"", "href=\"index.html\"");
+        let html = Page::all().iter().fold(html, |acc, p| {
+            let (href, _, _) = p.meta();
+            if href == "/" { acc } else {
+                acc.replace(&format!("href=\"{href}\""), &format!("href=\"{}.html\"", href.trim_start_matches('/')))
+            }
+        });
+        std::fs::write(dir.join(&file), html).map_err(|e| format!("writing {file}: {e}"))?;
+    }
+    std::fs::write(dir.join("style.css"), STYLE_CSS).map_err(|e| format!("writing style.css: {e}"))?;
+    std::fs::write(dir.join("favicon.svg"), FAVICON_SVG).map_err(|e| format!("writing favicon.svg: {e}"))?;
+
     let chain_json =
         format!("{{\"generated_at\":{generated_at},\"info\":{info},\"blocks\":[{}]}}", blocks.join(","));
-    std::fs::write(dir.join("index.html"), page).map_err(|e| format!("writing index.html: {e}"))?;
     std::fs::write(dir.join("chain.json"), chain_json).map_err(|e| format!("writing chain.json: {e}"))?;
     Ok(blocks.len())
 }
@@ -521,8 +653,16 @@ mod tests {
     /// because everything 404s.
     #[test]
     fn the_read_only_routes_resolve() {
-        assert!(matches!(route("/"), Route::Index));
-        assert!(matches!(route("/index.html"), Route::Index));
+        assert!(matches!(route("/"), Route::Page(Page::Home)));
+        assert!(matches!(route("/index.html"), Route::Page(Page::Home)));
+        assert!(matches!(route("/about"), Route::Page(Page::About)));
+        assert!(matches!(route("/whitepaper"), Route::Page(Page::Whitepaper)));
+        assert!(matches!(route("/downloads"), Route::Page(Page::Downloads)));
+        assert!(matches!(route("/explorer"), Route::Page(Page::Explorer)));
+        // A trailing slash is the same page, not a 404.
+        assert!(matches!(route("/about/"), Route::Page(Page::About)));
+        assert!(matches!(route("/style.css"), Route::Style));
+        assert!(matches!(route("/favicon.svg"), Route::Favicon));
         assert!(matches!(route("/api/info"), Route::Info));
         assert!(matches!(route("/api/blocks"), Route::Recent));
         assert!(matches!(route("/api/block/0"), Route::Block(0)));
@@ -548,12 +688,41 @@ mod tests {
     /// immutable network gives no second chance to correct that.
     #[test]
     fn the_page_carries_exactly_one_rewritable_source_marker() {
-        assert_eq!(INDEX_HTML.matches(SOURCE_MARKER).count(), 1, "index.html marker drifted");
+        assert_eq!(EXPLORER_HTML.matches(SOURCE_MARKER).count(), 1, "explorer marker drifted");
         assert_eq!(INDEX_HTML.matches(SOURCE_SNAPSHOT).count(), 0, "page already says snapshot");
 
         let published = INDEX_HTML.replace(SOURCE_MARKER, SOURCE_SNAPSHOT);
         assert!(published.contains(SOURCE_SNAPSHOT));
         assert!(!published.contains(SOURCE_MARKER));
+    }
+
+    /// Every page renders through the one shell, so none of them can quietly
+    /// lose the disclosure banner or the navigation. A new `Page` variant that
+    /// nobody wired up fails here rather than shipping a bare fragment.
+    #[test]
+    fn every_page_renders_with_the_banner_and_full_nav() {
+        for page in Page::all() {
+            let (path, label, title) = page.meta();
+            let html = shell(page);
+
+            assert!(html.starts_with("<!doctype html>"), "{path} is not a whole document");
+            assert!(html.contains(title), "{path} lost its title");
+            assert!(html.contains("Testnet only."), "{path} lost the disclosure banner");
+            assert!(html.contains("50% genesis premine"), "{path} lost the premine disclosure");
+            assert!(html.contains("nocturnal-g"), "{path} lost the logo");
+            assert!(!page.body().is_empty(), "{label} has no content");
+
+            // Every other page is reachable from this one.
+            for other in Page::all() {
+                let (href, _, _) = other.meta();
+                assert!(
+                    html.contains(&format!("href=\"{href}\"")),
+                    "{path} has no link to {href}"
+                );
+            }
+            // Exactly one nav item is marked current.
+            assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{path} current-page marker");
+        }
     }
 
     /// A published page must not reach off its own origin. The whole point of

@@ -1,0 +1,154 @@
+<div class="hero"><div class="wrap">
+  <h1>Nocturnal: a small, readable privacy coin</h1>
+  <p>Borrowed cryptography, a new chain, published reasoning. Version 0.1 — draft, pre-mainnet.</p>
+</div></div>
+
+<section><div class="wrap">
+  <h2>Abstract</h2>
+  <p>Nocturnal is a proof-of-work chain with confidential amounts, sender ambiguity and unlinkable
+     recipients. It deliberately contributes no new cryptography: commitments, range proofs and
+     ring signatures are taken from the <code>monero-oxide</code> crates, which implement Monero's
+     reviewed construction. The contribution is the chain around them — written to be small enough
+     that one reviewer can read all of it, with the reasoning behind each rule written down and the
+     internal security review published in full, including the parts that turned out to be wrong.</p>
+  <p class="muted">This document describes intent and design. The normative rules live in the
+     <a href="https://github.com/adamanto75/nocturnal/blob/main/noct/docs/SPECIFICATION.md">protocol
+     specification</a>; where the two disagree, the specification and then the code are
+     authoritative.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>1. The problem</h2>
+  <p>A transparent ledger publishes every payment forever. Anyone who learns one address learns a
+     balance, a set of counterparties, and — by intersecting timing and amounts — often an
+     identity. Chain analysis is a mature industry precisely because the data is simply sitting
+     there waiting to be read.</p>
+  <p>Money should not work that way. Cash does not itemise your life to strangers. The technical
+     problem is to build a ledger everyone can verify but nobody can read, and that problem is
+     solved: Monero has run this construction under sustained adversarial pressure for a decade.</p>
+  <p>So Nocturnal does not attempt a cryptographic contribution. It asks a narrower question: how
+     small and how legible can the surrounding chain be, if the cryptography is treated as a
+     dependency rather than an achievement?</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>2. Design</h2>
+
+  <h3>2.1 Confidential amounts</h3>
+  <p>Every output carries a Pedersen commitment <code>C = xG + aH</code> rather than a plaintext
+     amount. Commitments are additively homomorphic, so a verifier can confirm that inputs equal
+     outputs plus fee without learning any individual value. Each output additionally carries an
+     aggregated Bulletproofs+ range proof establishing that the amount lies in
+     <code>[0, 2^64)</code> — without which a negative amount could mint supply from nothing.</p>
+
+  <h3>2.2 Sender ambiguity</h3>
+  <p>Inputs are signed with CLSAG ring signatures over <b>exactly sixteen</b> members. The
+     signature proves the signer owns one of the sixteen without revealing which. A key image,
+     deterministic in the spent key, prevents double spends: spend the same output twice and the
+     same image appears twice, and the second is rejected.</p>
+  <p>The ring size is fixed rather than a floor, and that distinction matters. A variable ring size
+     is itself a fingerprint: the count partitions users by whichever wallet, version or setting
+     produced it, so a user who picks an unusually large ring becomes <em>less</em> private, not
+     more. Uniformity is the property being defended.</p>
+
+  <h3>2.3 Unlinkable recipients</h3>
+  <p>Each output is paid to a one-time key derived from the recipient's address and a
+     per-transaction secret, so two payments to the same person share no on-chain identifier.
+     Subaddresses let a single wallet hand out unlimited distinct receiving addresses under one
+     view key, so a merchant can publish a fresh address per customer without managing more keys.</p>
+
+  <h3>2.4 Proof of work</h3>
+  <p>RandomX — the same function Monero uses — chosen because it is designed to run well on general
+     purpose CPUs and poorly on specialised hardware. This is a distribution argument rather than a
+     security one: a chain that ordinary machines can mine spreads issuance wider than one that
+     requires a fabrication plant.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>3. Consensus</h2>
+  <p>Blocks target 120 seconds. Difficulty retargets over a windowed average with a lag, outlier
+     trimming at both ends, and a per-step clamp — three independent defences, because an unbounded
+     retarget compounds after a burst of fast blocks and can leave the chain unmineable.</p>
+  <p>Fork choice is <b>cumulative difficulty</b>, not height. This matters more than it sounds. An
+     earlier version advertised chain height in its gossip messages while consensus compared work,
+     so a peer holding a shorter but heavier branch had no way to say anything the network would
+     act on. That is a persistent chain split with no attacker involved. It was found and fixed
+     before launch, and it is the kind of defect that only shows up when someone writes down what
+     each layer actually believes.</p>
+  <p>Coinbase outputs mature for sixty blocks before they can be spent — including as ring decoys,
+     since ring signatures hide which member is real — so a reorg cannot invalidate an
+     already-spent fresh coinbase.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>4. Economics</h2>
+  <p>Supply approaches <b>1,000,000 NOCT</b> asymptotically along a smooth emission curve, followed
+     by a <b>0.03 NOCT</b> tail emission that never terminates. A permanent tail is deliberate: a
+     chain whose security budget falls to zero must rely entirely on transaction fees, and no
+     proof-of-work chain has yet demonstrated that this holds in practice.</p>
+  <p>Block rewards are consequently sub-NOCT from the start — roughly 0.95 NOCT at genesis,
+     decaying from there. Simulated across the entire smooth phase, emission reaches 96.85% of the
+     supply parameter after about 3.6 million blocks.</p>
+
+  <h3 id="premine">4.1 The premine, stated plainly</h3>
+  <p>The planned mainnet genesis block mints <b>500,000 NOCT to the founder — 50% of the supply
+     parameter</b>. This is the most consequential economic decision in the project and the one
+     every reader should interrogate hardest.</p>
+  <p><b>The case against.</b> Monero has no premine, and that fact underwrites a great deal of its
+     credibility. A 50% allocation means one party holds as much as every future miner combined,
+     forever. It is the single largest concentration risk here, it invites precisely the criticism
+     that sinks projects, and no amount of technical care offsets it if you consider the
+     distribution illegitimate. A reader who stops at this paragraph and walks away is behaving
+     rationally.</p>
+  <p><b>The case for.</b> It is disclosed everywhere — this document, the front page of the
+     website, the README, the specification and the security review — rather than discovered later
+     by someone reading a genesis block. It is a fixed, verifiable, one-time number rather than an
+     ongoing founder's reward or a permanent tax on every block. There is no sale, no allocation
+     round, no private round at a better price, and nothing being offered to anyone.</p>
+  <p><b>What is not yet decided.</b> Whether the allocation vests, burns down over time, or funds
+     anything specific. Until that question is answered publicly and verifiably, the honest
+     description is the plain one: half the coin, held by one person.</p>
+  <p class="muted">On testnet the premine is a tenth of this and its seed phrase is published in the
+     repository, so the mechanism is independently verifiable and the coins are unmistakably
+     worthless.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>5. What is not claimed</h2>
+  <ul>
+    <li><b>No audit.</b> Nineteen internal review passes and one independent model review have found
+        real defects — including an 8.79-second denial of service reachable by any peer, and the
+        fork-choice mismatch described above. Internal review is an argument about the code, not
+        evidence about it, which is why it is published in full rather than summarised.</li>
+    <li><b>No network-layer anonymity.</b> Transactions relay over Dandelion++, which frustrates
+        naive origin tracing. It is not Tor, and an adversary who can observe the whole network is
+        not defeated by it.</li>
+    <li><b>Clock dependence.</b> One validity rule — the future-timestamp bound — depends on the
+        validating node's wall clock rather than on chain data. This is deliberate and matches both
+        Bitcoin and Monero: the alternative makes recovery from a long network outage impossible.</li>
+    <li><b>Uniform decoy selection.</b> Ring members are drawn uniformly rather than from a
+        distribution calibrated to real spending behaviour. This is weaker than Monero's gamma
+        selection and is a known, documented gap.</li>
+  </ul>
+</div></section>
+
+<section><div class="wrap">
+  <h2>6. Status, and what has to happen next</h2>
+  <p>A public testnet is running. Mainnet parameters — genesis timestamp, address tags, the RandomX
+     seed schedule — are still placeholders.</p>
+  <ul>
+    <li>A long and genuinely adversarial testnet</li>
+    <li>A professional third-party audit, which has not been commissioned</li>
+    <li>Gamma-calibrated decoy selection</li>
+    <li>A published, verifiable decision on the premine's disposition</li>
+  </ul>
+  <p>Until those are done, Nocturnal is a research chain with a working implementation. It is not
+     money, and nothing here is an offer or investment advice. It is published now so that it can
+     be read, disagreed with, and broken by people who are not its author — which is the only
+     process that has ever produced trustworthy money software.</p>
+  <div class="btns">
+    <a class="btn primary" href="https://github.com/adamanto75/nocturnal">Read the source</a>
+    <a class="btn" href="https://github.com/adamanto75/nocturnal/blob/main/noct/docs/SPECIFICATION.md">Protocol specification</a>
+    <a class="btn" href="https://github.com/adamanto75/nocturnal/blob/main/noct/SECURITY-REVIEW.md">Security review</a>
+  </div>
+</div></section>

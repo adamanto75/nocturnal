@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Nocturnal">
+  <defs>
+    <linearGradient id="nocturnal-g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a897ff"/>
+      <stop offset="1" stop-color="#5b45d6"/>
+    </linearGradient>
+  </defs>
+  <circle cx="32" cy="32" r="28" fill="none" stroke="url(#nocturnal-g)" stroke-width="2.5"
+          stroke-linecap="round" stroke-dasharray="72 16" transform="rotate(-40 32 32)" opacity=".85"/>
+  <path d="M46 17.5 A19 19 0 1 0 46 46.5 A15.5 15.5 0 1 1 46 17.5 Z" fill="url(#nocturnal-g)"/>
+</svg>

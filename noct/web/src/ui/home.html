@@ -1,0 +1,45 @@
+<div class="hero">
+  <div class="wrap">
+    <h1>A privacy coin that hides amounts,<br>senders and recipients.</h1>
+    <p>Nocturnal is a Monero-style chain in Rust. Confidential amounts, ring signatures over a
+       fixed ring of 16, one-time stealth addresses, and proof of work that runs on the CPU you
+       already own.</p>
+    <div class="btns">
+      <a class="btn primary" href="/downloads">Get the wallet</a>
+      <a class="btn" href="/whitepaper">Read the whitepaper</a>
+      <a class="btn" href="/explorer">Testnet explorer</a>
+    </div>
+  </div>
+</div>
+
+<section><div class="wrap">
+  <h2>What it is</h2>
+  <p>Amounts are hidden by Pedersen commitments with Bulletproofs+ range proofs, senders by CLSAG
+     ring signatures, and recipients by one-time stealth addresses derived per output. Proof of
+     work is RandomX, designed to run on ordinary CPUs rather than specialised hardware.</p>
+  <p>The cryptography is deliberately <em>not</em> novel. It uses the <code>monero-oxide</code>
+     crates, which are Monero's reviewed construction, so it can be audited by comparison against a
+     system that has been attacked for a decade. What is new here is the surrounding chain, and
+     that is the part being tested.</p>
+  <div class="grid" style="margin-top:18px">
+    <div class="card"><h3>Confidential amounts</h3><p>Pedersen commitments, aggregated Bulletproofs+ range proofs.</p></div>
+    <div class="card"><h3>Sender ambiguity</h3><p>CLSAG ring signatures over exactly 16 members, so the ring size is not itself a fingerprint.</p></div>
+    <div class="card"><h3>Unlinkable recipients</h3><p>One-time stealth keys; subaddresses under a single view key.</p></div>
+    <div class="card"><h3>CPU mining</h3><p>RandomX, 120-second target, ~1,000,000 NOCT asymptote.</p></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Where it stands</h2>
+  <p>Stated plainly, because you should not have to dig for it.</p>
+  <ul>
+    <li><b>Not launched.</b> This is a testnet. Coins have no value and the chain will be reset.</li>
+    <li><b>Unaudited.</b> Nineteen internal review passes and one independent model review found and
+        fixed real bugs, including an 8.79-second denial of service and a fork-choice rule that
+        disagreed with consensus. No professional audit has been commissioned.</li>
+    <li><b>50% premine.</b> The planned mainnet genesis mints 500,000 NOCT to the founder, half the
+        supply parameter. Argued in full in the <a href="/whitepaper">whitepaper</a>.</li>
+  </ul>
+  <p class="muted">The full internal security review is published in the repository, including the
+     bugs found and the conclusions that later turned out to be wrong.</p>
+</div></section>

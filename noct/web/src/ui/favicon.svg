@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Nocturnal">
+  <defs>
+    <linearGradient id="f" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b5a6ff"/>
+      <stop offset="1" stop-color="#5b45d6"/>
+    </linearGradient>
+  </defs>
+  <path d="M44 6 A28 28 0 1 0 44 58 A22 22 0 1 1 44 6 Z" fill="url(#f)"/>
+</svg>

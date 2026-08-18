@@ -73,18 +73,43 @@ mod tests {
     }
 
     #[test]
-    fn a_mistyped_word_is_rejected_by_the_checksum() {
-        let secret = Account::random(&mut OsRng).spend_secret.to_bytes();
-        let phrase = to_phrase(&secret);
-        let mut words: Vec<&str> = phrase.split_whitespace().collect();
-        // Swap the first word for a different valid BIP39 word → checksum fails
-        // (extremely likely; 255/256 of checksums differ).
-        words[0] = if words[0] == "zoo" { "abandon" } else { "zoo" };
-        let tampered = words.join(" ");
-        assert_eq!(from_phrase(&tampered), Err(MnemonicError::Invalid));
+    fn a_mistyped_word_never_restores_the_same_wallet() {
+        // Swapping one word changes 11 bits of entropy, and the checksum is only
+        // 8 bits, so about one tampered phrase in 256 still checksums cleanly.
+        // The previous version of this test asserted outright rejection and
+        // therefore failed roughly 0.4% of the time — observed in a real run, not
+        // theorised. A test that fails occasionally for no reason is worse than
+        // no test: it trains you to re-run until green and eventually to ignore
+        // a genuine regression.
+        //
+        // The property that actually matters is total, so assert that instead: a
+        // mistyped phrase must never silently restore the ORIGINAL wallet. Being
+        // rejected is the common outcome and being decoded to some unrelated key
+        // is the rare one; both are safe. Recovering the same secret from a
+        // phrase the user did not type would be the real defect.
+        for _ in 0..64 {
+            let secret = Account::random(&mut OsRng).spend_secret.to_bytes();
+            let phrase = to_phrase(&secret);
+            let mut words: Vec<&str> = phrase.split_whitespace().collect();
+            words[0] = if words[0] == "zoo" { "abandon" } else { "zoo" };
+            let tampered = words.join(" ");
+            assert_ne!(tampered, phrase, "tampering did not change the phrase");
+
+            match from_phrase(&tampered) {
+                // Overwhelmingly the common path: the checksum catches it.
+                Err(MnemonicError::Invalid) => {}
+                Err(e) => panic!("a tampered phrase gave an unexpected error: {e:?}"),
+                // Rare but legitimate: a different valid phrase, so a different
+                // wallet. It must not be the one the user actually owns.
+                Ok(recovered) => assert_ne!(
+                    recovered, secret,
+                    "a mistyped word restored the original wallet"
+                ),
+            }
+        }
     }
 
-    #[test]
+        #[test]
     fn garbage_and_wrong_length_are_rejected() {
         assert_eq!(from_phrase("not a real phrase"), Err(MnemonicError::Invalid));
         // A valid 12-word phrase encodes 16 bytes, not a 32-byte spend key.

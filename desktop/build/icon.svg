@@ -1,23 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Nocturnal">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1b2027"/>
-      <stop offset="1" stop-color="#0a0d10"/>
+      <stop offset="0" stop-color="#181c26"/><stop offset="1" stop-color="#0b0d12"/>
     </linearGradient>
-    <linearGradient id="moon" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#3ee0a4"/>
-      <stop offset="1" stop-color="#22a377"/>
+    <linearGradient id="fg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b5a6ff"/><stop offset="1" stop-color="#5b45d6"/>
     </linearGradient>
-    <mask id="crescent">
-      <rect width="1024" height="1024" fill="black"/>
-      <circle cx="500" cy="524" r="286" fill="white"/>
-      <circle cx="628" cy="430" r="252" fill="black"/>
-    </mask>
   </defs>
-  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
-  <rect width="1024" height="1024" fill="url(#moon)" mask="url(#crescent)"/>
-  <!-- a few stars -->
-  <circle cx="700" cy="300" r="10" fill="#e7edf3" opacity="0.9"/>
-  <circle cx="760" cy="380" r="6" fill="#e7edf3" opacity="0.7"/>
-  <circle cx="330" cy="720" r="7" fill="#e7edf3" opacity="0.6"/>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="176" fill="none" stroke="url(#fg)" stroke-width="16"
+          stroke-linecap="round" stroke-dasharray="452 101" transform="rotate(-40 256 256)" opacity=".85"/>
+  <path d="M344 140 A120 120 0 1 0 344 372 A98 98 0 1 1 344 140 Z" fill="url(#fg)"/>
 </svg>

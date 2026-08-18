@@ -1,0 +1,119 @@
+<div class="hero"><div class="wrap">
+  <h1>Testnet explorer</h1>
+  <p id="chain-note" class="muted">Reading from a testnet node...</p>
+</div></div>
+
+<section><div class="wrap">
+  <div class="grid" style="margin-bottom:16px">
+    <div class="stat"><div class="k">Height</div><div class="v" id="s-height">-</div></div>
+    <div class="stat"><div class="k">Outputs</div><div class="v" id="s-outputs">-</div></div>
+    <div class="stat"><div class="k">Emitted</div><div class="v" id="s-emitted">-</div></div>
+    <div class="stat"><div class="k">Peers</div><div class="v" id="s-peers">-</div></div>
+  </div>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Height</th><th>Block id</th><th>Time</th><th>Txs</th><th>Reward</th></tr></thead>
+      <tbody id="blocks"><tr><td colspan="5" class="muted">loading...</td></tr></tbody>
+    </table>
+  </div>
+  <p class="muted" style="margin-top:16px">Blocks here are almost all empty coinbases: the testnet
+     has no traffic beyond mining. That is expected, not a fault.</p>
+</div></section>
+
+<script>
+  // Where chain data comes from. `noct-web --emit-static` rewrites this single
+  // literal to "snapshot" when publishing to a network that has no server to
+  // ask. Keep it on one line and unique; the emitter asserts it replaced
+  // exactly one occurrence.
+  const CHAIN_SOURCE = "live";
+
+  // Either way the page only ever fetches from its own origin. Pointing it at
+  // an absolute API URL would make every visitor's browser connect to whoever
+  // runs that API, which for a privacy coin's site is the one thing worth
+  // refusing outright.
+  const $ = (id) => document.getElementById(id);
+  const NOCT = 1e12;
+
+  const fmtAmount = (a) => (Number(a) / NOCT).toLocaleString(undefined, { maximumFractionDigits: 4 });
+  const fmtTime = (t) => {
+    const d = new Date(Number(t) * 1000);
+    return isNaN(d) ? "-" : d.toISOString().replace("T", " ").slice(0, 19) + "Z";
+  };
+  const short = (h) => (h && h.length > 20 ? h.slice(0, 10) + "…" + h.slice(-8) : (h || "-"));
+
+  // textContent everywhere, never innerHTML with fetched values: block ids and
+  // any future node-supplied string are untrusted as far as this page cares.
+  function cell(row, text, cls) {
+    const td = document.createElement("td");
+    td.textContent = text;
+    if (cls) td.className = cls;
+    row.appendChild(td);
+  }
+
+  async function snapshot() {
+    const snap = await (await fetch("chain.json")).json();
+    return { info: snap.info, blocks: snap.blocks, taken: snap.generated_at };
+  }
+
+  async function live() {
+    const [info, recent] = await Promise.all([
+      fetch("/api/info").then((r) => r.json()),
+      fetch("/api/blocks").then((r) => r.json()),
+    ]);
+    if (info.error) throw new Error(info.error);
+    return { info, blocks: recent.blocks, taken: null };
+  }
+
+  async function load() {
+    let data = null;
+    try {
+      data = CHAIN_SOURCE === "snapshot" ? await snapshot() : await live();
+    } catch (e) {
+      $("chain-note").textContent =
+        CHAIN_SOURCE === "snapshot"
+          ? "The published chain snapshot could not be read."
+          : "Explorer is offline right now (the node is unreachable).";
+    }
+
+    if (data) {
+      const info = data.info || {};
+      $("s-height").textContent = info.height ?? "-";
+      $("s-outputs").textContent = info.outputs ?? "-";
+      $("s-emitted").textContent = info.emitted != null ? fmtAmount(info.emitted) : "-";
+      $("s-peers").textContent = info.peers ?? "-";
+      // Never call a snapshot "live". On an immutable network this page may
+      // still be readable years from now, and a stale number presented as
+      // current is worse than no number at all.
+      $("chain-note").textContent = data.taken
+        ? "Snapshot taken " + fmtTime(data.taken) + " — not live. Coins here are worthless."
+        : "Live testnet — coins here are worthless.";
+    }
+
+    const body = $("blocks");
+    const placeholder = (text) => {
+      body.textContent = "";
+      const tr = document.createElement("tr");
+      cell(tr, text, "muted");
+      tr.firstChild.colSpan = 5;
+      body.appendChild(tr);
+    };
+
+    if (!data) { placeholder("unavailable"); return; }
+    const rows = data.blocks || [];
+    if (!rows.length) { placeholder("no blocks yet"); return; }
+    body.textContent = "";
+    for (const b of rows) {
+      const tr = document.createElement("tr");
+      cell(tr, b.height);
+      cell(tr, short(b.id), "mono hash");
+      cell(tr, fmtTime(b.timestamp), "muted");
+      cell(tr, b.txs);
+      cell(tr, fmtAmount(b.reward), "mono");
+      body.appendChild(tr);
+    }
+  }
+
+  load();
+  // Nothing to poll when the data is a file published beside the page.
+  if (CHAIN_SOURCE !== "snapshot") setInterval(load, 30000);
+</script>
