@@ -200,6 +200,23 @@ fn main() {
                     eprintln!("✔ block at height {height} accepted (total {found}) — {}", reply.trim());
                     break;
                 }
+                // "Duplicate" *after a retry* means our own earlier attempt
+                // arrived after all — the send succeeded and only the reply was
+                // lost, which is exactly what a read timeout looks like. The
+                // work was credited; reporting it as a rejection tells the miner
+                // it is losing shares it is actually being paid for, and makes a
+                // healthy pool look like it is refusing everything.
+                //
+                // Only on a retry. A duplicate on the *first* attempt is a
+                // genuine replay and must still be reported.
+                Ok(reply) if attempt > 0 && reply.contains("duplicate share") => {
+                    found += 1;
+                    eprintln!(
+                        "✔ block at height {height} accepted (total {found}) — the first attempt \
+                         had landed; only its reply was lost"
+                    );
+                    break;
+                }
                 // The node understood us and said no (stale/invalid) — retrying
                 // cannot help.
                 Ok(reply) => {
@@ -294,4 +311,54 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 fn fail(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
+}
+
+/// A solved share that the pool accepted must not be reported to the miner as a
+/// rejection just because the reply was lost in transit.
+///
+/// Reproduced live: with a low share target the pool answers slowly enough that
+/// the miner's read times out (`os error 11`), the miner retries the identical
+/// nonce, and the pool — which recorded that nonce on the first attempt —
+/// answers `duplicate share`. The work *was* credited. Reported as a rejection
+/// it looks like the pool is refusing everything, which is what sent a real
+/// investigation down the wrong path.
+#[cfg(test)]
+mod submit_retry_tests {
+    /// The rule under test, isolated from the socket: a duplicate is success
+    /// only when we are retrying, because then the duplicate is *our own*
+    /// earlier attempt.
+    fn duplicate_means_accepted(attempt: u32, reply: &str) -> bool {
+        attempt > 0 && reply.contains("duplicate share")
+    }
+
+    #[test]
+    fn a_duplicate_after_a_retry_is_our_own_landed_attempt() {
+        let dup = r#"{"status":"rejected","reason":"duplicate share"}"#;
+        assert!(duplicate_means_accepted(1, dup), "the retry found our own share already recorded");
+        assert!(duplicate_means_accepted(2, dup));
+    }
+
+    /// On the first attempt nothing of ours can already be there, so a duplicate
+    /// is a genuine replay and must stay a rejection — otherwise a miner could
+    /// be credited for work it never did.
+    #[test]
+    fn a_duplicate_on_the_first_attempt_is_still_a_rejection() {
+        let dup = r#"{"status":"rejected","reason":"duplicate share"}"#;
+        assert!(!duplicate_means_accepted(0, dup));
+    }
+
+    /// Every other refusal stays a refusal at any attempt number. A stale job or
+    /// a share under target is not evidence that anything was credited.
+    #[test]
+    fn other_rejections_are_never_reinterpreted() {
+        for reply in [
+            r#"{"status":"rejected","reason":"stale job"}"#,
+            r#"{"status":"rejected","reason":"share does not meet the target"}"#,
+            r#"{"error":"rate limited"}"#,
+        ] {
+            for attempt in 0..3 {
+                assert!(!duplicate_means_accepted(attempt, reply), "{reply} must stay rejected");
+            }
+        }
+    }
 }
