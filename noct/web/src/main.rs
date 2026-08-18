@@ -559,21 +559,43 @@ fn err_json(msg: &str) -> String {
     "{\"error\":\"upstream node unavailable\"}".to_string()
 }
 
-fn respond(out: &mut Stream, status: &str, content_type: &str, body: &str) -> std::io::Result<()> {
-    // A static, restrictive CSP: the page is self-contained, so nothing should
-    // ever be fetched from another origin. For a privacy coin's site that is not
-    // decoration — a third-party font or script would report every visitor to
-    // whoever serves it.
-    let response = format!(
+/// The security headers every response carries.
+///
+/// A static, restrictive CSP: the page is self-contained, so nothing should ever
+/// be fetched from another origin. For a privacy coin's site that is not
+/// decoration — a third-party font or script would report every visitor to
+/// whoever serves it.
+///
+/// `style-src` lists **both** `'self'` and `'unsafe-inline'`, and the pair is not
+/// redundant. They are different permissions: `'unsafe-inline'` allows a
+/// `<style>` block or a `style="..."` attribute, while `<link rel=stylesheet>`
+/// needs `'self'`. While the CSS was inline the policy happened to cover it;
+/// moving it to `/style.css` needed `'self'` and, without it, every page rendered
+/// as bare unstyled HTML in a browser. `img-src 'self'` is here for the favicon
+/// for exactly the same reason.
+///
+/// Kept as a separate function returning a String so a test can read it. The
+/// outage above survived a `curl` check that returned 200 for both the page and
+/// the stylesheet, because **curl does not enforce CSP** — a served byte is not
+/// a permitted byte.
+fn response_head(status: &str, content_type: &str, len: usize) -> String {
+    let csp = "default-src 'none'; style-src 'self' 'unsafe-inline'; \
+script-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; \
+base-uri 'none'; form-action 'none'";
+    format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
-         Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'\r\n\
+         Content-Length: {len}\r\n\
+         Content-Security-Policy: {csp}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
+         Connection: close\r\n\r\n"
+    )
+}
+
+fn respond(out: &mut Stream, status: &str, content_type: &str, body: &str) -> std::io::Result<()> {
+    let mut response = response_head(status, content_type, body.len());
+    response.push_str(body);
     out.write_all(response.as_bytes())?;
     out.flush()?;
     out.close();
@@ -722,6 +744,71 @@ mod tests {
             }
             // Exactly one nav item is marked current.
             assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{path} current-page marker");
+        }
+    }
+
+    /// The CSP must actually permit every resource the pages reference.
+    ///
+    /// This exists because of a real outage. When the CSS was inline, the policy
+    /// `style-src 'unsafe-inline'` covered it. Moving it to `/style.css` needed
+    /// `style-src 'self'`, which is a DIFFERENT permission — so every page
+    /// rendered as bare unstyled HTML in a browser while `curl` happily reported
+    /// 200 for both the page and the stylesheet.
+    ///
+    /// That is the trap: **curl does not enforce CSP.** A status code proves the
+    /// bytes were served, not that a browser is allowed to use them. So assert
+    /// the relationship between what the document asks for and what the policy
+    /// grants, which is checkable without a browser.
+    #[test]
+    fn the_csp_permits_every_resource_the_pages_reference() {
+        let head = response_head("200 OK", "text/html; charset=utf-8", 0);
+        let csp = head
+            .lines()
+            .find(|l| l.trim().to_ascii_lowercase().starts_with("content-security-policy:"))
+            .expect("no CSP header emitted")
+            .to_ascii_lowercase();
+
+        let directive = |name: &str| -> &str {
+            csp.split(';')
+                .map(str::trim)
+                .find(|d| d.starts_with(name))
+                .unwrap_or("")
+        };
+
+        for page in Page::all() {
+            let (path, _, _) = page.meta();
+            let html = shell(page);
+
+            if html.contains("rel=\"stylesheet\"") {
+                assert!(
+                    directive("style-src").contains("'self'"),
+                    "{path} links a stylesheet but style-src lacks 'self' — the browser will                      refuse it and the page renders unstyled. CSP: {csp}"
+                );
+            }
+            if html.contains("rel=\"icon\"") {
+                assert!(
+                    directive("img-src").contains("'self'"),
+                    "{path} links a favicon but img-src lacks 'self'. CSP: {csp}"
+                );
+            }
+            if html.contains("<script") {
+                assert!(
+                    directive("script-src").contains("'unsafe-inline'"),
+                    "{path} has an inline script but script-src forbids it. CSP: {csp}"
+                );
+            }
+            if html.contains("style=\"") {
+                assert!(
+                    directive("style-src").contains("'unsafe-inline'"),
+                    "{path} uses inline style attributes but style-src forbids them. CSP: {csp}"
+                );
+            }
+            if html.contains("fetch(") {
+                assert!(
+                    directive("connect-src").contains("'self'"),
+                    "{path} fetches but connect-src lacks 'self'. CSP: {csp}"
+                );
+            }
         }
     }
 
