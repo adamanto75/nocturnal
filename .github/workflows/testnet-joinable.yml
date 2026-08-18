@@ -1,0 +1,94 @@
+# Can a stranger actually join the Nocturnal testnet?
+#
+# Everything else we can check from inside the network answers a weaker
+# question. A port that looks open from behind your own NAT proves nothing —
+# hairpin makes a working forward and a broken one look identical, and it has
+# produced a wrong diagnosis on this project more than once.
+#
+# A GitHub runner is a machine we do not own, on a network we do not control,
+# with no route to the seeds except the public internet. It downloads the
+# published release exactly as a stranger would, checks the checksum, and tries
+# to sync. If this job passes, the testnet is joinable. If it fails, it was not
+# joinable for anyone, and we would rather find that out on a schedule than
+# from someone who gave up quietly.
+name: testnet joinable
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  join-from-outside:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RELEASE: v0.1.0-testnet
+      TARBALL: nocturnal-v0.1.0-testnet-linux-x64.tar.gz
+      # Deliberately far below the live tip: this asserts "it really synced the
+      # chain", not "the chain is exactly this tall today".
+      MIN_HEIGHT: 100
+
+    steps:
+      - name: Download the published release, as a stranger would
+        run: |
+          set -euo pipefail
+          B="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE}"
+          curl -fsSL -O "$B/${TARBALL}"
+          curl -fsSL -O "$B/SHA256SUMS.txt"
+          grep 'linux-x64' SHA256SUMS.txt > linux.sha256
+          sha256sum -c linux.sha256
+          tar xzf "${TARBALL}"
+          ./nocturnal-${RELEASE}/noctd --help || true
+
+      - name: Start a node with nothing but the baked-in public seeds
+        run: |
+          set -euo pipefail
+          # No --peer, no --seed: it must find the network on its own, through
+          # seed1/seed2.nocturnalcoin.com, over the public internet.
+          ./nocturnal-${RELEASE}/noctd \
+            --network testnet \
+            --data-dir "$PWD/chaindata" \
+            > noctd.log 2>&1 &
+          echo $! > noctd.pid
+          sleep 5
+          if ! kill -0 "$(cat noctd.pid)" 2>/dev/null; then
+            echo "::error::noctd exited immediately"
+            cat noctd.log
+            exit 1
+          fi
+          grep -E 'pow|network|seeds' noctd.log || true
+
+      - name: Wait for it to peer and sync
+        run: |
+          set -uo pipefail
+          peers=0; height=0
+          for i in $(seq 1 120); do
+            info=$(curl -fsS --max-time 10 http://127.0.0.1:19334/info 2>/dev/null || true)
+            if [ -n "$info" ]; then
+              height=$(printf '%s' "$info" | sed -e 's/.*"height"://' -e 's/,.*//')
+              peers=$(printf  '%s' "$info" | sed -e 's/.*"peers"://'  -e 's/[,}].*//')
+              echo "t=${i}0s peers=${peers} height=${height}"
+              if [ "${peers:-0}" -ge 1 ] && [ "${height:-0}" -ge "${MIN_HEIGHT}" ]; then
+                echo "SYNCED: peers=${peers} height=${height}"
+                echo "peers=${peers} height=${height}" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "::error::never reached ${MIN_HEIGHT} blocks with a peer (last: peers=${peers} height=${height})"
+          echo "--- noctd.log ---"; tail -60 noctd.log
+          exit 1
+
+      - name: Report what the node saw, pass or fail
+        if: always()
+        run: |
+          curl -fsS --max-time 10 http://127.0.0.1:19334/info || echo "(RPC unreachable)"
+          echo
+          echo "--- noctd.log (tail) ---"
+          tail -40 noctd.log || true
+          kill "$(cat noctd.pid)" 2>/dev/null || true
