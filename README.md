@@ -3,7 +3,7 @@
 A Monero-style privacy coin in Rust. Confidential amounts, sender ambiguity,
 unlinkable one-time recipient addresses, CPU-friendly proof of work.
 
-**Website:** https://nocturnalcoin.com
+**Website:** https://nocturnalcoin.com &nbsp;·&nbsp; **Source:** https://github.com/adamanto75/nocturnal
 
 > ### Status: testnet. Unaudited. Read this before anything else.
 >
