@@ -26,16 +26,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      RELEASE: v0.1.0-testnet
-      TARBALL: nocturnal-v0.1.0-testnet-linux-x64.tar.gz
       # Deliberately far below the live tip: this asserts "it really synced the
       # chain", not "the chain is exactly this tall today".
       MIN_HEIGHT: 100
 
     steps:
-      - name: Download the published release, as a stranger would
+      - name: Download the newest published release, as a stranger would
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Resolve the newest release rather than pinning one. A stranger
+          # downloads whatever is current, so that is what has to be tested —
+          # a pinned tag would keep proving that an old build still works long
+          # after it stopped being what anyone gets. Prereleases count: every
+          # testnet release is one.
+          RELEASE=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1 --json tagName --jq '.[0].tagName')
+          [ -n "$RELEASE" ] || { echo "::error::no release found"; exit 1; }
+          echo "testing release $RELEASE"
+          echo "RELEASE=$RELEASE" >> "$GITHUB_ENV"
+          TARBALL="nocturnal-${RELEASE}-linux-x64.tar.gz"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
           B="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE}"
           curl -fsSL -O "$B/${TARBALL}"
           curl -fsSL -O "$B/SHA256SUMS.txt"
