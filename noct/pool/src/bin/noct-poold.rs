@@ -698,6 +698,7 @@ fn issue_difficulty(
     miner: &str,
     base: Difficulty,
     params: &VardiffParams,
+    now: std::time::Instant,
 ) -> Difficulty {
     let a = assignments.entry(miner.to_string()).or_insert_with(|| Assignment {
         current: base,
@@ -712,7 +713,26 @@ fn issue_difficulty(
     if !a.ewma_secs.is_finite() {
         return a.current;
     }
-    let next = vardiff::retarget(a.current, a.ewma_secs, params);
+    // An overdue share is evidence in its own right.
+    //
+    // `ewma_secs` is only written when a share ARRIVES. If the target is tuned
+    // above what this miner can find inside one batch of nonces, no share ever
+    // arrives, the average stays frozen at its last "this rig is fast" value,
+    // and the controller keeps re-issuing a target the miner cannot meet. It
+    // goes blind exactly when it has overshot, and there is no path back: the
+    // rig grinds at full CPU, earns nothing, and neither side can tell.
+    //
+    // Observed live — a rig issued difficulty 120,809,701 against a base of 200
+    // sat at 98% CPU for over three hours without submitting once.
+    //
+    // Time since the last accepted share is a lower bound on the interval now
+    // in progress, so take whichever is larger. Once a miner is overdue, that
+    // bound grows every time work is issued and drags the target back down.
+    let observed = match a.last_share {
+        Some(t) => a.ewma_secs.max(now.saturating_duration_since(t).as_secs_f64()),
+        None => a.ewma_secs,
+    };
+    let next = vardiff::retarget(a.current, observed, params);
     if next != a.current {
         a.previous = a.current;
         a.current = next;
@@ -897,7 +917,8 @@ fn handle(
                 };
                 let who = who.session;
                 let base = s.pool.share_difficulty();
-                let issued = issue_difficulty(&mut s.assignments, &who, base, &vardiff_params);
+                let issued =
+                    issue_difficulty(&mut s.assignments, &who, base, &vardiff_params, std::time::Instant::now());
                 match s.current_job.and_then(|id| s.pool.job(id).map(|j| (id, j))) {
                     Some((id, job)) => {
                         let template = hex::encode(wire::encode_message(&Wire::Block(
@@ -1891,9 +1912,9 @@ mod vardiff_daemon_tests {
     #[test]
     fn a_new_miner_keeps_the_base_target() {
         let mut a = HashMap::new();
-        assert_eq!(issue_difficulty(&mut a, "fresh", 1_000, &params()), 1_000);
+        assert_eq!(issue_difficulty(&mut a, "fresh", 1_000, &params(), std::time::Instant::now()), 1_000);
         // Asking again changes nothing while there is still no measurement.
-        assert_eq!(issue_difficulty(&mut a, "fresh", 1_000, &params()), 1_000);
+        assert_eq!(issue_difficulty(&mut a, "fresh", 1_000, &params(), std::time::Instant::now()), 1_000);
     }
 
     /// The case vardiff exists for: a rig submitting far too fast is moved up,
@@ -1901,11 +1922,11 @@ mod vardiff_daemon_tests {
     #[test]
     fn a_flooding_miner_is_moved_up_and_its_old_target_remembered() {
         let mut a = HashMap::new();
-        issue_difficulty(&mut a, "fast", 1_000, &params());
+        issue_difficulty(&mut a, "fast", 1_000, &params(), std::time::Instant::now());
         // Pretend it has been finding a share every second — 15x too fast.
         a.get_mut("fast").unwrap().ewma_secs = 1.0;
 
-        let issued = issue_difficulty(&mut a, "fast", 1_000, &params());
+        let issued = issue_difficulty(&mut a, "fast", 1_000, &params(), std::time::Instant::now());
         assert_eq!(issued, 4_000, "clamped to one max_step up");
         let entry = &a["fast"];
         assert_eq!(entry.current, 4_000);
@@ -1919,9 +1940,9 @@ mod vardiff_daemon_tests {
     #[test]
     fn a_slow_miner_is_moved_down() {
         let mut a = HashMap::new();
-        issue_difficulty(&mut a, "slow", 10_000, &params());
+        issue_difficulty(&mut a, "slow", 10_000, &params(), std::time::Instant::now());
         a.get_mut("slow").unwrap().ewma_secs = 120.0; // 8x too slow
-        assert_eq!(issue_difficulty(&mut a, "slow", 10_000, &params()), 2_500);
+        assert_eq!(issue_difficulty(&mut a, "slow", 10_000, &params(), std::time::Instant::now()), 2_500);
     }
 
     /// Timing must smooth rather than track the last sample, or the controller
@@ -1957,9 +1978,9 @@ mod vardiff_daemon_tests {
     fn the_configured_floor_is_respected() {
         let p = VardiffParams { min: 500, ..params() };
         let mut a = HashMap::new();
-        issue_difficulty(&mut a, "m", 100, &p);
+        issue_difficulty(&mut a, "m", 100, &p, std::time::Instant::now());
         a.get_mut("m").unwrap().ewma_secs = 10_000.0; // absurdly slow
-        assert!(issue_difficulty(&mut a, "m", 100, &p) >= 500);
+        assert!(issue_difficulty(&mut a, "m", 100, &p, std::time::Instant::now()) >= 500);
     }
 }
 
@@ -2095,5 +2116,97 @@ mod rejection_streak_tests {
         assert!(!reject(&mut a, "duplicate share"), "a new reason restarts the count");
         assert_eq!(a.rejected_streak, 1);
         assert_eq!(a.last_rejection, "duplicate share");
+    }
+}
+
+/// Vardiff must be able to come back down from a target it should never have
+/// issued.
+///
+/// The controller measures the interval between *accepted shares*. That reading
+/// only exists when a share arrives, so a target tuned above what a miner can
+/// find inside one batch of nonces destroys the very signal needed to correct
+/// it: no share, no measurement, no correction, forever. The rig burns full CPU
+/// and earns nothing, and `/stats` shows a share count that merely stopped
+/// rising — indistinguishable from a rig that was switched off.
+///
+/// Found on the live testnet: a miner issued difficulty 120,809,701 against a
+/// base of 200 sat at 98% CPU for over three hours without submitting once.
+#[cfg(test)]
+mod vardiff_recovery_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn params() -> VardiffParams {
+        VardiffParams { target_secs: 15.0, min: 100, max: 1 << 40, max_step: 4.0 }
+    }
+
+    /// Build a miner that looked fast and has since gone silent — the exact
+    /// state the runaway leaves behind.
+    fn stuck(current: Difficulty, silent_for: Duration, now: Instant) -> HashMap<String, Assignment> {
+        let mut a = HashMap::new();
+        a.insert(
+            "stuck".to_string(),
+            Assignment {
+                current,
+                previous: current,
+                // It really was finding a share every second, once.
+                last_share: Some(now - silent_for),
+                ewma_secs: 1.0,
+                rejected_streak: 0,
+                last_rejection: "",
+            },
+        );
+        a
+    }
+
+    #[test]
+    fn a_silent_miner_has_its_target_lowered() {
+        let now = Instant::now();
+        let mut a = stuck(120_809_701, Duration::from_secs(600), now);
+        let issued = issue_difficulty(&mut a, "stuck", 200, &params(), now);
+        assert!(
+            issued < 120_809_701,
+            "ten minutes without a share must move the target DOWN, not hold it at {issued}"
+        );
+    }
+
+    /// The property that matters: it must keep descending until the miner can
+    /// actually meet it. One step down would leave a rig stuck at 30M.
+    #[test]
+    fn repeated_silence_walks_the_target_all_the_way_back() {
+        let mut now = Instant::now();
+        let mut a = stuck(120_809_701, Duration::from_secs(60), now);
+        for _ in 0..30 {
+            now += Duration::from_secs(60);
+            // Still no share: last_share stays where it was, so the miner grows
+            // more overdue with every issue.
+            issue_difficulty(&mut a, "stuck", 200, &params(), now);
+        }
+        let end = a["stuck"].current;
+        assert!(end <= 100_000, "a permanently silent miner must fall to a findable target, got {end}");
+    }
+
+    /// A miner performing exactly on target must not be dragged down by this —
+    /// otherwise every healthy rig drifts toward the floor and floods the pool.
+    #[test]
+    fn a_miner_on_target_is_left_alone() {
+        let now = Instant::now();
+        let mut a = HashMap::new();
+        a.insert(
+            "good".to_string(),
+            Assignment {
+                current: 10_000,
+                previous: 10_000,
+                last_share: Some(now - Duration::from_secs(15)),
+                ewma_secs: 15.0,
+                rejected_streak: 0,
+                last_rejection: "",
+            },
+        );
+        assert_eq!(
+            issue_difficulty(&mut a, "good", 200, &params(), now),
+            10_000,
+            "a rig hitting the target interval must be left where it is"
+        );
     }
 }
