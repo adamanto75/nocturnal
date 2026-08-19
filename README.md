@@ -48,7 +48,7 @@ renamed. **In code, `noct*` is authoritative.**
 Rust is pinned to **1.82** (no `rustup` assumptions, no edition 2024).
 
 ```bash
-cargo test --workspace                      # 297 tests
+cargo test --workspace                      # 306 tests
 cargo build --release -p noct-wallet --bins # noct-cli, noct-walletd
 cargo build --release -p noct-node --features randomx   # noctd with real PoW
 ```
