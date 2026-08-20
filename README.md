@@ -18,9 +18,14 @@ unlinkable one-time recipient addresses, CPU-friendly proof of work.
 >   supply parameter — to the founder, earmarked for a professional audit,
 >   community work, marketing and running costs. That is a stated intention: the
 >   allocation sits in one wallet, with no vesting, multisig or published
->   accounting enforcing it yet. It is the single most consequential economic
->   parameter here — judge it accordingly, and see the whitepaper for the argument
->   both ways.
+>   accounting enforcing it yet. The address is published —
+>   `C4do37CzzKCV3XJHDinLAoL7MaEtRU5oHgGTWLVb8JBY5zEDayjqYqHGoyzGMF3VakXa2QjUgN9UJH7jpDQpMUVuRD1jNA`
+>   — and a test pins it to the genesis constants, so anyone can confirm the
+>   genesis output is addressed there and holds exactly that amount. Note what
+>   that does *not* buy: this is a ring-signature chain, so nobody can tell from
+>   the address when the premine moves. It is the single most consequential
+>   economic parameter here — judge it accordingly, and see the whitepaper for
+>   the argument both ways.
 > * **Placeholder parameters.** Mainnet genesis timestamp, address tags and the
 >   RandomX seed schedule are not final.
 

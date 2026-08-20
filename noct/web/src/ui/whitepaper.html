@@ -134,12 +134,32 @@
      guarantee has misread the situation; a reader who treats it as a claim to be
      verified later has it right.</p>
 
+  <p><b>The address, published.</b> The mainnet premine is paid to:</p>
+  <p style="word-break:break-all"><code>C4do37CzzKCV3XJHDinLAoL7MaEtRU5oHgGTWLVb8JBY5zEDayjqYqHGoyzGMF3VakXa2QjUgN9UJH7jpDQpMUVuRD1jNA</code></p>
+  <p>This was always derivable — the founder's public keys are baked into the
+     source, along with the genesis transaction secret. Writing it down removes
+     a step, which is the difference between a fact being technically available
+     and actually checkable. Because that secret is public, anyone can confirm
+     the genesis output really is addressed here and holds exactly 500,000 NOCT.
+     A test in the codebase pins this address to the genesis constants, so the
+     two cannot drift apart.</p>
+  <p><b>What publishing it does not give you.</b> An earlier version of this
+     document said the address let every movement out of the premine be watched.
+     That was wrong, and wrong in the project's own favour, so it is worth
+     correcting plainly: this is a ring-signature chain. A spend is signed
+     against sixteen possible inputs, and the key image that would identify the
+     real one is derived from the output's <em>private</em> key. Nobody can tell
+     from the address when the premine moves. Watching this address does not
+     watch the money.</p>
   <p><b>What would make it verifiable.</b> Intentions become checkable when they
      leave the prose and enter the chain. None of the following is in place yet,
      and each is a fair thing to ask for before extending trust:</p>
   <ul>
-    <li>Publishing the premine address so that every movement out of it can be
-        watched by anyone.</li>
+    <li>Publishing the premine output's <b>key image</b>. Unlike the address,
+        this would work: a key image is a one-way function of the private key
+        that reveals nothing and cannot spend anything, but the instant it
+        appears in a block, everyone knows the premine has moved — and until it
+        does, everyone knows it has not.</li>
     <li>A vesting or time-lock schedule, so the whole balance cannot move at once.</li>
     <li>Multisig control, so no single person — including the founder — can spend
         it alone.</li>

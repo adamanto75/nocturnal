@@ -228,3 +228,85 @@ mod separation_tests {
         assert_ne!(TESTNET.genesis_tx_secret, MAINNET.genesis_tx_secret);
     }
 }
+
+/// The mainnet premine address, published so that the allocation is legible
+/// rather than merely derivable.
+///
+/// This is a **public** value in every sense: the founder's public spend and
+/// view keys are already baked into [`crate::block`], and the genesis one-time
+/// secret is published beside them, so this address has always been derivable
+/// from the source. Writing it down changes nothing about what is knowable — it
+/// removes the step of deriving it, which is the difference between a fact being
+/// technically available and actually checkable.
+///
+/// **Be precise about what publishing an address does and does not give you on
+/// a chain like this one.** Because the genesis transaction secret `r` is
+/// published, anyone can confirm that the genesis output really is addressed
+/// here, and that it holds exactly [`crate::block::PREMINE_AMOUNT`]. Nobody can
+/// tell when it is *spent*: the spend is a ring signature, and the key image
+/// that would reveal it is derived from the output's private key. Watching this
+/// address does not watch the money.
+///
+/// The whitepaper lists four things that would turn "the premine is for the
+/// project" from a claim into something checkable. This is the weakest of them,
+/// and none of the other three — vesting, multisig, published accounts — exists.
+#[cfg(test)]
+mod premine_address_tests {
+    use crate::address::{Address, Network};
+    use crate::block::{PREMINE_SPEND_PUBLIC, PREMINE_VIEW_PUBLIC};
+    use crate::keys::PublicKey;
+
+    /// The address published in the README, the whitepaper and the website.
+    pub const PUBLISHED_MAINNET_PREMINE_ADDRESS: &str =
+        "C4do37CzzKCV3XJHDinLAoL7MaEtRU5oHgGTWLVb8JBY5zEDayjqYqHGoyzGMF3VakXa2QjUgN9UJH7jpDQpMUVuRD1jNA";
+
+    fn derived() -> String {
+        let spend = PublicKey::from_bytes(PREMINE_SPEND_PUBLIC).expect("valid point");
+        let view = PublicKey::from_bytes(PREMINE_VIEW_PUBLIC).expect("valid point");
+        Address::new(Network::Mainnet, spend, view).encode()
+    }
+
+    /// A published address that does not match the code is worse than none: it
+    /// invites people to watch the wrong thing while believing they are
+    /// checking something. This pins the two together, so changing the founder
+    /// keys without updating every published copy breaks the build.
+    #[test]
+    fn the_published_address_matches_the_baked_keys() {
+        assert_eq!(
+            derived(),
+            PUBLISHED_MAINNET_PREMINE_ADDRESS,
+            "the premine address published to the world no longer matches the genesis constants"
+        );
+    }
+
+    /// It must be a mainnet address. A testnet tag here would point readers at
+    /// a worthless chain while claiming to disclose the real allocation.
+    #[test]
+    fn it_is_a_mainnet_address() {
+        let decoded = Address::decode(PUBLISHED_MAINNET_PREMINE_ADDRESS).expect("decodes");
+        assert_eq!(decoded.network, Network::Mainnet);
+        assert!(!decoded.is_subaddress, "the premine is paid to the main address");
+    }
+
+    /// And it must be the address the genesis block actually pays.
+    #[test]
+    fn the_genesis_block_pays_this_address() {
+        use crate::block::{Block, PREMINE_AMOUNT};
+        let g = Block::genesis();
+        assert_eq!(g.coinbase.outputs.len(), 1);
+        assert_eq!(g.coinbase.outputs[0].amount, PREMINE_AMOUNT);
+        let spend = PublicKey::from_bytes(PREMINE_SPEND_PUBLIC).expect("valid point");
+        let view = PublicKey::from_bytes(PREMINE_VIEW_PUBLIC).expect("valid point");
+        let addr = Address::new(Network::Mainnet, spend, view);
+        assert_eq!(
+            g.coinbase.outputs[0].one_time_key,
+            crate::stealth::derive_output(
+                &crate::keys::PrivateKey::from_canonical_bytes(crate::params::MAINNET.genesis_tx_secret)
+                    .expect("canonical"),
+                &addr,
+                0
+            ),
+            "the genesis output must be payable to the published address"
+        );
+    }
+}
