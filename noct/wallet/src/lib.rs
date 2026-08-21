@@ -362,10 +362,17 @@ impl Wallet {
         }
 
         // Resolve each selected output into a ring of decoys from the chain.
+        //
+        // Recency-biased, not uniform. People overwhelmingly spend outputs they
+        // received recently, so uniform decoys are drawn from a population that
+        // looks nothing like the real spend: the newest member of the ring is
+        // the real one far more often than chance, and that is a statistical
+        // handle on every transaction the wallet makes. Matching the decoy ages
+        // to observed spending removes it.
         let mut inputs: Vec<InputSecret> = Vec::with_capacity(selected.len());
         for owned in &selected {
             let (ring, signer_index) = chain
-                .select_ring_uniform(rng, ring_size, owned.global_index)
+                .select_ring_recency_biased(rng, ring_size, owned.global_index)
                 .ok_or(WalletError::NotEnoughDecoys)?;
             inputs.push(owned.output.to_input(ring, signer_index));
         }

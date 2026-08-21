@@ -62,10 +62,25 @@ pub const FUTURE_TIME_LIMIT: u64 = 2 * 60 * 60;
 /// transactions are valid.
 pub const RING_SIZE: usize = 16;
 
-/// Gamma parameters for recency-biased decoy selection (Monero's fitted shape /
-/// scale). See the module note on calibration.
+/// Gamma parameters for recency-biased decoy selection, from Monero's fit to
+/// observed spend ages.
+///
+/// **These describe the log of an age in seconds, not an age.** A sample `x`
+/// from `Gamma(shape, rate)` is exponentiated: `age_seconds = e^x`. With a mean
+/// of `shape / rate = 11.97`, the median spend age lands around
+/// `e^11.97 ≈ 1.8 days`, with a long tail toward older outputs — which is what
+/// real spending looks like.
+///
+/// `1.61` is a **rate**, so the scale passed to a shape/scale sampler is its
+/// reciprocal. Feeding 1.61 in as a scale inflates the mean from 11.97 to 31.0,
+/// and dropping the exponentiation destroys the shape altogether: both mistakes
+/// were present here, and together they placed every decoy in a narrow band in
+/// the *middle* of the output set with none near the tip — the opposite of
+/// recency bias, and worse than choosing uniformly.
 pub const GAMMA_SHAPE: f64 = 19.28;
-pub const GAMMA_SCALE: f64 = 1.61;
+pub const GAMMA_RATE: f64 = 1.61;
+/// The scale a shape/scale gamma sampler needs: `1 / rate`.
+pub const GAMMA_SCALE: f64 = 1.0 / GAMMA_RATE;
 
 /// How many blocks a coinbase (mined or premine) output must be buried before it
 /// can be referenced by a transaction — as the real spend *or* as a decoy.
@@ -699,13 +714,47 @@ impl<P: ProofOfWork> Blockchain<P> {
         ring_size: usize,
         real_index: u64,
     ) -> Option<(Vec<RingMember>, usize)> {
-        self.assemble_ring(rng, ring_size, real_index, |rng, n| {
-            // Sample an "age" and map it to an index, favouring recent outputs
-            // (higher indices). Bounded and monotone in the sampled age.
-            let age = sample_gamma(rng, GAMMA_SHAPE, GAMMA_SCALE);
-            let frac = (age / (age + (GAMMA_SHAPE * GAMMA_SCALE))).clamp(0.0, 0.999_999);
-            let from_tip = (frac * n as f64) as usize;
-            (n - 1).saturating_sub(from_tip)
+        let height = self.height();
+        let meta = &self.output_meta;
+        self.assemble_ring(rng, ring_size, real_index, move |rng, n| {
+            // Sample log(age in seconds), exponentiate to an age, and convert
+            // that to a block height. Mapping through *height* rather than
+            // straight to an index matters: outputs are not spread evenly over
+            // blocks, so treating an index as a proxy for age would skew the
+            // distribution by however much transaction volume has varied.
+            let age_secs = sample_gamma(rng, GAMMA_SHAPE, GAMMA_SCALE).exp();
+            let age_blocks = (age_secs / crate::pow::TARGET_BLOCK_TIME as f64) as u64;
+
+            // The distribution has a tail reaching years back, which on a young
+            // chain is older than the chain itself. Clamping those samples to
+            // height 0 would pile them onto the very first outputs — on this
+            // chain, the premine — so it would appear in rings far more often
+            // than any other output and become a marker rather than a decoy.
+            //
+            // A sample older than the chain carries no information about where
+            // a real spend sits, so fall back to a uniform draw instead of
+            // pretending it points at the genesis end.
+            if age_blocks >= height {
+                return (rng.next_u64() as usize) % n;
+            }
+            let target_height = height - age_blocks;
+
+            // First output at or after that height. Heights are non-decreasing
+            // in index, so this is a binary search.
+            let lo = meta.partition_point(|m| m.height < target_height);
+            if lo >= n {
+                // Age fell inside the newest block: take from the tip.
+                return n - 1;
+            }
+            // Outputs sharing that height are interchangeable in age, so pick
+            // among them uniformly rather than always taking the first — which
+            // would make the earliest output in a block a permanent favourite.
+            let hi = meta.partition_point(|m| m.height <= meta[lo].height).min(n);
+            if hi > lo + 1 {
+                lo + (rng.next_u64() as usize) % (hi - lo)
+            } else {
+                lo
+            }
         })
     }
 
@@ -1529,6 +1578,103 @@ mod tests {
         assert!(!removed.is_empty() || chain.height() == 1);
     }
 
+    // --- decoy selection on a real chain ---------------------------------
+    //
+    // The broken "recency-biased" selector clustered every decoy in the middle
+    // of the output set and put none near the tip. Wired up, a recent real
+    // spend would have been the only ring member near the tip — identified by
+    // the very mechanism meant to hide it. These pin the shape on a real chain.
+
+    /// Map a ring member back to its output index, for inspecting a ring.
+    fn index_of(chain: &Blockchain<KeccakPow>, m: &RingMember) -> Option<u64> {
+        (0..chain.num_outputs()).find(|&i| chain.output(i).as_ref() == Some(m))
+    }
+
+    fn chain_with_history() -> Blockchain<KeccakPow> {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        mine_coinbase(&mut chain, &miner, 1_000);
+        warm_up(&mut chain, 300, 1_200);
+        chain
+    }
+
+    /// Count decoys landing in the newest quarter of the output set, for a
+    /// given selector.
+    fn near_tip_fraction(
+        chain: &Blockchain<KeccakPow>,
+        real: u64,
+        recency: bool,
+    ) -> f64 {
+        let n = chain.num_outputs();
+        let (mut near, mut total) = (0usize, 0usize);
+        for _ in 0..120 {
+            let (ring, signer) = if recency {
+                chain.select_ring_recency_biased(&mut OsRng, RING_SIZE, real)
+            } else {
+                chain.select_ring_uniform(&mut OsRng, RING_SIZE, real)
+            }
+            .expect("assembles");
+            for (i, m) in ring.iter().enumerate() {
+                if i == signer {
+                    continue;
+                }
+                if let Some(idx) = index_of(chain, m) {
+                    total += 1;
+                    if idx >= n * 3 / 4 {
+                        near += 1;
+                    }
+                }
+            }
+        }
+        near as f64 / total as f64
+    }
+
+    /// The property that matters, tested as a *comparison* on one chain so the
+    /// result does not depend on how long the test chain happens to be.
+    ///
+    /// Absolute numbers here are muted for a reason worth recording: the gamma's
+    /// median age is ~1.5 days, so on a chain younger than that most samples are
+    /// older than the chain itself and fall back to a uniform draw. The bias is
+    /// real but only fully expressed once a chain has months of history — which
+    /// is exactly when it starts to matter.
+    #[test]
+    fn recency_biased_beats_uniform_at_covering_recent_outputs() {
+        let chain = chain_with_history();
+        let real = chain.num_outputs() - 5;
+        let biased = near_tip_fraction(&chain, real, true);
+        let uniform = near_tip_fraction(&chain, real, false);
+        assert!(
+            biased > uniform,
+            "recency-biased ({biased:.3}) must put more decoys near the tip than uniform              ({uniform:.3}) — the old selector managed ~0, which would have exposed every              recent real spend"
+        );
+    }
+
+    /// No single output may dominate. The premine sits at index 0, and a tail
+    /// clamping to the genesis end would put it in nearly every ring — turning
+    /// the one output everybody can identify into a beacon.
+    #[test]
+    fn the_first_output_is_not_over_selected() {
+        let chain = chain_with_history();
+        let n = chain.num_outputs();
+        let real = n - 5;
+        let (mut zero_hits, mut rings) = (0usize, 0usize);
+        for _ in 0..120 {
+            let (ring, signer) =
+                chain.select_ring_recency_biased(&mut OsRng, RING_SIZE, real).expect("assembles");
+            rings += 1;
+            for (i, m) in ring.iter().enumerate() {
+                if i != signer && index_of(&chain, m) == Some(0) {
+                    zero_hits += 1;
+                }
+            }
+        }
+        let per_ring = zero_hits as f64 / rings as f64;
+        assert!(
+            per_ring < 0.5,
+            "output 0 appeared {per_ring:.3} times per ring — a tail clamping to genesis would              make it a marker rather than a decoy"
+        );
+    }
+
     #[test]
     fn fork_choice_prefers_more_work() {
         let mut chain = Blockchain::with_maturity(KeccakPow, 1);
@@ -1648,3 +1794,84 @@ mod tests {
         assert!(chain.validate_tx(&mut OsRng, &tx2).is_ok());
     }
 }
+
+/// Decoy selection must put most of the ring where real spends actually are —
+/// near the tip. The original "recency-biased" selector did the exact opposite:
+/// it clustered every decoy between 35% and 62% back through the output set and
+/// put **none** in the newest 1%. Wired up, that would have made a recent real
+/// spend the only ring member near the tip, and identified it.
+///
+/// These tests pin the shape of the distribution, not just that it runs.
+#[cfg(test)]
+mod decoy_distribution_tests {
+    use super::*;
+    use rand_core::OsRng;
+
+    /// Sample ages the way the selector does, in blocks back from the tip.
+    fn sample_ages_in_blocks(n: usize) -> Vec<f64> {
+        let mut v: Vec<f64> = (0..n)
+            .map(|_| {
+                let secs = sample_gamma(&mut OsRng, GAMMA_SHAPE, GAMMA_SCALE).exp();
+                secs / crate::pow::TARGET_BLOCK_TIME as f64
+            })
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    }
+
+    fn pct(v: &[f64], p: f64) -> f64 {
+        v[((v.len() as f64 - 1.0) * p) as usize]
+    }
+
+    /// The headline property: the median decoy should be days old, not months —
+    /// matching how people actually spend.
+    #[test]
+    fn the_median_decoy_is_days_old_not_half_the_chain() {
+        let ages = sample_ages_in_blocks(20_000);
+        let median_blocks = pct(&ages, 0.50);
+        let median_days = median_blocks * crate::pow::TARGET_BLOCK_TIME as f64 / 86_400.0;
+        assert!(
+            (0.2..14.0).contains(&median_days),
+            "median decoy age should be on the order of days, got {median_days:.2} days"
+        );
+    }
+
+    /// A large share must be genuinely recent. This is the assertion the broken
+    /// selector failed outright — it produced zero recent decoys.
+    #[test]
+    fn a_real_share_of_decoys_are_recent() {
+        let ages = sample_ages_in_blocks(20_000);
+        let day_in_blocks = 86_400.0 / crate::pow::TARGET_BLOCK_TIME as f64;
+        let within_a_day = ages.iter().filter(|a| **a <= day_in_blocks).count() as f64 / ages.len() as f64;
+        assert!(
+            within_a_day > 0.15,
+            "at least a sixth of decoys should be under a day old, got {within_a_day:.3}"
+        );
+    }
+
+    /// And it must keep a long tail: if every decoy were recent, an *old* real
+    /// spend would stand out just as badly in the other direction.
+    #[test]
+    fn the_tail_still_reaches_old_outputs() {
+        let ages = sample_ages_in_blocks(20_000);
+        let week_in_blocks = 7.0 * 86_400.0 / crate::pow::TARGET_BLOCK_TIME as f64;
+        let older_than_a_week = ages.iter().filter(|a| **a > week_in_blocks).count() as f64 / ages.len() as f64;
+        assert!(
+            older_than_a_week > 0.02,
+            "the distribution needs a real tail, got {older_than_a_week:.3} older than a week"
+        );
+    }
+
+    /// Print the shape, so a human can sanity-check it rather than trusting the
+    /// thresholds above.
+    #[test]
+    fn show_the_decoy_age_distribution() {
+        let ages = sample_ages_in_blocks(20_000);
+        let d = |b: f64| b * crate::pow::TARGET_BLOCK_TIME as f64 / 86_400.0;
+        println!("decoy age (days back from the tip):");
+        for q in [0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99] {
+            println!("  p{:02.0} = {:.3} days", q * 100.0, d(pct(&ages, q)));
+        }
+    }
+}
+

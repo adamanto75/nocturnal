@@ -213,9 +213,15 @@
     <li><b>Clock dependence.</b> One validity rule — the future-timestamp bound — depends on the
         validating node's wall clock rather than on chain data. This is deliberate and matches both
         Bitcoin and Monero: the alternative makes recovery from a long network outage impossible.</li>
-    <li><b>Uniform decoy selection.</b> Ring members are drawn uniformly rather than from a
-        distribution calibrated to real spending behaviour. This is weaker than Monero's gamma
-        selection and is a known, documented gap.</li>
+    <li><b>Decoy selection is calibrated but young.</b> Ring members are drawn from a
+        gamma-shaped age distribution fitted to observed spending, so decoys look like
+        real spends instead of being spread evenly over all history — uniform selection
+        makes the newest ring member the real one far more often than chance, which is a
+        handle on every transaction. Two caveats remain. The distribution's median age is
+        about a day and a half, so on a chain younger than that most draws fall back to
+        uniform; the bias only fully expresses itself once there are months of history.
+        And it is calibrated from Monero's fit, not from Nocturnal's own spending data,
+        which will not exist until people actually use it.</li>
   </ul>
 </div></section>
 
