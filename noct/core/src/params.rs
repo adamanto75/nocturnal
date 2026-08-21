@@ -288,6 +288,34 @@ mod premine_address_tests {
         assert!(!decoded.is_subaddress, "the premine is paid to the main address");
     }
 
+    /// The premine output's key image, as published in the whitepaper.
+    ///
+    /// It cannot be re-derived here — that needs the founder's private key,
+    /// which is deliberately not in this repository and never will be. So this
+    /// pins what it *can*: that the published value is a structurally valid key
+    /// image rather than a typo or a truncation. A malformed commitment would be
+    /// worse than none, because it can never appear on-chain and so can never be
+    /// falsified — it would look like a promise while being unfalsifiable.
+    pub const PUBLISHED_PREMINE_KEY_IMAGE: &str =
+        "06f1c57958aea772c2a687cd456121fea003af3b84238767d2429a5d2795db16";
+
+    #[test]
+    fn the_published_key_image_is_a_well_formed_one() {
+        let raw = hex::decode(PUBLISHED_PREMINE_KEY_IMAGE).expect("valid hex");
+        let bytes: [u8; 32] = raw.as_slice().try_into().expect("32 bytes");
+        assert!(
+            crate::ring::KeyImage::from_bytes(bytes).is_some(),
+            "the published key image must decode as a canonical, torsion-free point —              a malformed one is a promise that can never be checked"
+        );
+    }
+
+    /// And it must not be confusable with the address published beside it.
+    #[test]
+    fn the_key_image_is_not_the_address() {
+        assert_ne!(PUBLISHED_PREMINE_KEY_IMAGE, PUBLISHED_MAINNET_PREMINE_ADDRESS);
+        assert_eq!(PUBLISHED_PREMINE_KEY_IMAGE.len(), 64, "32 bytes as hex");
+    }
+
     /// And it must be the address the genesis block actually pays.
     #[test]
     fn the_genesis_block_pays_this_address() {

@@ -23,7 +23,12 @@ unlinkable one-time recipient addresses, CPU-friendly proof of work.
 >   — and a test pins it to the genesis constants, so anyone can confirm the
 >   genesis output is addressed there and holds exactly that amount. Note what
 >   that does *not* buy: this is a ring-signature chain, so nobody can tell from
->   the address when the premine moves. It is the single most consequential
+>   the address when the premine moves. What does bind is the output's **key
+>   image**, also published —
+>   `06f1c57958aea772c2a687cd456121fea003af3b84238767d2429a5d2795db16` — which
+>   appears on-chain the moment the premine is spent and not before. The first
+>   movement is pre-announced as a split into 50 outputs of 10,000 NOCT; see the
+>   whitepaper for why that matters. It is the single most consequential
 >   economic parameter here — judge it accordingly, and see the whitepaper for
 >   the argument both ways.
 > * **Placeholder parameters.** Mainnet genesis timestamp, address tags and the

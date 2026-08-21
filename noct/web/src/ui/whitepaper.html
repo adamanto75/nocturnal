@@ -151,15 +151,41 @@
      real one is derived from the output's <em>private</em> key. Nobody can tell
      from the address when the premine moves. Watching this address does not
      watch the money.</p>
-  <p><b>What would make it verifiable.</b> Intentions become checkable when they
-     leave the prose and enter the chain. None of the following is in place yet,
-     and each is a fair thing to ask for before extending trust:</p>
+  <p><b>The key image, published.</b> The premine output's key image is:</p>
+  <p style="word-break:break-all"><code>06f1c57958aea772c2a687cd456121fea003af3b84238767d2429a5d2795db16</code></p>
+  <p>Unlike the address, this one binds. A key image is a one-way function of an
+     output's secret key: it reveals nothing, cannot be forged by anyone who does
+     not hold that key, and cannot spend anything. But it is exactly what a spend
+     must publish — the network rejects a second appearance of the same image,
+     which is how it prevents double spending. So the moment this value appears
+     in a block, anyone can see the premine has moved; and for as long as it does
+     not, anyone can see it has not. Once published it cannot be withdrawn, which
+     is the property that makes it worth anything.</p>
+
+  <p><b>What the first movement will be, said in advance.</b> The premine is a
+     <em>single</em> output of 500,000 NOCT. Spending any part of it spends all of
+     it — a payment of 20,000 returns 480,000 as change — so a published key image
+     would otherwise turn the first ordinary payment into a signal
+     indistinguishable from moving the lot.</p>
+  <p>So the first transaction will be a <b>split</b>, and nothing else: the
+     500,000 will be divided into <b>50 outputs of 10,000 NOCT</b>, all paid back
+     to the founder wallet, across roughly seven transactions. The key images of
+     all fifty will be published here as soon as they exist. After that,
+     visibility is proportionate: spending 10,000 makes exactly one of the fifty
+     appear, and the other forty-nine are demonstrably untouched.</p>
+  <p>This is stated now, before mainnet exists, so that when the image above
+     appears it is a <em>predicted</em> event rather than a discovered one. If the
+     first movement is anything other than that split, it is fair to treat this
+     document as having been wrong.</p>
+  <p class="muted">None of this reveals a destination, a recipient, or how a spend
+     was divided — those stay hidden by the same construction that protects every
+     other user, and no amount of founder disclosure should weaken it. It shows
+     only that a specific output moved, and when.</p>
+
+  <p><b>What would still make it verifiable.</b> Intentions become checkable when
+     they leave the prose and enter the chain. None of the following is in place
+     yet, and each is a fair thing to ask for before extending trust:</p>
   <ul>
-    <li>Publishing the premine output's <b>key image</b>. Unlike the address,
-        this would work: a key image is a one-way function of the private key
-        that reveals nothing and cannot spend anything, but the instant it
-        appears in a block, everyone knows the premine has moved — and until it
-        does, everyone knows it has not.</li>
     <li>A vesting or time-lock schedule, so the whole balance cannot move at once.</li>
     <li>Multisig control, so no single person — including the founder — can spend
         it alone.</li>
