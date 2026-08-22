@@ -76,8 +76,22 @@
      before launch, and it is the kind of defect that only shows up when someone writes down what
      each layer actually believes.</p>
   <p>Coinbase outputs mature for sixty blocks before they can be spent — including as ring decoys,
-     since ring signatures hide which member is real — so a reorg cannot invalidate an
+     since ring signatures hide which member is real — so a short reorg cannot invalidate an
      already-spent fresh coinbase.</p>
+  <p><b>An earlier version of this section claimed more than that, and was wrong.</b> It said a
+     reorg <em>cannot</em> invalidate an already-spent fresh coinbase, full stop. That holds only
+     while reorgs are shallower than the maturity window, and this implementation permits deeper
+     ones: a node will consider a reorg up to <b>100</b> blocks deep, while maturity is
+     <b>60</b>. A reorg between those two numbers would invalidate a coinbase that had already
+     matured and been spent — exactly what the rule is meant to prevent.</p>
+  <p>Nothing observed has come close to that depth, and no proof-of-work chain relies on such a
+     bound in practice: Bitcoin matures coinbase for 100 blocks and Monero for 60, neither with a
+     reorg cap, both trusting hashrate to make deep reorgs impractical. But a stated guarantee
+     should either hold or not be stated. The invariant that would make it hold is that maturity
+     is at least the deepest reorg a node will accept, and closing the gap — by raising maturity,
+     or by refusing reorgs deeper than it — is a parameter decision still to be made. It is
+     recorded here rather than quietly fixed, because the gap was found by running the chain and
+     the reasoning is the point.</p>
 </div></section>
 
 <section class="reveal"><div class="wrap">
