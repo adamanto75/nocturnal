@@ -473,6 +473,12 @@ impl Discovery {
     fn unmark(&self, addr: &SocketAddr) {
         self.connected.lock().unwrap().remove(addr);
     }
+    /// How many addresses we know of at all. Reported by the connection
+    /// manager, because "no peers" and "no addresses" need different fixes.
+    fn book_len(&self) -> usize {
+        self.book.lock().unwrap().len()
+    }
+
     fn connected_count(&self) -> usize {
         self.connected.lock().unwrap().len()
     }
@@ -721,10 +727,40 @@ pub fn spawn_listener(listener: TcpListener, state: Arc<Mutex<NodeState>>, peers
 /// connections by dialing from the address book, and periodically pulls fresh
 /// addresses from a peer. Runs immediately, then every [`MANAGER_INTERVAL`].
 pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc: Discovery) {
-    thread::spawn(move || loop {
-        let need = disc.target_outbound.saturating_sub(disc.connected_count());
+    thread::spawn(move || {
+        // Say once, at startup, what this node intends to do. A node that ends
+        // up with no peers otherwise gives an operator nothing at all to work
+        // with: "dialing and failing" and "never dialing" look identical from
+        // the outside, and the difference is the whole diagnosis.
+        eprintln!(
+            "connection manager: want {} outbound, {} address(es) known",
+            disc.target_outbound,
+            disc.book_len()
+        );
+        let mut quiet_rounds = 0u32;
+        loop {
+        let connected = disc.connected_count();
+        let need = disc.target_outbound.saturating_sub(connected);
+        let candidates = if need > 0 { disc.dial_candidates() } else { Vec::new() };
+
+        // The case that cost hours: wanting peers, having none, and dialing
+        // nobody — because every address we know is already reserved, banned,
+        // or absent. Silence here is indistinguishable from a working node, so
+        // it must not be silent.
+        if need > 0 && candidates.is_empty() {
+            quiet_rounds += 1;
+            if quiet_rounds == 1 || quiet_rounds % 20 == 0 {
+                eprintln!(
+                    "connection manager: want {need} more peer(s) but have no address to dial                      ({} known, {connected} reserved/connected) — check --seed/--peer and peers.dat",
+                    disc.book_len()
+                );
+            }
+        } else {
+            quiet_rounds = 0;
+        }
+
         if need > 0 {
-            for addr in disc.dial_candidates().into_iter().take(need) {
+            for addr in candidates.into_iter().take(need) {
                 disc.mark_connected(addr); // reserve so we don't double-dial
                 let state = Arc::clone(&state);
                 let peers = peers.clone();
@@ -732,11 +768,18 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
                 thread::spawn(move || {
                     match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
                         Ok(s) => {
-                            if register_connection(s, &state, &peers, &disc, Some(addr)).is_err() {
+                            if let Err(e) = register_connection(s, &state, &peers, &disc, Some(addr)) {
+                                eprintln!("dial {addr}: connected but could not register: {e}");
                                 disc.unmark(&addr);
                             }
                         }
-                        Err(_) => disc.unmark(&addr),
+                        // A failed dial is ordinary — a peer may simply be down —
+                        // but it must be *visible*, or a node that can reach
+                        // nobody looks exactly like one that never tried.
+                        Err(e) => {
+                            eprintln!("dial {addr}: {e}");
+                            disc.unmark(&addr);
+                        }
                     }
                 });
             }
@@ -746,6 +789,7 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
         peers.send_to_one(&Wire::GetPeers);
         disc.save();
         thread::sleep(MANAGER_INTERVAL);
+        }
     });
 }
 
