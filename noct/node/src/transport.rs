@@ -56,6 +56,14 @@ const MAX_SHARE: usize = 32;
 /// addresses from peers.
 const MANAGER_INTERVAL: Duration = Duration::from_secs(15);
 
+/// First wait after a failed dial; doubles per consecutive failure.
+const DIAL_BACKOFF_BASE_SECS: u64 = 30;
+/// Cap on the doubling exponent, so the shift cannot overflow.
+const DIAL_BACKOFF_MAX_SHIFT: u32 = 10;
+/// Longest we will ever hold an address back. Hosts come back; a permanent
+/// write-off would be its own kind of forgetting.
+const DIAL_BACKOFF_CAP_SECS: u64 = 1800;
+
 /// A per-peer writer; the mutex serializes all sends to that socket.
 type PeerWriter = Arc<Mutex<TcpStream>>;
 
@@ -186,6 +194,17 @@ pub struct Discovery {
     /// Session nonces of peers we are currently connected to, to drop a second,
     /// duplicate link to a peer we already have.
     peer_nonces: Arc<Mutex<HashSet<u64>>>,
+    /// Consecutive failed dials per address, and the time we may try it again.
+    ///
+    /// Without this an unreachable address is redialled every
+    /// [`MANAGER_INTERVAL`] forever. Outbound slots are finite, so once enough
+    /// dead addresses accumulate they occupy every slot and the node cannot
+    /// reach anyone — while reachable peers sit in the book untried.
+    ///
+    /// Observed on the testnet: eight dials, eight slots, six of them dead
+    /// GitHub Actions runners learned by gossip from the daily join test. The
+    /// one peer that worked never got a slot.
+    dial_backoff: Arc<Mutex<HashMap<SocketAddr, (u32, Instant)>>>,
 }
 
 /// What a ban actually applies to (security review F12).
@@ -279,7 +298,37 @@ impl Discovery {
             banned: Arc::new(Mutex::new(HashMap::new())),
             self_nonce: OsRng.next_u64(),
             peer_nonces: Arc::new(Mutex::new(HashSet::new())),
+            dial_backoff: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Note that a dial to `addr` failed, and hold it back for a while.
+    ///
+    /// Backoff, deliberately, rather than eviction. An address that fails is
+    /// not necessarily bad — a peer reboots, a link flaps — and *removing* it on
+    /// failure would hand an attacker a lever: induce failures against honest
+    /// addresses and watch them disappear from the book, which is the shape of
+    /// an eclipse attack. Delaying is enough to free the slot, and is not
+    /// something an attacker can turn into permanent exclusion.
+    pub fn note_dial_failure(&self, addr: SocketAddr) {
+        let mut b = self.dial_backoff.lock().unwrap();
+        let entry = b.entry(addr).or_insert((0, Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        // 30s, 1m, 2m, 4m … capped, so even a long-dead address is retried
+        // occasionally: hosts do come back, and a permanent write-off would be
+        // its own kind of forgetting.
+        let secs = DIAL_BACKOFF_BASE_SECS.saturating_mul(1u64 << entry.0.min(DIAL_BACKOFF_MAX_SHIFT));
+        entry.1 = Instant::now() + Duration::from_secs(secs.min(DIAL_BACKOFF_CAP_SECS));
+    }
+
+    /// A dial succeeded: forget its failure history entirely.
+    pub fn note_dial_success(&self, addr: SocketAddr) {
+        self.dial_backoff.lock().unwrap().remove(&addr);
+    }
+
+    /// Is this address currently being held back after repeated failures?
+    fn in_backoff(&self, addr: &SocketAddr, now: Instant) -> bool {
+        self.dial_backoff.lock().unwrap().get(addr).is_some_and(|(_, until)| *until > now)
     }
 
     /// Is this handshake nonce our own? (I.e. we connected back to ourselves.)
@@ -496,7 +545,18 @@ impl Discovery {
                 .copied()
                 .collect()
         };
-        candidates.into_iter().filter(|a| !self.is_banned(a)).collect()
+        let now = Instant::now();
+        let mut usable: Vec<SocketAddr> = candidates
+            .into_iter()
+            .filter(|a| !self.is_banned(a) && !self.in_backoff(a, now))
+            .collect();
+
+        // Try the addresses with the cleanest record first. Slots are scarce,
+        // so spending them on a peer that has never failed beats spending them
+        // on one that has failed twice and is merely out of its backoff.
+        let fails = self.dial_backoff.lock().unwrap();
+        usable.sort_by_key(|a| fails.get(a).map(|(n, _)| *n).unwrap_or(0));
+        usable
     }
 
     /// A sample of known addresses to share, excluding the requester's own.
@@ -779,6 +839,10 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
                 thread::spawn(move || {
                     match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
                         Ok(s) => {
+                            // Reaching the host is what clears the slate. The
+                            // session may still be refused (banned, wrong
+                            // network); that is not the address being dead.
+                            disc.note_dial_success(addr);
                             if let Err(e) = register_connection(s, &state, &peers, &disc, Some(addr)) {
                                 eprintln!("dial {addr}: connected but could not register: {e}");
                                 disc.unmark(&addr);
@@ -786,9 +850,12 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
                         }
                         // A failed dial is ordinary — a peer may simply be down —
                         // but it must be *visible*, or a node that can reach
-                        // nobody looks exactly like one that never tried.
+                        // nobody looks exactly like one that never tried. It
+                        // also has to cost the address its place in the queue,
+                        // or dead hosts occupy every slot forever.
                         Err(e) => {
                             eprintln!("dial {addr}: {e}");
+                            disc.note_dial_failure(addr);
                             disc.unmark(&addr);
                         }
                     }
@@ -1235,5 +1302,106 @@ mod dial_reservation_tests {
              and the address is never dialed again"
         );
         drop(stream);
+    }
+}
+
+/// Unreachable addresses must not be able to occupy every outbound slot.
+///
+/// Observed on the testnet: a node dialing eight addresses on eight slots, six
+/// of them dead GitHub Actions runners learned by gossip from the daily join
+/// test. The one peer that actually worked never got a slot, and the node sat
+/// at zero peers while the addresses it needed sat untried in its book.
+#[cfg(test)]
+mod dial_backoff_tests {
+    use super::*;
+
+    fn disc() -> Discovery {
+        Discovery::new("0.0.0.0:19333".parse().unwrap(), [0u8; 32], 1, 8)
+    }
+    fn a(n: u8) -> SocketAddr {
+        format!("10.0.0.{n}:19333").parse().unwrap()
+    }
+
+    /// The core property: a failing address steps aside so a working one can be
+    /// tried. Slots are the scarce resource, not book entries.
+    #[test]
+    fn a_failed_address_frees_its_slot() {
+        let d = disc();
+        let dead = a(1);
+        let good = a(2);
+        d.learn([dead, good]);
+        assert!(d.dial_candidates().contains(&dead));
+
+        d.note_dial_failure(dead);
+        let c = d.dial_candidates();
+        assert!(!c.contains(&dead), "a just-failed address must not be retried immediately");
+        assert!(c.contains(&good), "the working address must still be offered");
+    }
+
+    /// Backoff, not eviction. The address stays in the book, because removing
+    /// addresses on failure would let an attacker induce failures against
+    /// honest peers and erase them — the shape of an eclipse attack.
+    #[test]
+    fn a_failed_address_is_held_back_not_forgotten() {
+        let d = disc();
+        let dead = a(1);
+        d.learn([dead]);
+        for _ in 0..5 {
+            d.note_dial_failure(dead);
+        }
+        assert!(
+            d.book.lock().unwrap().contains(&dead),
+            "the address must remain known; failure is not proof it is worthless"
+        );
+    }
+
+    /// Reaching a host clears its history, so one bad spell does not haunt a
+    /// peer that has come back.
+    #[test]
+    fn success_clears_the_penalty() {
+        let d = disc();
+        let peer = a(1);
+        d.learn([peer]);
+        d.note_dial_failure(peer);
+        assert!(!d.dial_candidates().contains(&peer));
+        d.note_dial_success(peer);
+        assert!(
+            d.dial_candidates().contains(&peer),
+            "a reachable peer must be immediately eligible again"
+        );
+    }
+
+    /// Cleanest record first: a slot spent on a never-failed address beats one
+    /// spent on an address that has failed repeatedly and merely aged out.
+    #[test]
+    fn never_failed_addresses_are_tried_first() {
+        let d = disc();
+        let flaky = a(1);
+        let fresh = a(2);
+        d.learn([flaky, fresh]);
+        // Age the flaky one out of its backoff by hand, so both are eligible.
+        d.note_dial_failure(flaky);
+        d.dial_backoff.lock().unwrap().insert(flaky, (3, Instant::now() - Duration::from_secs(1)));
+
+        let c = d.dial_candidates();
+        assert_eq!(c.len(), 2, "both are eligible");
+        assert_eq!(c[0], fresh, "the address with no failures must be tried first");
+    }
+
+    /// And the whole point, end to end: enough dead addresses must not starve a
+    /// live one of a slot.
+    #[test]
+    fn dead_addresses_cannot_crowd_out_a_live_peer() {
+        let d = disc();
+        let live = a(200);
+        // Eight dead addresses — exactly the outbound target — plus one live.
+        for n in 1..=8u8 {
+            d.learn([a(n)]);
+            d.note_dial_failure(a(n));
+        }
+        d.learn([live]);
+        let c = d.dial_candidates();
+        assert!(c.contains(&live), "the live peer must get a slot");
+        assert_eq!(c.len(), 1, "the dead addresses must all be held back, got {c:?}");
     }
 }
