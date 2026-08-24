@@ -77,6 +77,11 @@ impl BlockStore {
                 w.write_all(&bytes)?;
             }
             w.flush()?;
+            // Get the bytes to the disk, not merely to the page cache, before
+            // the rename publishes this file as the canonical log. Without it a
+            // machine that loses power mid-rewrite comes back to a log that is
+            // shorter than the chain it claims to hold.
+            w.into_inner().map_err(|e| io::Error::other(e.to_string()))?.sync_all()?;
         }
         // Drop our handle on the old file before replacing it (Windows will not
         // rename over an open file).
@@ -142,7 +147,9 @@ impl BlockStore {
 /// Command sent to the background writer.
 enum StoreCmd {
     Append(Block, Vec<Transaction>),
-    Rewrite(Vec<(Block, Vec<Transaction>)>),
+    /// The channel signals the rewrite has finished, so the caller can wait for
+    /// it. A rewrite that is merely queued is lost if the process is killed.
+    Rewrite(Vec<(Block, Vec<Transaction>)>, Option<Sender<()>>),
 }
 
 /// A block store whose disk writes run on a **background thread**.
@@ -170,8 +177,15 @@ impl AsyncStore {
             for cmd in rx {
                 let result = match cmd {
                     StoreCmd::Append(block, txs) => store.append(&block, &txs),
-                    StoreCmd::Rewrite(blocks) => {
-                        store.rewrite(blocks.iter().map(|(b, t)| (b, t.as_slice())))
+                    StoreCmd::Rewrite(blocks, done) => {
+                        let r = store.rewrite(blocks.iter().map(|(b, t)| (b, t.as_slice())));
+                        // Signal completion even on failure: the caller is
+                        // waiting to know the attempt finished, not that it
+                        // succeeded, and a silent hang would be worse.
+                        if let Some(d) = done {
+                            let _ = d.send(());
+                        }
+                        r
                     }
                 };
                 if let Err(e) = result {
@@ -189,11 +203,32 @@ impl AsyncStore {
         }
     }
 
-    /// Queue a full rewrite of the log from the canonical chain (after a reorg).
+    /// Rewrite the log from the canonical chain after a reorg, **and wait for
+    /// it to land**.
+    ///
+    /// This one blocks, unlike `append`, and that is the point. A rewrite is
+    /// what makes the log stop describing an abandoned branch, so losing one is
+    /// not a lost block — it is a log that no longer matches the chain. On the
+    /// next start `replay` walks into the abandoned branch, fails validation,
+    /// and discards everything after it.
+    ///
+    /// That is not hypothetical: it cost this testnet roughly 2,750 blocks. The
+    /// writer thread only flushes its queue when `AsyncStore` is dropped, and
+    /// **`Drop` does not run when the process is killed by a signal** — which is
+    /// how `systemctl stop`, a container stop and the OOM reaper all end a node.
+    /// A queued rewrite simply vanished.
+    ///
+    /// Reorgs are rare, so paying disk latency here is cheap next to silently
+    /// throwing the chain away.
     pub fn rewrite(&self, blocks: Vec<(Block, Vec<Transaction>)>) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(StoreCmd::Rewrite(blocks));
+        let Some(tx) = &self.tx else { return };
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        if tx.send(StoreCmd::Rewrite(blocks, Some(done_tx))).is_err() {
+            return;
         }
+        // If the writer died we must not hang the node forever; a bounded wait
+        // keeps a broken disk from becoming a hung process.
+        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(60));
     }
 }
 
@@ -215,7 +250,7 @@ mod tests {
     use noct_wallet::Wallet;
     use rand_core::OsRng;
 
-    fn temp_path(tag: &str) -> PathBuf {
+    pub(super) fn temp_path(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -224,7 +259,7 @@ mod tests {
     }
 
     // Mine `n` blocks on a fresh node, returning them.
-    fn mined(n: usize) -> Vec<(Block, Vec<Transaction>)> {
+    pub(super) fn mined(n: usize) -> Vec<(Block, Vec<Transaction>)> {
         let w = Wallet::random(&mut OsRng, Network::Mainnet);
         let mut node = NodeState::new(w.address());
         (0..n).map(|_| node.mine_block(&mut OsRng).unwrap()).collect()
@@ -292,6 +327,77 @@ mod tests {
         let loaded = BlockStore::load_all(&path).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0.id(), blocks[0].0.id());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// A rewrite must be on disk before the call returns.
+///
+/// The writer thread only drains its queue when `AsyncStore` is dropped, and
+/// `Drop` does not run when a process is killed by a signal — which is how
+/// `systemctl stop`, a container stop and the OOM reaper all end a node. A
+/// merely-queued rewrite therefore vanished, leaving a log that still described
+/// an abandoned branch. On the next start `replay` walked into that branch,
+/// failed validation, and discarded everything after it.
+///
+/// That cost this testnet roughly 2,750 blocks across a handful of restarts.
+#[cfg(test)]
+mod rewrite_durability_tests {
+    use super::tests::{mined, temp_path};
+    use super::*;
+
+    /// The regression: after `rewrite` returns, the file must already hold the
+    /// new chain — without relying on the store being dropped first.
+    #[test]
+    fn a_rewrite_is_on_disk_before_it_returns() {
+        let path = temp_path("rewrite-sync");
+        let store = AsyncStore::open(&path).expect("open");
+
+        let all = mined(6);
+        for (b, t) in &all {
+            store.append(b, t);
+        }
+        // Reorg: the canonical chain is now a shorter prefix.
+        let kept: Vec<_> = all.iter().take(3).cloned().collect();
+        store.rewrite(kept.clone());
+
+        // Deliberately do NOT drop the store — that is the whole point. A killed
+        // process never drops it.
+        let on_disk = BlockStore::load_all(&path).expect("load");
+        assert_eq!(
+            on_disk.len(),
+            kept.len(),
+            "the rewrite must be durable when it returns, not when the store is dropped"
+        );
+        for (i, (b, _)) in on_disk.iter().enumerate() {
+            assert_eq!(b.id(), kept[i].0.id(), "block {i} does not match the rewritten chain");
+        }
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And the log must not still contain the abandoned branch, which is what
+    /// made `replay` truncate.
+    #[test]
+    fn the_abandoned_branch_is_gone_from_the_log() {
+        let path = temp_path("rewrite-drops-branch");
+        let store = AsyncStore::open(&path).expect("open");
+        let all = mined(5);
+        for (b, t) in &all {
+            store.append(b, t);
+        }
+        let kept: Vec<_> = all.iter().take(2).cloned().collect();
+        let abandoned: Vec<_> = all.iter().skip(2).map(|(b, _)| b.id()).collect();
+        store.rewrite(kept);
+
+        let on_disk = BlockStore::load_all(&path).expect("load");
+        for id in abandoned {
+            assert!(
+                !on_disk.iter().any(|(b, _)| b.id() == id),
+                "a discarded block survived the rewrite; replay would fail on it later"
+            );
+        }
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 }
