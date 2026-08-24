@@ -194,6 +194,17 @@ pub struct Discovery {
     /// Session nonces of peers we are currently connected to, to drop a second,
     /// duplicate link to a peer we already have.
     peer_nonces: Arc<Mutex<HashSet<u64>>>,
+    /// Advertise port 0 instead of our real one, so peers do not remember us.
+    ///
+    /// For nodes that exist briefly and will never be reachable again — CI
+    /// runners, one-shot probes, scanners. Peers already discard a gossiped
+    /// address whose port is 0 as unroutable, so this is the existing "do not
+    /// record me" signal rather than a new protocol rule.
+    ///
+    /// Without it every ephemeral node leaves a permanent dead entry in every
+    /// peer's book. A daily CI job that dials the seeds put six such addresses
+    /// into this network's books, and they filled every outbound dial slot.
+    ephemeral: bool,
     /// Consecutive failed dials per address, and the time we may try it again.
     ///
     /// Without this an unreachable address is redialled every
@@ -299,7 +310,15 @@ impl Discovery {
             self_nonce: OsRng.next_u64(),
             peer_nonces: Arc::new(Mutex::new(HashSet::new())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
+            ephemeral: false,
         }
+    }
+
+    /// Mark this node ephemeral: advertise no listen port, so peers do not add
+    /// us to their address books.
+    pub fn ephemeral(mut self, yes: bool) -> Self {
+        self.ephemeral = yes;
+        self
     }
 
     /// Note that a dial to `addr` failed, and hold it back for a while.
@@ -616,7 +635,11 @@ impl Discovery {
 
     /// Our handshake message.
     fn version(&self) -> Wire {
-        Wire::Version(self.magic, self.genesis, self.self_addr.port(), self.self_nonce)
+        // Port 0 means "do not record me". Peers reject a gossiped address with
+        // port 0 as unroutable, which is exactly the behaviour an ephemeral node
+        // wants: connect, sync, disappear without leaving a dead entry behind.
+        let port = if self.ephemeral { 0 } else { self.self_addr.port() };
+        Wire::Version(self.magic, self.genesis, port, self.self_nonce)
     }
 }
 
@@ -1485,5 +1508,57 @@ mod dial_backoff_tests {
         let c = d.dial_candidates();
         assert!(c.contains(&live), "the live peer must get a slot");
         assert_eq!(c.len(), 1, "the dead addresses must all be held back, got {c:?}");
+    }
+}
+
+/// A node that will never be reachable again must not leave a permanent dead
+/// entry in every peer's address book.
+///
+/// The daily CI join test dials the seeds from a fresh GitHub Actions runner.
+/// Each run put that runner's address into the network's books by gossip, the
+/// runner vanished minutes later, and the address stayed forever — until six of
+/// them filled every outbound dial slot and a node could reach nobody.
+#[cfg(test)]
+mod ephemeral_node_tests {
+    use super::*;
+
+    fn disc(ephemeral: bool) -> Discovery {
+        Discovery::new("0.0.0.0:19333".parse().unwrap(), [0u8; 32], 1, 8).ephemeral(ephemeral)
+    }
+
+    fn advertised_port(d: &Discovery) -> u16 {
+        match d.version() {
+            Wire::Version(_, _, port, _) => port,
+            other => panic!("version() must produce a Version message, got {other:?}"),
+        }
+    }
+
+    /// An ordinary node advertises where it can be reached.
+    #[test]
+    fn a_normal_node_advertises_its_listen_port() {
+        assert_eq!(advertised_port(&disc(false)), 19333);
+    }
+
+    /// An ephemeral one advertises nothing.
+    #[test]
+    fn an_ephemeral_node_advertises_no_port() {
+        assert_eq!(
+            advertised_port(&disc(true)),
+            0,
+            "port 0 is the existing 'unroutable, do not record me' signal"
+        );
+    }
+
+    /// And the receiving side must genuinely discard it — otherwise advertising
+    /// 0 would just create a differently-broken entry.
+    #[test]
+    fn a_peer_does_not_record_an_ephemeral_address() {
+        let peer = disc(false);
+        let ephemeral_addr: SocketAddr = "203.0.113.9:0".parse().unwrap();
+        peer.learn_gossip_from(Some("8.8.8.8".parse().unwrap()), [ephemeral_addr]);
+        assert!(
+            !peer.book.lock().unwrap().contains(&ephemeral_addr),
+            "an address with no listen port must never enter the book"
+        );
     }
 }

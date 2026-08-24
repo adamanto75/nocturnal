@@ -58,10 +58,27 @@ jobs:
       - name: Start a node with nothing but the baked-in public seeds
         run: |
           set -euo pipefail
+          # --ephemeral asks peers not to remember this runner. Without it every
+          # run left its address in the network's address books permanently: the
+          # runner is destroyed minutes later, but the dead entry is retried
+          # forever. Six accumulated and filled every outbound dial slot on a
+          # node, which could then reach nobody. A daily test must not degrade
+          # the thing it tests.
+          #
+          # Conditional because releases before v0.1.5 do not have the flag, and
+          # this job deliberately runs against whatever is currently published.
+          EPHEMERAL=""
+          if ./nocturnal-${RELEASE}/noctd --help 2>&1 | grep -q -- --ephemeral; then
+            EPHEMERAL="--ephemeral"
+            echo "using --ephemeral (this release supports it)"
+          else
+            echo "note: this release predates --ephemeral; it will leave an address behind"
+          fi
           # No --peer, no --seed: it must find the network on its own, through
           # seed1/seed2.nocturnalcoin.com, over the public internet.
           ./nocturnal-${RELEASE}/noctd \
             --network testnet \
+            $EPHEMERAL \
             --data-dir "$PWD/chaindata" \
             > noctd.log 2>&1 &
           echo $! > noctd.pid

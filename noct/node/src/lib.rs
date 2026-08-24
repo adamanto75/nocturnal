@@ -92,6 +92,12 @@ pub struct Config {
     pub seeds: Vec<SocketAddr>,
     /// Target number of outbound connections the manager maintains.
     pub target_outbound: usize,
+    /// Ask peers not to remember this node's address.
+    ///
+    /// For a node that exists briefly and will never be reachable again — a CI
+    /// runner, a one-shot probe. Without it, every such node leaves a permanent
+    /// dead entry in the address book of every peer it touches.
+    pub ephemeral: bool,
     /// Where coinbase rewards are paid.
     pub miner_address: Address,
     /// Start with the background miner running (it can be toggled later via RPC).
@@ -206,6 +212,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
     let genesis = { state.lock().unwrap().chain.genesis_id() };
     let magic = { state.lock().unwrap().chain.params().p2p_magic };
     let disc = transport::Discovery::new(config.p2p_listen, genesis, magic, config.target_outbound)
+        .ephemeral(config.ephemeral)
         .with_book(config.data_dir.as_ref().map(|d| d.join("peers.dat")));
     disc.learn(config.peers.iter().copied());
     disc.learn(config.seeds.iter().copied());

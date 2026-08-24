@@ -38,6 +38,7 @@ fn main() {
     let mut seeds: Vec<SocketAddr> = Vec::new();
     let mut target_outbound: usize = 8;
     let mut use_default_seeds = true;
+    let mut ephemeral = false;
     let mut mine = false;
     let mut miner_address: Option<Address> = None;
     let mut rpc_token: Option<String> = None;
@@ -80,6 +81,7 @@ fn main() {
             }
             "--network" => i += 1, // already parsed above; skip its value
             "--no-default-seeds" => use_default_seeds = false,
+            "--ephemeral" => ephemeral = true,
             "--mine" => mine = true,
             "--mine-threads" => {
                 i += 1;
@@ -195,6 +197,7 @@ fn main() {
         peers,
         seeds,
         target_outbound,
+        ephemeral,
         miner_address,
         mine,
         mine_threads,
@@ -251,7 +254,7 @@ fn parse_addr(args: &[String], i: usize, flag: &str) -> SocketAddr {
 
 fn print_help() {
     eprintln!(
-        "noctd [--network mainnet|testnet] [--p2p ADDR] [--rpc ADDR] [--peer ADDR]... [--seed ADDR]... [--no-default-seeds] [--max-outbound N] [--mine] [--mine-threads N] [--mine-interval-ms N] [--miner-address B58] [--data-dir DIR] [--rpc-token TOKEN | --rpc-token-file PATH] [--rpc-rate-limit N] [--rpc-tls-cert PATH --rpc-tls-key PATH]"
+        "noctd [--network mainnet|testnet] [--p2p ADDR] [--rpc ADDR] [--peer ADDR]... [--seed ADDR]... [--no-default-seeds] [--ephemeral] [--max-outbound N] [--mine] [--mine-threads N] [--mine-interval-ms N] [--miner-address B58] [--data-dir DIR] [--rpc-token TOKEN | --rpc-token-file PATH] [--rpc-rate-limit N] [--rpc-tls-cert PATH --rpc-tls-key PATH]"
     );
 }
 
