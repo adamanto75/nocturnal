@@ -536,7 +536,18 @@ pub fn register_connection(
     // connection and a fresh score every time (F12).
     if let Some(a) = socket_addr {
         if disc.is_banned(&a) {
-            return Ok(());
+            // Err, not Ok. The dialer releases its reservation only on an
+            // error, so returning Ok here left `mark_connected(addr)` standing
+            // forever: the address dropped out of the dial candidates for the
+            // life of the process and was never retried, *including after the
+            // ban expired*. A temporary ban became a permanent inability to
+            // reconnect to that peer.
+            //
+            // Seen on the testnet: a node banned its only LAN seed during a
+            // period of chain divergence, then sat at zero peers indefinitely,
+            // still dutifully dialing two unreachable public seeds — because
+            // those failed at TCP and so took the path that does unmark.
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "peer is banned"));
         }
     }
     let peer_ip = socket_addr.map(|a| a.ip());
@@ -1135,5 +1146,94 @@ mod private_network_discovery_tests {
         for a in ["0.0.0.0:19333", "224.0.0.1:19333", "10.10.10.9:0"] {
             assert!(!book_has(&d, a), "{a} is not a dialable address");
         }
+    }
+}
+
+/// A reservation must always be released, or an address silently leaves the
+/// dial set forever.
+///
+/// The dialer calls `mark_connected(addr)` *before* connecting, so two dials
+/// cannot race for the same peer, and relies on the error path to undo it. Any
+/// outcome that skips that undo removes the address from `dial_candidates` for
+/// the life of the process — no retry, no log, no symptom except a peer count
+/// that never rises.
+///
+/// Found on the testnet: a node banned its only LAN seed during a period of
+/// chain divergence and then sat at zero peers indefinitely, still dialing two
+/// unreachable public seeds. Those kept being retried only because they failed
+/// at TCP, which does unmark; the reachable one had taken the banned path,
+/// which returned `Ok` and did not.
+#[cfg(test)]
+mod dial_reservation_tests {
+    use super::*;
+
+    fn disc() -> Discovery {
+        Discovery::new("0.0.0.0:19333".parse().unwrap(), [0u8; 32], 1, 8)
+    }
+
+    /// A reserved address is not offered again — that is the point of reserving.
+    #[test]
+    fn a_reservation_removes_an_address_from_the_dial_set() {
+        let d = disc();
+        let a: SocketAddr = "10.0.0.5:19333".parse().unwrap();
+        d.learn([a]);
+        assert!(d.dial_candidates().contains(&a));
+        d.mark_connected(a);
+        assert!(!d.dial_candidates().contains(&a), "a reserved address must not be dialed twice");
+    }
+
+    /// And releasing it puts the address back. Without this the node quietly
+    /// loses the ability to ever reach that peer again.
+    #[test]
+    fn releasing_a_reservation_restores_the_address() {
+        let d = disc();
+        let a: SocketAddr = "10.0.0.5:19333".parse().unwrap();
+        d.learn([a]);
+        d.mark_connected(a);
+        d.unmark(&a);
+        assert!(
+            d.dial_candidates().contains(&a),
+            "an address must return to the dial set once its reservation ends"
+        );
+    }
+
+    /// The specific regression: `register_connection` on a banned peer must
+    /// report an error, because that is the only signal the dialer acts on to
+    /// release the reservation it took.
+    #[test]
+    fn a_banned_peer_reports_an_error_so_its_reservation_is_released() {
+        use std::net::{TcpListener, TcpStream};
+        let d = disc();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).expect("connect");
+        let (accepted, _) = listener.accept().expect("accept");
+
+        // Ban the address the ACCEPTED socket actually reports, which is the
+        // client's ephemeral port — not the listener's. Loopback bans are keyed
+        // by full address including port (so local test nodes do not ban each
+        // other wholesale), and getting this wrong makes the test pass or fail
+        // for reasons unrelated to what it checks.
+        let seen = accepted.peer_addr().expect("peer addr");
+        d.ban(seen);
+        assert!(d.is_banned(&seen), "test setup: the peer must be banned");
+        let acct = noct_core::keys::Account::random(&mut rand_core::OsRng);
+        let miner = noct_core::address::Address::new(
+            noct_core::address::Network::Testnet,
+            acct.spend_public,
+            acct.view_public,
+        );
+        let state = Arc::new(Mutex::new(NodeState::for_network(
+            noct_core::address::Network::Testnet,
+            miner,
+        )));
+        let peers = Peers::default();
+        let result = register_connection(accepted, &state, &peers, &d, Some(addr));
+        assert!(
+            result.is_err(),
+            "a banned peer must return Err — returning Ok leaks the dialer's reservation \
+             and the address is never dialed again"
+        );
+        drop(stream);
     }
 }
