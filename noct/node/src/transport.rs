@@ -394,9 +394,49 @@ impl Discovery {
     /// loopback/private/link-local gossip, so a remote peer can neither make it
     /// probe internal hosts (SSRF) nor flood its book with unreachable junk.
     pub fn learn_gossip<I: IntoIterator<Item = SocketAddr>>(&self, addrs: I) {
-        let local_node = self.self_addr.ip().is_loopback();
+        self.learn_gossip_from(None, addrs)
+    }
+
+    /// Learn gossip, taking into account **which peer said it**.
+    ///
+    /// The rule above — reject private addresses unless we are loopback-bound —
+    /// is right for a node on the public internet and wrong for every node on a
+    /// private network, which is most nodes in most deployments. A node bound to
+    /// `0.0.0.0` on a LAN is not loopback, so it discarded every private address
+    /// it was told about, *including the listen address of the peer it was
+    /// already talking to*. The result observed on this testnet: four nodes,
+    /// three of them with exactly one peer each, all pointing at the one seed
+    /// they were explicitly configured with. Discovery never happened, and the
+    /// network was a star with a single point of failure.
+    ///
+    /// The source address is what makes this safe to relax. If we are hearing
+    /// gossip over a link to a private address, we already have a route into
+    /// that network — accepting more addresses from it grants no reach we did
+    /// not have. A node facing the public internet still hears only from public
+    /// peers, so it still refuses to be pointed at `192.168.0.1`, which is the
+    /// SSRF case the filter exists for.
+    pub fn learn_gossip_from<I: IntoIterator<Item = SocketAddr>>(
+        &self,
+        from: Option<std::net::IpAddr>,
+        addrs: I,
+    ) {
+        let local_node = self.self_addr.ip().is_loopback()
+            || from.map(Self::is_private_scope).unwrap_or(false);
         let ok = addrs.into_iter().filter(|a| Self::routable(a, local_node));
         self.learn(ok);
+    }
+
+    /// Is this address inside a private network we could already be part of?
+    fn is_private_scope(ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+            // fc00::/7 (unique local) and fe80::/10 (link local).
+            IpAddr::V6(v6) => {
+                let o = v6.octets();
+                v6.is_loopback() || (o[0] & 0xfe) == 0xfc || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80)
+            }
+        }
     }
 
     /// Is `addr` an address we should ever dial from gossip? `local_node` relaxes
@@ -585,7 +625,11 @@ fn spawn_peer_reader(
                             break; // a banned peer reconnecting → refuse it
                         }
                         peer_listen = Some(addr);
-                        disc.learn_gossip([addr]); // advertised port is untrusted
+                        // The IP here is the one this connection actually came
+                        // from, so it is reachable by construction — including
+                        // when it is a LAN address. Only the advertised *port*
+                        // is untrusted, and a wrong port merely wastes a dial.
+                        disc.learn_gossip_from(Some(ip), [addr]);
                         disc.mark_connected(addr);
                     }
                     continue;
@@ -598,7 +642,10 @@ fn spawn_peer_reader(
                     continue;
                 }
                 Wire::Peers(addrs) => {
-                    disc.learn_gossip(addrs);
+                    // Judge the addresses by the company they arrive in: gossip
+                    // reaching us over a private link is about a network we can
+                    // already reach.
+                    disc.learn_gossip_from(peer_ip, addrs);
                     continue;
                 }
                 _ => {}
@@ -957,5 +1004,92 @@ mod registry_tests {
             peers.remove(id);
         }
         assert_eq!(peers.count(), 0, "churn must leave nothing behind");
+    }
+}
+
+/// Peer discovery has to work on a private network without letting a public
+/// peer aim a public node at private hosts.
+///
+/// Found by running the testnet: four nodes, three with exactly one peer each,
+/// every one of them pointing at the single seed it was configured with.
+/// Discovery had never worked, because a node bound to `0.0.0.0` is not
+/// loopback and so discarded every private address it heard — including the
+/// listen address of the peer it was already connected to.
+#[cfg(test)]
+mod private_network_discovery_tests {
+    use super::*;
+    use std::net::{IpAddr, SocketAddr};
+
+    fn disc(self_addr: &str) -> Discovery {
+        Discovery::new(self_addr.parse().unwrap(), [0u8; 32], 1, 8)
+    }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+    fn book_has(d: &Discovery, a: &str) -> bool {
+        d.book.lock().unwrap().contains(&sa(a))
+    }
+
+    /// The bug: a LAN node bound to 0.0.0.0 must be able to learn its LAN peers.
+    #[test]
+    fn a_lan_node_learns_lan_peers_from_a_lan_peer() {
+        let d = disc("0.0.0.0:19333");
+        d.learn_gossip_from(Some(ip("10.10.10.240")), [sa("10.10.10.82:19333")]);
+        assert!(
+            book_has(&d, "10.10.10.82:19333"),
+            "a node on a private network must be able to discover its own network"
+        );
+    }
+
+    /// The protection that must survive: a public node told about private hosts
+    /// by a public peer still refuses. This is the SSRF case.
+    #[test]
+    fn a_public_peer_cannot_aim_us_at_private_hosts() {
+        let d = disc("0.0.0.0:19333");
+        d.learn_gossip_from(
+            Some(ip("8.8.8.8")),
+            [sa("192.168.0.1:19333"), sa("10.0.0.1:19333"), sa("127.0.0.1:19333")],
+        );
+        for a in ["192.168.0.1:19333", "10.0.0.1:19333", "127.0.0.1:19333"] {
+            assert!(!book_has(&d, a), "{a} must not be learned from a public peer");
+        }
+    }
+
+    /// And a public peer telling us about public peers still works.
+    ///
+    /// Note the addresses: the documentation ranges (192.0.2/24, 198.51.100/24,
+    /// 203.0.113/24) are rejected as unroutable, so a test written with them
+    /// fails for a reason that has nothing to do with what it is testing.
+    #[test]
+    fn public_gossip_from_a_public_peer_is_still_accepted() {
+        let d = disc("0.0.0.0:19333");
+        d.learn_gossip_from(Some(ip("8.8.8.8")), [sa("93.184.216.34:19333")]);
+        assert!(book_has(&d, "93.184.216.34:19333"));
+    }
+
+    /// Gossip with no known source keeps the old, strict behaviour — an unknown
+    /// origin is not evidence of anything.
+    #[test]
+    fn gossip_from_an_unknown_source_stays_strict() {
+        let d = disc("0.0.0.0:19333");
+        d.learn_gossip_from(None, [sa("10.0.0.5:19333")]);
+        assert!(!book_has(&d, "10.0.0.5:19333"));
+    }
+
+    /// A private peer still cannot smuggle in nonsense: unroutable is
+    /// unroutable regardless of who says it.
+    #[test]
+    fn a_private_peer_still_cannot_gossip_junk() {
+        let d = disc("0.0.0.0:19333");
+        d.learn_gossip_from(
+            Some(ip("10.10.10.240")),
+            [sa("0.0.0.0:19333"), sa("224.0.0.1:19333"), sa("10.10.10.9:0")],
+        );
+        for a in ["0.0.0.0:19333", "224.0.0.1:19333", "10.10.10.9:0"] {
+            assert!(!book_has(&d, a), "{a} is not a dialable address");
+        }
     }
 }
