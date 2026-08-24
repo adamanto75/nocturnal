@@ -556,7 +556,50 @@ impl Discovery {
         // on one that has failed twice and is merely out of its backoff.
         let fails = self.dial_backoff.lock().unwrap();
         usable.sort_by_key(|a| fails.get(a).map(|(n, _)| *n).unwrap_or(0));
-        usable
+        if !usable.is_empty() {
+            return usable;
+        }
+
+        // Everything is in backoff. Waiting it out would be its own starvation:
+        // a node with no peers and nothing to try does nothing at all, which is
+        // exactly the state backoff was added to escape. Seen in practice — a
+        // node reporting "14 known, no address to dial" while sitting idle at
+        // zero peers, because a subnet fault had timed out its good LAN peers
+        // alongside the genuinely dead ones.
+        //
+        // So always keep one candidate: whichever is closest to being eligible.
+        // The backoff still does its job — dead addresses are tried rarely
+        // rather than every 15s — but the node never stops trying entirely.
+        drop(fails);
+        let now2 = Instant::now();
+
+        // Snapshot first, then filter. `ban()` takes `banned` before `book`, so
+        // calling `is_banned` while holding `book` would invert that order and
+        // invite a deadlock.
+        let known: Vec<SocketAddr> = {
+            let connected = self.connected.lock().unwrap();
+            self.book
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| **a != self.self_addr && !connected.contains(*a))
+                .copied()
+                .collect()
+        };
+        let mut soonest: Option<(Instant, SocketAddr)> = None;
+        for a in known {
+            if self.is_banned(&a) {
+                continue;
+            }
+            let until = {
+                let b = self.dial_backoff.lock().unwrap();
+                b.get(&a).map(|(_, u)| *u).unwrap_or(now2)
+            };
+            if soonest.as_ref().is_none_or(|(best, _)| until < *best) {
+                soonest = Some((until, a));
+            }
+        }
+        soonest.map(|(_, a)| vec![a]).unwrap_or_default()
     }
 
     /// A sample of known addresses to share, excluding the requester's own.
@@ -1356,19 +1399,58 @@ mod dial_backoff_tests {
     }
 
     /// Reaching a host clears its history, so one bad spell does not haunt a
-    /// peer that has come back.
+    /// peer that has come back. Two addresses, so the held-back one has an
+    /// alternative and the backoff is actually observable.
     #[test]
     fn success_clears_the_penalty() {
         let d = disc();
         let peer = a(1);
-        d.learn([peer]);
+        let other = a(2);
+        d.learn([peer, other]);
         d.note_dial_failure(peer);
-        assert!(!d.dial_candidates().contains(&peer));
+        assert!(!d.dial_candidates().contains(&peer), "held back while an alternative exists");
         d.note_dial_success(peer);
         assert!(
             d.dial_candidates().contains(&peer),
             "a reachable peer must be immediately eligible again"
         );
+    }
+
+    /// Backoff must never leave the node with nothing to do.
+    ///
+    /// A node with no peers and no address to try does nothing at all — which
+    /// is the very starvation backoff was added to escape. Seen in practice: a
+    /// node reporting "14 known, no address to dial" while idle at zero peers,
+    /// because a subnet fault had timed out its good LAN peers alongside the
+    /// genuinely dead ones. So when everything is held back, the one closest to
+    /// eligible is offered anyway.
+    #[test]
+    fn something_is_always_offered_even_when_all_are_backed_off() {
+        let d = disc();
+        for n in 1..=5u8 {
+            d.learn([a(n)]);
+            d.note_dial_failure(a(n));
+        }
+        let c = d.dial_candidates();
+        assert_eq!(c.len(), 1, "exactly one fallback candidate, not the whole dead book");
+        assert!(c[0] >= a(1) && c[0] <= a(5));
+    }
+
+    /// And the fallback picks the one whose penalty expires soonest, not an
+    /// arbitrary address — fewest failures means most likely to work.
+    #[test]
+    fn the_fallback_prefers_the_least_penalised_address() {
+        let d = disc();
+        let mild = a(1);
+        let hopeless = a(2);
+        d.learn([mild, hopeless]);
+        d.note_dial_failure(mild);
+        for _ in 0..6 {
+            d.note_dial_failure(hopeless);
+        }
+        let c = d.dial_candidates();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0], mild, "the least-penalised address should be retried first");
     }
 
     /// Cleanest record first: a slot spent on a never-failed address beats one
