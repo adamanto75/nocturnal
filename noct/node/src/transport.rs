@@ -44,6 +44,19 @@ pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Cap on the address book, so a peer can't grow our memory without bound.
 const MAX_BOOK: usize = 1024;
 
+/// Most of the address book any single gossip source may fill.
+///
+/// Without a per-source cap, one peer that merely talks can hand us
+/// `MAX_BOOK` routable-but-useless addresses, fill the book, and — because a
+/// full book refuses new entries rather than evicting honest ones — leave the
+/// node permanently unable to learn a real peer. That is an eclipse for the
+/// price of a connection, and an adversarial test confirmed it: 1024 junk
+/// addresses in, honest address refused.
+///
+/// A sixteenth each means it takes sixteen distinct sources to fill the book,
+/// and no one of them can shut the others out.
+const MAX_BOOK_PER_SOURCE: usize = MAX_BOOK / 16;
+
 /// Cap on the misbehaviour score table. An attacker cycling through addresses
 /// would otherwise make a defensive counter into a memory leak — the same lesson
 /// as F13 and the rate limiter's client table.
@@ -194,6 +207,9 @@ pub struct Discovery {
     /// Session nonces of peers we are currently connected to, to drop a second,
     /// duplicate link to a peer we already have.
     peer_nonces: Arc<Mutex<HashSet<u64>>>,
+    /// How many book entries each gossip source has been allowed to contribute,
+    /// so no single peer can fill the book and shut everyone else out.
+    gossip_quota: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
     /// Advertise port 0 instead of our real one, so peers do not remember us.
     ///
     /// For nodes that exist briefly and will never be reachable again — CI
@@ -311,6 +327,7 @@ impl Discovery {
             peer_nonces: Arc::new(Mutex::new(HashSet::new())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             ephemeral: false,
+            gossip_quota: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -490,8 +507,28 @@ impl Discovery {
     ) {
         let local_node = self.self_addr.ip().is_loopback()
             || from.map(Self::is_private_scope).unwrap_or(false);
-        let ok = addrs.into_iter().filter(|a| Self::routable(a, local_node));
-        self.learn(ok);
+        let ok: Vec<SocketAddr> =
+            addrs.into_iter().filter(|a| Self::routable(a, local_node)).collect();
+
+        // Cap what any one source may contribute. A full book refuses new
+        // entries rather than evicting old ones — which stops a flood erasing
+        // honest peers, but means whoever fills it first decides who we can
+        // ever hear about. Quota-per-source keeps that from being one peer.
+        let Some(src) = from else {
+            // No known source: it cannot be attributed, so it cannot be
+            // trusted with book space at all beyond the usual limit.
+            self.learn(ok);
+            return;
+        };
+        let allowed = {
+            let mut counts = self.gossip_quota.lock().unwrap();
+            let used = counts.entry(src).or_insert(0);
+            let room = MAX_BOOK_PER_SOURCE.saturating_sub(*used);
+            let take = room.min(ok.len());
+            *used += take;
+            take
+        };
+        self.learn(ok.into_iter().take(allowed));
     }
 
     /// Is this address inside a private network we could already be part of?
@@ -1559,6 +1596,258 @@ mod ephemeral_node_tests {
         assert!(
             !peer.book.lock().unwrap().contains(&ephemeral_addr),
             "an address with no listen port must never enter the book"
+        );
+    }
+}
+
+/// Hostile traffic against a **running** node.
+///
+/// The unit tests elsewhere check rejection logic in isolation; the testnet has
+/// exercised the cooperative path across tens of thousands of transactions.
+/// Neither answers the question these do: does a live node, reachable over a
+/// real socket, survive someone actively trying to break it?
+///
+/// Every bug found on this network so far came from an accident — a migration,
+/// a restart, an OOM. Accidents found six. It would be strange if deliberate
+/// hostility found none.
+///
+/// Each test asserts the node is **still serving afterwards**, because a node
+/// that rejects an attack and then dies has not defended anything.
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+    use noct_core::address::{Address, Network};
+    use rand_core::OsRng;
+    use std::io::Write;
+
+    /// Start a real node on a loopback port and return its address.
+    fn victim() -> SocketAddr {
+        let acct = noct_core::keys::Account::random(&mut OsRng);
+        let miner = Address::new(Network::Testnet, acct.spend_public, acct.view_public);
+        let state = Arc::new(Mutex::new(NodeState::for_network(Network::Testnet, miner)));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let genesis = { state.lock().unwrap().chain.genesis_id() };
+        let magic = { state.lock().unwrap().chain.params().p2p_magic };
+        let disc = Discovery::new(addr, genesis, magic, 8);
+        spawn_listener(listener, state, Peers::default(), disc);
+        addr
+    }
+
+    /// Is the node still accepting connections?
+    fn still_alive(addr: SocketAddr) -> bool {
+        TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
+    }
+
+    /// Raw bytes, bypassing every encoder — an attacker is not obliged to use
+    /// our framing helpers.
+    fn raw(addr: SocketAddr, bytes: &[u8]) -> io::Result<()> {
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+        s.set_write_timeout(Some(Duration::from_secs(3)))?;
+        s.write_all(bytes)?;
+        let _ = s.flush();
+        Ok(())
+    }
+
+    /// A length prefix claiming an enormous body must not make the node try to
+    /// allocate it. This is the cheapest denial of service there is: four bytes.
+    #[test]
+    fn a_huge_length_prefix_does_not_kill_the_node() {
+        let addr = victim();
+        for len in [u32::MAX, u32::MAX - 1, 1 << 30, 1 << 24] {
+            let _ = raw(addr, &len.to_le_bytes());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(still_alive(addr), "a 4-byte length prefix must not take the node down");
+    }
+
+    /// A frame that promises more than it delivers, then goes silent. The node
+    /// must not wait on it forever holding a connection slot.
+    #[test]
+    fn a_truncated_frame_does_not_wedge_the_node() {
+        let addr = victim();
+        for _ in 0..20 {
+            let mut msg = 4096u32.to_le_bytes().to_vec();
+            msg.extend_from_slice(&[0xAB; 16]); // promises 4096, sends 16
+            let _ = raw(addr, &msg);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(still_alive(addr), "truncated frames must not wedge the listener");
+    }
+
+    /// Pure garbage, at every length that might trip a parser boundary.
+    #[test]
+    fn random_garbage_is_survived() {
+        let addr = victim();
+        for n in [0usize, 1, 3, 4, 5, 63, 64, 65, 255, 256, 1023, 4096] {
+            let body: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+            let mut msg = (n as u32).to_le_bytes().to_vec();
+            msg.extend_from_slice(&body);
+            let _ = raw(addr, &msg);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(still_alive(addr), "garbage of any length must be survived");
+    }
+
+    /// Connect and say nothing at all. Idle sockets are free for an attacker
+    /// and expensive for the node — this is the shape of F31.
+    #[test]
+    fn many_silent_connections_do_not_exhaust_the_node() {
+        let addr = victim();
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                held.push(s);
+            }
+        }
+        assert!(
+            still_alive(addr),
+            "the node must still accept an honest peer while 64 silent sockets are held"
+        );
+        drop(held);
+    }
+
+    /// A peer from another network must be dropped, and dropping it must not
+    /// cost the node anything lasting.
+    #[test]
+    fn a_foreign_network_peer_is_refused_without_damage() {
+        let addr = victim();
+        for _ in 0..10 {
+            if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                let wrong = Wire::Version(0xDEADBEEF, [9u8; 32], 19333, 12345);
+                let _ = send_message(&mut s, &wrong);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(still_alive(addr), "foreign-network handshakes must be cheap to refuse");
+    }
+
+    /// The right magic but a foreign genesis — a peer on a different chain that
+    /// otherwise looks correct.
+    #[test]
+    fn a_foreign_genesis_peer_is_refused_without_damage() {
+        let addr = victim();
+        let magic = noct_core::params::TESTNET.p2p_magic;
+        for _ in 0..10 {
+            if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                let _ = send_message(&mut s, &Wire::Version(magic, [0x77u8; 32], 19333, 999));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(still_alive(addr), "a foreign chain must be refused without damage");
+    }
+
+    /// Connect and immediately vanish, repeatedly. Each one costs the node a
+    /// registry entry and a socket; leaking either is how a node is exhausted
+    /// for free.
+    #[test]
+    fn connect_and_drop_storms_are_survived() {
+        let addr = victim();
+        for _ in 0..200 {
+            if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                drop(s);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(still_alive(addr), "200 connect-and-drop cycles must leave the node serving");
+    }
+}
+
+/// Can a hostile peer fill our address book with junk?
+///
+/// This is the eclipse question. `learn()` inserts only while the book is under
+/// `MAX_BOOK`, and drops new addresses once it is full. That refusal is
+/// deliberate — it stops a flood *evicting* honest peers — but it has a mirror
+/// image: if an attacker fills the book first, the node can never learn a real
+/// peer afterwards.
+#[cfg(test)]
+mod book_flooding_tests {
+    use super::*;
+
+    fn disc() -> Discovery {
+        Discovery::new("0.0.0.0:19333".parse().unwrap(), [0u8; 32], 1, 8)
+    }
+
+    /// Flood the book from a single hostile peer, then try to learn an honest
+    /// address. If the honest one cannot get in, the node is eclipsed by a peer
+    /// that only had to talk.
+    #[test]
+    fn a_flood_of_junk_can_shut_out_honest_addresses() {
+        let d = disc();
+        let attacker: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+
+        // Routable, well-formed, and entirely useless: exactly what gossip
+        // accepts. Enough to exceed MAX_BOOK.
+        let junk: Vec<SocketAddr> = (0..(MAX_BOOK + 200))
+            .map(|i| {
+                let a = 11 + (i / 65536) as u8;
+                let b = ((i / 256) % 256) as u8;
+                let c = (i % 256) as u8;
+                format!("{a}.{b}.{c}.1:19333").parse().unwrap()
+            })
+            .collect();
+        d.learn_gossip_from(Some(attacker), junk);
+
+        let honest: SocketAddr = "93.184.216.34:19333".parse().unwrap();
+        d.learn_gossip_from(Some("1.1.1.1".parse().unwrap()), [honest]);
+
+        let honest_in = d.book.lock().unwrap().contains(&honest);
+        println!("book_len={} honest_learned={}", d.book_len(), honest_in);
+
+        assert!(
+            d.book_len() <= MAX_BOOK_PER_SOURCE + 1,
+            "one source must not exceed its quota; book holds {}",
+            d.book_len()
+        );
+        assert!(
+            honest_in,
+            "an honest address must remain learnable after a flood, or one peer that              merely talks has eclipsed us"
+        );
+    }
+
+    /// The quota is per source, so honest peers are not collectively punished
+    /// for one attacker: many distinct sources can still fill the book.
+    #[test]
+    fn distinct_sources_can_still_fill_the_book() {
+        let d = disc();
+        for src in 1..=20u8 {
+            let from: std::net::IpAddr = format!("8.8.8.{src}").parse().unwrap();
+            let addrs: Vec<SocketAddr> = (0..MAX_BOOK_PER_SOURCE)
+                .map(|i| {
+                    let b = ((i / 256) % 256) as u8;
+                    let c = (i % 256) as u8;
+                    format!("{}.{b}.{c}.1:19333", 100 + src).parse().unwrap()
+                })
+                .collect();
+            d.learn_gossip_from(Some(from), addrs);
+        }
+        assert!(
+            d.book_len() > MAX_BOOK_PER_SOURCE * 4,
+            "many honest sources must together contribute far more than one quota, got {}",
+            d.book_len()
+        );
+    }
+
+    /// The operator's own configuration must survive a flood. A node told
+    /// explicitly where to connect should never lose that to gossip.
+    #[test]
+    fn a_configured_seed_survives_a_flood() {
+        let d = disc();
+        let seed: SocketAddr = "10.10.10.240:19333".parse().unwrap();
+        d.learn([seed]); // as --seed does, at startup
+
+        let junk: Vec<SocketAddr> = (0..(MAX_BOOK + 200))
+            .map(|i| {
+                let b = ((i / 256) % 256) as u8;
+                let c = (i % 256) as u8;
+                format!("77.{b}.{c}.1:19333").parse().unwrap()
+            })
+            .collect();
+        d.learn_gossip_from(Some("8.8.8.8".parse().unwrap()), junk);
+
+        assert!(
+            d.book.lock().unwrap().contains(&seed),
+            "a configured seed must never be displaced by gossip"
         );
     }
 }
