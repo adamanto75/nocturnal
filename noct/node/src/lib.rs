@@ -424,6 +424,9 @@ pub struct Reaction {
 
 /// All consensus state for one node. Guard with a `Mutex` when shared.
 pub struct NodeState {
+    /// How many blocks have been thrown away because a branch collection from
+    /// the same peer was in progress. Diagnostic only.
+    dropped_while_collecting: u64,
     pub chain: Blockchain<NodePow>,
     pub mempool: Mempool,
     pub miner_address: Address,
@@ -457,6 +460,7 @@ impl NodeState {
     pub fn for_network(network: noct_core::address::Network, miner_address: Address) -> Self {
         let pow = new_pow();
         NodeState {
+            dropped_while_collecting: 0,
             chain: Blockchain::for_network(network, pow.clone()),
             mempool: Mempool::new(),
             miner_address,
@@ -729,7 +733,18 @@ impl NodeState {
         // (Deliberately before the seen-dedup: a branch re-sends blocks we know.)
         if let Some(collect) = self.sync.get_mut(&peer) {
             if block_height != collect.next {
-                return; // out of order / unsolicited — ignore
+                // Every block from this peer is captured by the collector, so a
+                // block fetched by ordinary sequential sync is discarded here.
+                // While a collection is open, that is most of them.
+                let want = collect.next;
+                self.dropped_while_collecting += 1;
+                if self.dropped_while_collecting % 50 == 1 {
+                    eprintln!(
+                        "peer {peer}: discarded block {block_height} while collecting (wanted {want});                          {} discarded so far",
+                        self.dropped_while_collecting
+                    );
+                }
+                return;
             }
             collect.blocks.push((block, txs));
             collect.next += 1;
@@ -815,6 +830,14 @@ impl NodeState {
         if to < from {
             return;
         }
+        // Say how much this is about to pull. `to` is the *peer's* tip, so for a
+        // node that is far behind this is not a small reorg window — it is the
+        // whole gap, buffered in memory before any of it is applied.
+        eprintln!(
+            "peer {peer}: collecting branch, heights {from}..={to} ({} blocks) while our chain is at {}",
+            to.saturating_sub(from).saturating_add(1),
+            self.chain.height()
+        );
         self.sync.insert(peer, Collect { next: from, to, blocks: Vec::new() });
         out.reply.push(Wire::GetBlock(from));
     }
