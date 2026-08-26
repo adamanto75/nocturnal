@@ -1067,7 +1067,12 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
             // Say it once, then rarely: it is a standing condition, not an event.
             if refused_rounds == 1 || refused_rounds % 20 == 0 {
                 eprintln!(
-                "connection manager: {} peer(s) in a row closed the connection on us and                  we have none left — this node is probably banned by the network; check                  that it is built for the same proof-of-work and network as its peers",
+                    concat!(
+                        "connection manager: {} peer(s) in a row closed the ",
+                        "connection on us and we have none left — this node is ",
+                        "probably banned by the network; check that it is built ",
+                        "for the same proof-of-work and network as its peers"
+                    ),
                     disc.refused_in_a_row()
                 );
             }
@@ -1079,7 +1084,7 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
             quiet_rounds += 1;
             if quiet_rounds == 1 || quiet_rounds % 20 == 0 {
                 eprintln!(
-                    "connection manager: want {need} more peer(s) but have no address to dial                      ({} known, {connected} reserved/connected) — check --seed/--peer and peers.dat",
+                    "connection manager: want {need} more peer(s) but have no address to dial ({} known, {connected} reserved/connected) — check --seed/--peer and peers.dat",
                     disc.book_len()
                 );
             }
