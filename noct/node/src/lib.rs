@@ -865,8 +865,28 @@ impl NodeState {
     // the background writer, so it does not block consensus.
     fn rewrite_store(&mut self) {
         if let Some(store) = &self.store {
-            let blocks: Vec<_> =
-                self.chain.blocks().iter().map(|s| (s.block.clone(), s.txs.clone())).collect();
+            // SKIP GENESIS. `Blockchain` keeps genesis as `blocks()[0]`, but a
+            // replaying node already has it: `Blockchain::new` applies genesis
+            // before a single stored block is read.
+            //
+            // Storing it meant replay called `add_block(genesis)` against a
+            // chain whose tip already *was* genesis. Genesis's prev_id is all
+            // zeros, which never matches that tip, so the very first stored
+            // block failed BadPrevId and replay discarded **everything after
+            // it** — the whole chain, on every start.
+            //
+            // The append path never wrote genesis, so a store built only by
+            // appends replayed fine. That is why this stayed hidden: a node was
+            // healthy until its first reorg triggered a rewrite, and poisoned
+            // from then on. It cost this testnet thousands of blocks across
+            // several restarts before the cause was found.
+            let blocks: Vec<_> = self
+                .chain
+                .blocks()
+                .iter()
+                .skip(1)
+                .map(|s| (s.block.clone(), s.txs.clone()))
+                .collect();
             store.rewrite(blocks);
         }
     }
@@ -987,7 +1007,7 @@ mod tests {
     use noct_wallet::{Wallet, DEFAULT_RING_SIZE};
     use rand_core::OsRng;
 
-    fn wallet() -> Wallet {
+    pub(super) fn wallet() -> Wallet {
         // Scan genesis, as production `sync` does, so the wallet's global-index
         // counter includes the premine (output 0) and stays aligned with the
         // node's chain.
@@ -999,14 +1019,14 @@ mod tests {
     // A node whose chain uses a shallow coinbase maturity, so tests can spend
     // freshly-mined coins without mining a full maturity window (production uses
     // `COINBASE_MATURITY`).
-    fn test_node(miner_address: noct_core::address::Address) -> NodeState {
+    pub(super) fn test_node(miner_address: noct_core::address::Address) -> NodeState {
         let mut node = NodeState::new(miner_address);
         node.chain = noct_core::chain::Blockchain::with_maturity(node.pow.clone(), 1);
         node
     }
 
     // Mine `n` blocks on `node`, scanning each into `w` to keep indices synced.
-    fn mine_n(node: &mut NodeState, w: &mut Wallet, n: usize) {
+    pub(super) fn mine_n(node: &mut NodeState, w: &mut Wallet, n: usize) {
         for _ in 0..n {
             let (block, txs) = node.mine_block(&mut OsRng).unwrap();
             w.scan_block(&block, &txs);
@@ -1710,5 +1730,105 @@ mod seed_tests {
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), hosts.len(), "two seeds share an address");
+    }
+}
+
+/// A store written by a rewrite must replay.
+///
+/// `Blockchain` keeps genesis as `blocks()[0]`, and the rewrite copied the whole
+/// vector — so the store began with genesis. A replaying node has already
+/// applied genesis before reading a single stored block, so `add_block(genesis)`
+/// failed `BadPrevId` on the very first record and replay discarded everything
+/// after it. The entire chain, on every start.
+///
+/// It stayed hidden because the *append* path never wrote genesis: a node was
+/// healthy until its first reorg triggered a rewrite, and poisoned from then on.
+/// It cost this testnet thousands of blocks across several restarts.
+#[cfg(test)]
+mod store_replay_tests {
+    use super::tests::*;
+    use super::*;
+    use noct_core::address::Network;
+    use rand_core::OsRng;
+
+    /// Mine a chain, rewrite the store from it, and replay that store into a
+    /// fresh node. Every block must come back.
+    #[test]
+    fn a_rewritten_store_replays_completely() {
+        let acct = noct_core::keys::Account::random(&mut OsRng);
+        let miner = noct_core::address::Address::new(
+            Network::Mainnet,
+            acct.spend_public,
+            acct.view_public,
+        );
+        let mut node = test_node(miner);
+        let mut w = wallet();
+        mine_n(&mut node, &mut w, 12);
+        let mined_height = node.chain.height();
+        assert!(mined_height >= 12, "setup mined a chain");
+
+        // Exactly what rewrite_store persists.
+        let stored: Vec<_> = node
+            .chain
+            .blocks()
+            .iter()
+            .skip(1)
+            .map(|s| (s.block.clone(), s.txs.clone()))
+            .collect();
+
+        // Replay it into a fresh node, as a restart does.
+        let acct2 = noct_core::keys::Account::random(&mut OsRng);
+        let miner2 = noct_core::address::Address::new(
+            Network::Mainnet,
+            acct2.spend_public,
+            acct2.view_public,
+        );
+        let mut fresh = test_node(miner2);
+        let height = fresh
+            .replay(&mut OsRng, stored)
+            .expect("a store we wrote ourselves must replay without error");
+
+        assert_eq!(
+            height, mined_height,
+            "replay must restore the full chain, not a truncated prefix"
+        );
+    }
+
+    /// The precise regression: genesis in the store poisons the whole replay.
+    /// This is what the old rewrite produced.
+    #[test]
+    fn genesis_in_the_store_would_destroy_the_chain() {
+        let acct = noct_core::keys::Account::random(&mut OsRng);
+        let miner = noct_core::address::Address::new(
+            Network::Mainnet,
+            acct.spend_public,
+            acct.view_public,
+        );
+        let mut node = test_node(miner);
+        let mut w = wallet();
+        mine_n(&mut node, &mut w, 8);
+
+        // The old behaviour: copy blocks() whole, genesis included.
+        let with_genesis: Vec<_> =
+            node.chain.blocks().iter().map(|s| (s.block.clone(), s.txs.clone())).collect();
+
+        let acct2 = noct_core::keys::Account::random(&mut OsRng);
+        let miner2 = noct_core::address::Address::new(
+            Network::Mainnet,
+            acct2.spend_public,
+            acct2.view_public,
+        );
+        let mut fresh = test_node(miner2);
+        let result = fresh.replay(&mut OsRng, with_genesis);
+
+        assert!(
+            result.is_err(),
+            "storing genesis must fail loudly here, so nobody reintroduces it"
+        );
+        assert_eq!(
+            fresh.chain.height(),
+            1,
+            "and the damage is total: the chain is left at genesis alone"
+        );
     }
 }
