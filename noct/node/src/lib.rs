@@ -329,6 +329,14 @@ pub const MAX_COLLECT_SPAN: u64 = 2 * MAX_REORG_DEPTH;
 /// run more than `FUTURE_TIME_LIMIT` ahead. A peer cannot dress an old block up
 /// as a current one. Blocks near the tip are relayed; the historical ones a
 /// bulk sync walks through are not.
+/// Transactions that may be buffered across all open branch collections at once.
+///
+/// Collected blocks are held unvalidated until the branch completes, so a block
+/// count alone does not bound the memory: a single block message may carry up
+/// to `MAX_MESSAGE_BYTES`. This puts a ceiling on the bytes instead, at roughly
+/// a hundred megabytes of transactions across every peer combined.
+pub const MAX_COLLECTED_TXS: usize = 50_000;
+
 pub const RELAY_FRESHNESS: u64 = 30 * noct_core::pow::TARGET_BLOCK_TIME;
 
 /// Seed nodes for the **testnet**.
@@ -464,6 +472,9 @@ pub struct NodeState {
     pow: NodePow,
     seen_txs: BoundedSet,
     seen_blocks: BoundedSet,
+    /// Transactions currently buffered across all open branch collections, so
+    /// the memory they hold has a ceiling rather than just a block count.
+    collected_txs: usize,
     /// Consecutive branch collections that never reached a common ancestor.
     ///
     /// A handful of these is ordinary. A steady stream means this node has
@@ -505,6 +516,7 @@ impl NodeState {
             seen_txs: BoundedSet::default(),
             seen_blocks: BoundedSet::default(),
             reorgs_without_ancestor: 0,
+            collected_txs: 0,
             peer_best_height: 0,
             store: None,
             sync: HashMap::new(),
@@ -779,11 +791,23 @@ impl NodeState {
         // minute this way against a network the same build syncs at five
         // hundred.
         if self.sync.get(&peer).is_some_and(|c| c.next == block_height) {
+            // These blocks are buffered before anything validates them, so the
+            // buffer needs a ceiling of its own.
+            if self.collected_txs.saturating_add(txs.len()) > MAX_COLLECTED_TXS {
+                eprintln!(
+                    "peer {peer}: abandoning branch collection — it would buffer more than                      {MAX_COLLECTED_TXS} unvalidated transactions"
+                );
+                self.forget_peer(peer);
+                return;
+            }
+            self.collected_txs += txs.len();
             let collect = self.sync.get_mut(&peer).expect("just checked");
             collect.blocks.push((block, txs));
             collect.next += 1;
             if collect.next > collect.to {
                 let done = self.sync.remove(&peer).expect("present");
+                let freed: usize = done.blocks.iter().map(|(_, t)| t.len()).sum();
+                self.collected_txs = self.collected_txs.saturating_sub(freed);
                 self.finish_reorg(rng, done.blocks, out);
             } else {
                 let next = collect.next;
@@ -860,6 +884,30 @@ impl NodeState {
                 eprintln!("peer {peer}: block {block_height} rejected as invalid ({e:?}) — penalising");
                 out.misbehavior += MISBEHAVIOR_INVALID_BLOCK
             }
+        }
+    }
+
+    /// Release everything held on behalf of a peer whose session has ended.
+    ///
+    /// A branch collection buffers blocks in memory and was only ever removed
+    /// when it *completed*. A peer that started one and then went away — by
+    /// disconnecting, by being dropped, or simply by never sending the last
+    /// block — left its buffer behind for the life of the process. Peer ids are
+    /// per connection, so reconnecting started a fresh one, and nothing ever
+    /// reclaimed the old.
+    ///
+    /// That is unbounded growth an attacker can drive deliberately (connect,
+    /// trigger a collection, send all but the last block, disconnect, repeat)
+    /// and that ordinary session churn causes by accident. This node has
+    /// already been OOM-killed once in production.
+    pub fn forget_peer(&mut self, peer: usize) {
+        if let Some(abandoned) = self.sync.remove(&peer) {
+            let txs: usize = abandoned.blocks.iter().map(|(_, t)| t.len()).sum();
+            self.collected_txs = self.collected_txs.saturating_sub(txs);
+            eprintln!(
+                "peer {peer}: released {} buffered block(s) from an unfinished branch collection",
+                abandoned.blocks.len()
+            );
         }
     }
 
@@ -1116,6 +1164,39 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A peer that starts a branch collection and leaves must not keep its
+    /// buffered blocks alive. Peer ids are per connection, so without this a
+    /// reconnecting peer starts a fresh collection and nothing reclaims the old
+    /// one — unbounded growth, drivable on purpose and reached by accident
+    /// through ordinary session churn.
+    #[test]
+    fn an_abandoned_branch_collection_is_released_when_the_peer_goes() {
+        let mut w = wallet();
+        let mut node = test_node(w.address());
+        mine_n(&mut node, &mut w, 3);
+        node.peer_best_height = 10_000;
+
+        node.begin_branch_collection(42, &mut Reaction::default());
+        assert!(node.sync.contains_key(&42), "collection should be open");
+
+        node.forget_peer(42); // as the transport now does when a session ends
+
+        assert!(
+            !node.sync.contains_key(&42),
+            "an unfinished collection must not outlive the peer's session"
+        );
+    }
+
+    /// Forgetting a peer we hold nothing for must be harmless — every session
+    /// end calls it, including the many that never collect anything.
+    #[test]
+    fn forgetting_an_unknown_peer_is_harmless() {
+        let mut w = wallet();
+        let mut node = test_node(w.address());
+        node.forget_peer(9999);
+        assert!(node.sync.is_empty());
+    }
 
     /// A peer must not be able to silence our block relay by claiming a height.
     ///

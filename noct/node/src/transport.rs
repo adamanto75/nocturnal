@@ -1013,6 +1013,11 @@ fn spawn_peer_reader(
             eprintln!("peer {who}: session ended — {end_reason}");
         }
         peers.remove(peer_id);
+        // Release consensus-side state held for this peer too — an unfinished
+        // branch collection keeps its buffered blocks alive otherwise.
+        if let Ok(mut node) = state.lock() {
+            node.forget_peer(peer_id);
+        }
         if let Some(a) = peer_listen {
             disc.unmark(&a);
         }
