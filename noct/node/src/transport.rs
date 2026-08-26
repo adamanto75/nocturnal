@@ -210,6 +210,12 @@ pub struct Discovery {
     /// How many book entries each gossip source has been allowed to contribute,
     /// so no single peer can fill the book and shut everyone else out.
     gossip_quota: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+    /// Consecutive sessions that were closed before the handshake completed.
+    ///
+    /// Reset by any peer that does complete one. A node the network has banned
+    /// dials successfully and is dropped every time, which otherwise looks
+    /// exactly like an idle node with unlucky peers.
+    refused_in_a_row: Arc<Mutex<u32>>,
     /// Addresses that turned out to be us, learned from our own handshake
     /// nonce coming back.
     ///
@@ -347,7 +353,22 @@ impl Discovery {
             gossip_quota: Arc::new(Mutex::new(HashMap::new())),
             seeds: Arc::new(Mutex::new(HashSet::new())),
             self_addrs: Arc::new(Mutex::new(HashSet::new())),
+            refused_in_a_row: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// A session ended before the peer completed a handshake with us.
+    fn note_session_refused(&self) {
+        *self.refused_in_a_row.lock().unwrap() += 1;
+    }
+
+    /// A peer completed a handshake, so we are not being refused outright.
+    fn note_session_established(&self) {
+        *self.refused_in_a_row.lock().unwrap() = 0;
+    }
+
+    fn refused_in_a_row(&self) -> u32 {
+        *self.refused_in_a_row.lock().unwrap()
     }
 
     /// Record that `addr` is one of our own addresses, and stop dialing it.
@@ -898,6 +919,7 @@ fn spawn_peer_reader(
                         break;
                     }
                     peer_nonce = Some(nonce);
+                    disc.note_session_established();
                     // Record a dialable address for this peer (its advertised
                     // listen port at the IP we see it on).
                     if let Some(ip) = peer_ip {
@@ -980,6 +1002,11 @@ fn spawn_peer_reader(
         // exactly the connections an attacker can produce cheaply and endlessly,
         // so leaving them registered would let anyone exhaust the node's sockets
         // and slow every broadcast.
+        if peer_nonce.is_some() {
+            disc.note_session_established();
+        } else {
+            disc.note_session_refused();
+        }
         if local_score > 0 {
             eprintln!("peer {who}: session ended — {end_reason} (score {local_score})");
         } else {
@@ -1019,6 +1046,7 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
             disc.book_len()
         );
         let mut quiet_rounds = 0u32;
+        let mut refused_rounds = 0u32;
         loop {
         let connected = disc.connected_count();
         let need = disc.target_outbound.saturating_sub(connected);
@@ -1028,6 +1056,25 @@ pub fn spawn_connection_manager(state: Arc<Mutex<NodeState>>, peers: Peers, disc
         // nobody — because every address we know is already reserved, banned,
         // or absent. Silence here is indistinguishable from a working node, so
         // it must not be silent.
+        // The mirror image of the case below, and the one that cost an hour:
+        // addresses to dial, dials succeeding, and every session dropped by the
+        // far end. That is what being banned looks like from the inside, and
+        // the usual cause is this node serving something its peers reject —
+        // a node built for the wrong proof-of-work, say. Without this line the
+        // operator sees only unrelated addresses timing out.
+        if connected == 0 && disc.refused_in_a_row() >= 6 {
+            refused_rounds += 1;
+            // Say it once, then rarely: it is a standing condition, not an event.
+            if refused_rounds == 1 || refused_rounds % 20 == 0 {
+                eprintln!(
+                "connection manager: {} peer(s) in a row closed the connection on us and                  we have none left — this node is probably banned by the network; check                  that it is built for the same proof-of-work and network as its peers",
+                    disc.refused_in_a_row()
+                );
+            }
+        } else {
+            refused_rounds = 0;
+        }
+
         if need > 0 && candidates.is_empty() {
             quiet_rounds += 1;
             if quiet_rounds == 1 || quiet_rounds % 20 == 0 {
