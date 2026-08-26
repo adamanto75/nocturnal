@@ -813,6 +813,21 @@ fn spawn_peer_reader(
         let mut window = Instant::now();
         let mut msgs_this_second: u32 = 0;
         let mut local_score: u32 = 0;
+        // Why this session ended, for the log.
+        //
+        // Every rejection below used to be a bare `break` with a comment, so a
+        // peer that refused us produced no output at all: the dial succeeded,
+        // the session died, and nothing said why. A node cut off from the
+        // network looked identical to a node with nothing to do. That cost an
+        // hour of guessing on the testnet — the answer was a ban, which the
+        // node knew and never mentioned.
+        let mut end_reason = "peer closed the connection";
+        // Identify the peer by the address we dialed when we have one, since
+        // that is the address an operator configured and recognizes.
+        let who = dialed
+            .map(|a| a.to_string())
+            .or_else(|| peer_ip.map(|ip| ip.to_string()))
+            .unwrap_or_else(|| "<unknown>".to_string());
 
         loop {
             let msg = match recv_message(&mut reader) {
@@ -839,13 +854,16 @@ fn spawn_peer_reader(
             match msg {
                 Wire::Version(network, genesis, port, nonce) => {
                     if network != disc.magic || genesis != disc.genesis {
-                        break; // foreign network or chain → disconnect
+                        end_reason = "peer is on a foreign network or chain";
+                        break;
                     }
                     if disc.is_self_nonce(nonce) {
-                        break; // we connected back to ourselves
+                        end_reason = "we dialed ourselves";
+                        break;
                     }
                     if !disc.claim_nonce(nonce) {
-                        break; // duplicate link to a peer we already have
+                        end_reason = "duplicate link to a peer we already have";
+                        break;
                     }
                     peer_nonce = Some(nonce);
                     // Record a dialable address for this peer (its advertised
@@ -853,7 +871,8 @@ fn spawn_peer_reader(
                     if let Some(ip) = peer_ip {
                         let addr = SocketAddr::new(ip, port);
                         if disc.is_banned(&addr) {
-                            break; // a banned peer reconnecting → refuse it
+                            end_reason = "we have this peer banned";
+                            break;
                         }
                         peer_listen = Some(addr);
                         // The IP here is the one this connection actually came
@@ -929,6 +948,11 @@ fn spawn_peer_reader(
         // exactly the connections an attacker can produce cheaply and endlessly,
         // so leaving them registered would let anyone exhaust the node's sockets
         // and slow every broadcast.
+        if local_score > 0 {
+            eprintln!("peer {who}: session ended — {end_reason} (score {local_score})");
+        } else {
+            eprintln!("peer {who}: session ended — {end_reason}");
+        }
         peers.remove(peer_id);
         if let Some(a) = peer_listen {
             disc.unmark(&a);
