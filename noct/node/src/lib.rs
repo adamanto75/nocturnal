@@ -230,8 +230,8 @@ pub fn run(config: Config) -> std::io::Result<()> {
     let disc = transport::Discovery::new(config.p2p_listen, genesis, magic, config.target_outbound)
         .ephemeral(config.ephemeral)
         .with_book(config.data_dir.as_ref().map(|d| d.join("peers.dat")));
-    disc.learn(config.peers.iter().copied());
-    disc.learn(config.seeds.iter().copied());
+    disc.learn_seeds(config.peers.iter().copied());
+    disc.learn_seeds(config.seeds.iter().copied());
 
     let p2p = TcpListener::bind(config.p2p_listen)?;
     transport::spawn_listener(p2p, Arc::clone(&state), peers.clone(), disc.clone());

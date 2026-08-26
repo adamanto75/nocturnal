@@ -210,6 +210,13 @@ pub struct Discovery {
     /// How many book entries each gossip source has been allowed to contribute,
     /// so no single peer can fill the book and shut everyone else out.
     gossip_quota: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+    /// The addresses the operator configured with `--seed`/`--peer`.
+    ///
+    /// Held apart from `book` because they mean something the book cannot say:
+    /// an operator vouched for these, while everything else is hearsay from the
+    /// network or a file on disk. When this node has no peers at all, that is
+    /// the difference worth acting on.
+    seeds: Arc<Mutex<HashSet<SocketAddr>>>,
     /// Advertise port 0 instead of our real one, so peers do not remember us.
     ///
     /// For nodes that exist briefly and will never be reachable again — CI
@@ -328,7 +335,19 @@ impl Discovery {
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             ephemeral: false,
             gossip_quota: Arc::new(Mutex::new(HashMap::new())),
+            seeds: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Learn addresses the operator configured explicitly.
+    ///
+    /// They go into the book like any other, and are additionally remembered as
+    /// seeds so [`dial_candidates`](Self::dial_candidates) can reach for them
+    /// first when this node is isolated.
+    pub fn learn_seeds(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
+        let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
+        self.seeds.lock().unwrap().extend(addrs.iter().copied());
+        self.learn(addrs);
     }
 
     /// Mark this node ephemeral: advertise no listen port, so peers do not add
@@ -591,21 +610,53 @@ impl Discovery {
     /// Addresses to try dialing: known, not ourselves, not already connected, not
     /// banned. (Ban check is a second pass to avoid holding multiple locks.)
     fn dial_candidates(&self) -> Vec<SocketAddr> {
-        let candidates: Vec<SocketAddr> = {
+        let (candidates, isolated) = {
             let connected = self.connected.lock().unwrap();
-            self.book
+            let isolated = connected.is_empty();
+            let c: Vec<SocketAddr> = self
+                .book
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|a| **a != self.self_addr && !connected.contains(*a))
                 .copied()
-                .collect()
+                .collect();
+            (c, isolated)
         };
         let now = Instant::now();
         let mut usable: Vec<SocketAddr> = candidates
             .into_iter()
             .filter(|a| !self.is_banned(a) && !self.in_backoff(a, now))
             .collect();
+
+        // With no peers at all, dial the operator's seeds before anything else.
+        //
+        // Otherwise a seed is just one entry among hundreds. A book restored
+        // from disk carries no failure history, so the sort below cannot tell
+        // the seed from junk, and dialing is serialized: every unreachable
+        // address costs a 15s timeout before the next one is tried.
+        //
+        // Seen on the testnet — a node sat at zero peers for over eight minutes
+        // working through a book of dead addresses, and never once dialed the
+        // reachable seed it had been configured with. The seed was in the book
+        // the whole time. Being in the book was not enough.
+        if isolated {
+            let seeds: Vec<SocketAddr> =
+                self.seeds.lock().unwrap().iter().copied().collect();
+            let seeds: Vec<SocketAddr> = seeds
+                .into_iter()
+                .filter(|a| *a != self.self_addr && !self.is_banned(a))
+                .collect();
+            if !seeds.is_empty() {
+                // Backoff is deliberately ignored here. It exists to stop a
+                // node wasting slots on dead addresses; a node with no peers
+                // has nothing better to spend them on.
+                usable.retain(|a| !seeds.contains(a));
+                let mut out = seeds;
+                out.extend(usable);
+                return out;
+            }
+        }
 
         // Try the addresses with the cleanest record first. Slots are scarce,
         // so spending them on a peer that has never failed beats spending them
@@ -1848,6 +1899,81 @@ mod book_flooding_tests {
         assert!(
             d.book.lock().unwrap().contains(&seed),
             "a configured seed must never be displaced by gossip"
+        );
+    }
+
+    /// Surviving in the book is not the same as being dialed.
+    ///
+    /// The testnet load node kept its seed through a flood and was still cut
+    /// off for eight minutes: the book had hundreds of dead addresses, dialing
+    /// is serialized, and each dead address costs a 15s timeout. An isolated
+    /// node has to try the addresses its operator vouched for first.
+    #[test]
+    fn an_isolated_node_dials_its_seed_before_the_junk() {
+        let d = disc();
+        let seed: SocketAddr = "10.10.10.240:19333".parse().unwrap();
+
+        // A book restored from disk: plenty of entries, none of them tried yet,
+        // so no failure history distinguishes the good address from the dead.
+        let junk: Vec<SocketAddr> = (0..300)
+            .map(|i| {
+                let b = ((i / 256) % 256) as u8;
+                let c = (i % 256) as u8;
+                format!("77.{b}.{c}.1:19333").parse().unwrap()
+            })
+            .collect();
+        d.learn(junk);
+        d.learn_seeds([seed]);
+
+        let order = d.dial_candidates();
+        assert_eq!(
+            order.first(),
+            Some(&seed),
+            "an isolated node must dial its configured seed first, not after              working through a book of dead addresses"
+        );
+    }
+
+    /// Backoff must not be able to hide the seed from an isolated node: after
+    /// a transient failure the seed is still the best address it has.
+    #[test]
+    fn backoff_does_not_keep_an_isolated_node_from_its_seed() {
+        let d = disc();
+        let seed: SocketAddr = "10.10.10.240:19333".parse().unwrap();
+        d.learn_seeds([seed]);
+        for _ in 0..5 {
+            d.note_dial_failure(seed);
+        }
+        assert!(
+            d.in_backoff(&seed, Instant::now()),
+            "test needs the seed to actually be in backoff"
+        );
+
+        assert_eq!(
+            d.dial_candidates().first(),
+            Some(&seed),
+            "a node with no peers has nothing better to spend a dial slot on"
+        );
+    }
+
+    /// The priority is for isolation only. A node that already has peers must
+    /// keep spreading out, or every node would pile onto the same few seeds.
+    #[test]
+    fn a_connected_node_does_not_favor_seeds() {
+        let d = disc();
+        let seed: SocketAddr = "10.10.10.240:19333".parse().unwrap();
+        let other: SocketAddr = "8.8.8.8:19333".parse().unwrap();
+        d.learn_seeds([seed]);
+        d.learn([other]);
+        for _ in 0..5 {
+            d.note_dial_failure(seed);
+        }
+        // Something is connected, so this node is not isolated.
+        d.connected.lock().unwrap().insert("1.1.1.1:19333".parse().unwrap());
+
+        let order = d.dial_candidates();
+        assert!(
+            order.first() != Some(&seed),
+            "a seed in backoff must not jump the queue for a node that has peers"
         );
     }
 }
