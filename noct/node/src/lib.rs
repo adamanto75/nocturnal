@@ -827,7 +827,13 @@ impl NodeState {
             // applied once our clock catches up.
             Err(ChainError::TimestampTooFarAhead) => {}
             // Anything else means the block is simply invalid — penalise the peer.
-            Err(_) => out.misbehavior += MISBEHAVIOR_INVALID_BLOCK,
+            Err(e) => {
+                // Say what earned the penalty. Two of these is a ban, and a ban
+                // is invisible to the peer it lands on, so a wrong one here is
+                // a partition that nobody can explain from either side.
+                eprintln!("peer {peer}: block {block_height} rejected as invalid ({e:?}) — penalising");
+                out.misbehavior += MISBEHAVIOR_INVALID_BLOCK
+            }
         }
     }
 
@@ -905,7 +911,10 @@ impl NodeState {
             // Anything else means the peer had us download a branch containing an
             // actually-invalid block (bad PoW, bad coinbase, invalid tx, …) —
             // wasted bandwidth on junk. Penalise it.
-            Err(_) => {
+            Err(e) => {
+                eprintln!(
+                    "collected branch rejected as invalid ({e:?}) — penalising the peer that served it"
+                );
                 out.misbehavior += MISBEHAVIOR_INVALID_BLOCK;
                 return;
             }
