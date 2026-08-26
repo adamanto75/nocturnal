@@ -440,9 +440,6 @@ pub struct Reaction {
 
 /// All consensus state for one node. Guard with a `Mutex` when shared.
 pub struct NodeState {
-    /// How many blocks have been thrown away because a branch collection from
-    /// the same peer was in progress. Diagnostic only.
-    dropped_while_collecting: u64,
     pub chain: Blockchain<NodePow>,
     pub mempool: Mempool,
     pub miner_address: Address,
@@ -476,7 +473,6 @@ impl NodeState {
     pub fn for_network(network: noct_core::address::Network, miner_address: Address) -> Self {
         let pow = new_pow();
         NodeState {
-            dropped_while_collecting: 0,
             chain: Blockchain::for_network(network, pow.clone()),
             mempool: Mempool::new(),
             miner_address,
@@ -747,21 +743,18 @@ impl NodeState {
 
         // If we're downloading a branch from this peer, this block is part of it.
         // (Deliberately before the seen-dedup: a branch re-sends blocks we know.)
-        if let Some(collect) = self.sync.get_mut(&peer) {
-            if block_height != collect.next {
-                // Every block from this peer is captured by the collector, so a
-                // block fetched by ordinary sequential sync is discarded here.
-                // While a collection is open, that is most of them.
-                let want = collect.next;
-                self.dropped_while_collecting += 1;
-                if self.dropped_while_collecting % 50 == 1 {
-                    eprintln!(
-                        "peer {peer}: discarded block {block_height} while collecting (wanted {want});                          {} discarded so far",
-                        self.dropped_while_collecting
-                    );
-                }
-                return;
-            }
+        // A collection takes only the block it actually asked for. Anything else
+        // from the same peer falls through to normal handling below.
+        //
+        // It used to swallow everything and discard whatever did not match,
+        // which meant an open collection starved the sequential sync running
+        // beside it: the node would request the block it needed next, the
+        // collector would drop the reply because it wanted a different height,
+        // and the chain would sit still. A testnet seed managed six blocks a
+        // minute this way against a network the same build syncs at five
+        // hundred.
+        if self.sync.get(&peer).is_some_and(|c| c.next == block_height) {
+            let collect = self.sync.get_mut(&peer).expect("just checked");
             collect.blocks.push((block, txs));
             collect.next += 1;
             if collect.next > collect.to {
@@ -1062,6 +1055,43 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// An open branch collection must not starve the sequential sync beside it.
+    ///
+    /// The collector used to take every block from its peer and discard
+    /// anything it had not asked for, including the block sequential sync had
+    /// just requested — so a node with a far-ahead peer barely advanced.
+    #[test]
+    fn an_open_collection_does_not_starve_sequential_sync() {
+        let mut w = wallet();
+        let mut a = test_node(w.address());
+        mine_n(&mut a, &mut w, 6);
+
+        // A second node holding only the first few of those blocks.
+        let mut b = test_node(w.address());
+        for h in 1..4u64 {
+            let s = a.chain.block_at(h).expect("mined block");
+            let (blk, txs) = (s.block.clone(), s.txs.clone());
+            b.react(&mut OsRng, 0, Wire::Block(blk, txs), false);
+        }
+        let before = b.chain.height();
+
+        // Open a collection on that same peer, waiting for a different height.
+        b.peer_best_height = 100;
+        b.begin_branch_collection(0, &mut Reaction::default());
+        let wanted = b.sync.get(&0).expect("collection should be open").next;
+        assert_ne!(wanted, before, "test needs the collector to want another height");
+
+        // Now deliver exactly the block sequential sync needs next.
+        let s = a.chain.block_at(before).expect("next block");
+        let (blk, txs) = (s.block.clone(), s.txs.clone());
+        b.react(&mut OsRng, 0, Wire::Block(blk, txs), false);
+
+        assert!(
+            b.chain.height() > before,
+            "a block extending our tip must still be applied while a collection is open"
+        );
+    }
 
     /// A node far behind must not treat the whole gap as a reorg candidate.
     ///
