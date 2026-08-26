@@ -447,6 +447,13 @@ pub struct NodeState {
     pow: NodePow,
     seen_txs: BoundedSet,
     seen_blocks: BoundedSet,
+    /// Consecutive branch collections that never reached a common ancestor.
+    ///
+    /// A handful of these is ordinary. A steady stream means this node has
+    /// diverged from the network by more than [`MAX_REORG_DEPTH`] and can no
+    /// longer rejoin by reorganising — a permanent condition whose only other
+    /// symptom is being slow.
+    reorgs_without_ancestor: u32,
     /// Highest height any peer has advertised — the initial-block-download target.
     peer_best_height: u64,
     /// On-disk block log (writes happen off-thread); when present, every accepted
@@ -480,6 +487,7 @@ impl NodeState {
             pow,
             seen_txs: BoundedSet::default(),
             seen_blocks: BoundedSet::default(),
+            reorgs_without_ancestor: 0,
             peer_best_height: 0,
             store: None,
             sync: HashMap::new(),
@@ -865,15 +873,33 @@ impl NodeState {
         out: &mut Reaction,
     ) {
         let reorg = match self.chain.try_reorg(rng, &branch) {
-            Ok(r) => r,
+            Ok(r) => {
+                self.reorgs_without_ancestor = 0;
+                r
+            }
             // Benign outcomes — keep our chain, do not penalise the peer:
             //  * NotHeavier: a valid but lighter competing fork.
             //  * BadPrevId: the fork is deeper than MAX_REORG_DEPTH (or a gap), so
             //    the collected window never reaches a common ancestor — an honest
             //    peer with a deep fork looks exactly like this.
             //  * EmptyBranch / CannotReplaceGenesis: degenerate, not attack-worthy.
+            // The collected window never reached a height where we and the
+            // peer agree. Once is ordinary — an honest peer with a deep fork
+            // looks exactly like this. Over and over means we are the ones who
+            // are lost, and no amount of waiting will fix it.
+            Err(ChainError::BadPrevId) => {
+                self.reorgs_without_ancestor += 1;
+                if self.reorgs_without_ancestor == 8
+                    || self.reorgs_without_ancestor % 100 == 0
+                {
+                    eprintln!(
+                        "WARNING: {} branch collections in a row never reached a block this node                          agrees with. It has probably diverged from the network by more than                          MAX_REORG_DEPTH ({}) blocks and cannot rejoin by reorganising — it will                          keep extending its own dead fork. Resync from scratch to recover.",
+                        self.reorgs_without_ancestor, MAX_REORG_DEPTH
+                    );
+                }
+                return;
+            }
             Err(ChainError::NotHeavier)
-            | Err(ChainError::BadPrevId)
             | Err(ChainError::EmptyBranch)
             | Err(ChainError::CannotReplaceGenesis) => return,
             // Anything else means the peer had us download a branch containing an
