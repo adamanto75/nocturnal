@@ -191,15 +191,31 @@ pub fn run(config: Config) -> std::io::Result<()> {
                 Vec::new()
             }
         };
+        let mut log_is_stale = false;
         if !stored.is_empty() {
             eprintln!("replaying {} stored blocks from {}…", stored.len(), path.display());
             match node.replay(&mut OsRng, stored) {
                 Ok(height) => eprintln!("restored chain to height {height}"),
                 // A bad log leaves the valid prefix applied; peers refill the rest.
-                Err(e) => eprintln!("WARNING: {e}"),
+                Err(e) => {
+                    eprintln!("WARNING: {e}");
+                    log_is_stale = true;
+                }
             }
         }
         node.attach_store(AsyncStore::open(&path)?);
+        if log_is_stale {
+            // The log no longer describes the chain, so it must be replaced —
+            // not appended to.
+            //
+            // Reopening in append mode left the bad prefix in place and wrote
+            // the re-synced chain after it. Every restart then hit the same bad
+            // record, truncated again, and appended another copy: the file grew
+            // without bound and never healed. Seen on this testnet at 14,623
+            // stored blocks for a 4,931-block chain, truncating on every start.
+            eprintln!("the stored log no longer matches the chain; rewriting it");
+            node.rewrite_store();
+        }
         eprintln!("persisting blocks to {}", path.display());
     }
 
