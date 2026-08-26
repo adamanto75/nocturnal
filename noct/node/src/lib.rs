@@ -314,6 +314,23 @@ pub const BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 /// and on a long chain the memory alone would end it.
 pub const MAX_COLLECT_SPAN: u64 = 2 * MAX_REORG_DEPTH;
 
+/// How recent a block must be before we relay it onward.
+///
+/// Relaying used to be decided by comparing our height against
+/// `peer_best_height` — a number peers tell us and nothing verifies. It is
+/// taken straight from `block.coinbase.height` before the block is validated,
+/// and from `Tip` messages, and it only ever rises. So a single message
+/// claiming an absurd height pinned it out of reach for good, and from then on
+/// the node applied every block and gossiped none of them. One cheap message,
+/// one node permanently removed from block propagation, nothing in the log.
+///
+/// A block's own timestamp is a local signal instead, and consensus already
+/// bounds it at both ends: it must beat the median of recent blocks and may not
+/// run more than `FUTURE_TIME_LIMIT` ahead. A peer cannot dress an old block up
+/// as a current one. Blocks near the tip are relayed; the historical ones a
+/// bulk sync walks through are not.
+pub const RELAY_FRESHNESS: u64 = 30 * noct_core::pow::TARGET_BLOCK_TIME;
+
 /// Seed nodes for the **testnet**.
 ///
 /// Two nodes on deliberately separate uplinks, so one line failing does not take
@@ -808,10 +825,19 @@ impl NodeState {
                 self.seen_blocks.insert(block.id()); // mark seen only once applied
                 self.mempool.on_block(&txs);
                 self.persist(&block, &txs);
-                if self.chain.height() >= self.peer_best_height {
-                    out.broadcast.push(Wire::Block(block, txs)); // fresh tip → gossip
-                } else {
-                    out.reply.push(Wire::GetBlock(self.chain.height())); // still syncing
+                // Two separate questions, and they used to share one answer.
+                // Whether to relay is decided locally, by how recent the block
+                // is. Whether to keep asking for more may still lean on the
+                // peer's claim: an inflated one costs a wasted request, not our
+                // place in the network.
+                let fresh =
+                    now_secs().saturating_sub(block.header.timestamp) <= RELAY_FRESHNESS;
+                let behind = self.chain.height() < self.peer_best_height;
+                if fresh {
+                    out.broadcast.push(Wire::Block(block, txs));
+                }
+                if behind {
+                    out.reply.push(Wire::GetBlock(self.chain.height()));
                 }
             }
             // Right height but doesn't build on our tip: the peer forked from us.
@@ -1090,6 +1116,52 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A peer must not be able to silence our block relay by claiming a height.
+    ///
+    /// `peer_best_height` is taken from unvalidated blocks and from `Tip`
+    /// messages, and only ever rises. One message claiming an absurd height
+    /// used to stop the node relaying anything, permanently.
+    #[test]
+    fn a_bogus_claimed_height_cannot_stop_us_relaying() {
+        let mut w = wallet();
+        let mut a = test_node(w.address());
+        mine_n(&mut a, &mut w, 3);
+
+        let mut b = test_node(w.address());
+        // A peer claims to be astronomically far ahead.
+        b.peer_best_height = 10_000_000;
+
+        let s = a.chain.block_at(b.chain.height()).expect("next block");
+        let (blk, txs) = (s.block.clone(), s.txs.clone());
+        let out = b.react(&mut OsRng, 0, Wire::Block(blk, txs), false);
+
+        assert!(
+            out.broadcast.iter().any(|m| matches!(m, Wire::Block(..))),
+            "a fresh block we applied must still be relayed, whatever a peer claims"
+        );
+    }
+
+    /// The other half: bulk-sync blocks are old, and must not be re-gossiped.
+    #[test]
+    fn historical_blocks_are_not_relayed_during_a_bulk_sync() {
+        let mut w = wallet();
+        let mut a = test_node(w.address());
+        mine_n(&mut a, &mut w, 3);
+
+        let mut b = test_node(w.address());
+        let s = a.chain.block_at(b.chain.height()).expect("next block");
+        let (mut blk, txs) = (s.block.clone(), s.txs.clone());
+        // Backdate it well beyond the relay window. It will not apply, which is
+        // fine: what matters is that nothing is queued for broadcast.
+        blk.header.timestamp = blk.header.timestamp.saturating_sub(RELAY_FRESHNESS * 10);
+
+        let out = b.react(&mut OsRng, 0, Wire::Block(blk, txs), false);
+        assert!(
+            !out.broadcast.iter().any(|m| matches!(m, Wire::Block(..))),
+            "a stale block must not be gossiped onward"
+        );
+    }
 
     /// An open branch collection must not starve the sequential sync beside it.
     ///
