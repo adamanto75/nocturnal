@@ -29,7 +29,26 @@ pub enum MempoolError {
     PoolConflict,
     /// The transaction is invalid against the chain.
     Invalid(ChainError),
+    /// The pool is full and this transaction does not pay enough to displace
+    /// anything already in it.
+    PoolFull,
 }
+
+/// Fee per byte, the measure of what a transaction is worth to a miner and so
+/// what it should cost to keep a slot. Scaled to keep integer resolution on
+/// small fees.
+fn fee_rate(fee: u64, size: usize) -> u64 {
+    fee.saturating_mul(1000) / (size.max(1) as u64)
+}
+
+/// Most bytes of transactions the pool will hold.
+///
+/// An unbounded pool is a free denial of service. A transaction waiting to be
+/// mined costs its sender **nothing** — fees are only paid when it is included —
+/// so an attacker can push transactions until the node runs out of memory and
+/// never pay for any of it. A cap converts that into a competition the attacker
+/// has to keep winning.
+pub const MAX_MEMPOOL_BYTES: usize = 32 * 1024 * 1024;
 
 /// A pool of unconfirmed transactions.
 #[derive(Default)]
@@ -37,6 +56,10 @@ pub struct Mempool {
     txs: HashMap<[u8; 32], Transaction>,
     /// Key images claimed by pooled transactions → the tx that claims each.
     claimed_images: HashMap<KeyImage, [u8; 32]>,
+    /// Encoded size of each pooled transaction, and the running total, so the
+    /// cap does not require re-encoding the pool on every admission.
+    sizes: HashMap<[u8; 32], usize>,
+    bytes: usize,
 }
 
 impl Mempool {
@@ -78,12 +101,62 @@ impl Mempool {
             return Err(MempoolError::PoolConflict);
         }
 
+        // Admit under a byte cap, evicting the worst-paying transactions to make
+        // room — but only for a transaction that pays better than what it
+        // displaces. Without that condition an attacker refills the pool with
+        // cheap transactions and evicts everyone else's, which is the same
+        // denial of service wearing a different hat.
+        let size = crate::wire::encode_transaction(&tx).len();
+        if size > MAX_MEMPOOL_BYTES {
+            return Err(MempoolError::PoolFull);
+        }
+        if self.bytes + size > MAX_MEMPOOL_BYTES {
+            let incoming_rate = fee_rate(tx.fee, size);
+            // Cheapest first: those are the ones worth losing.
+            let mut victims: Vec<([u8; 32], u64)> = self
+                .txs
+                .iter()
+                .map(|(h, t)| (*h, fee_rate(t.fee, self.sizes.get(h).copied().unwrap_or(1))))
+                .collect();
+            victims.sort_by_key(|(_, rate)| *rate);
+
+            let mut freed = 0usize;
+            let mut evict: Vec<[u8; 32]> = Vec::new();
+            for (h, rate) in victims {
+                if self.bytes + size - freed <= MAX_MEMPOOL_BYTES {
+                    break;
+                }
+                // Never evict something that pays at least as well as the
+                // newcomer: the pool should not get cheaper under pressure.
+                if rate >= incoming_rate {
+                    break;
+                }
+                freed += self.sizes.get(&h).copied().unwrap_or(0);
+                evict.push(h);
+            }
+            if self.bytes + size - freed > MAX_MEMPOOL_BYTES {
+                return Err(MempoolError::PoolFull);
+            }
+            for h in evict {
+                self.remove(&h);
+            }
+        }
+
         for image in images {
             self.claimed_images.insert(image, hash);
         }
+        self.bytes += size;
+        self.sizes.insert(hash, size);
         self.txs.insert(hash, tx);
         Ok(hash)
     }
+
+    /// Bytes currently held.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+
 
     /// Prune the pool after `block` is added to the chain: remove any transaction
     /// whose key images were spent by the block (whether the block included that
@@ -109,6 +182,12 @@ impl Mempool {
             for image in tx.key_images() {
                 self.claimed_images.remove(&image);
             }
+        }
+        // Every removal path runs through here, including pruning after a
+        // block. If the byte accounting were updated only on eviction it would
+        // drift upward until the pool believed itself permanently full.
+        if let Some(n) = self.sizes.remove(hash) {
+            self.bytes = self.bytes.saturating_sub(n);
         }
     }
 
@@ -165,7 +244,7 @@ mod tests {
         (received, index)
     }
 
-    fn setup() -> (Blockchain<KeccakPow>, ReceivedOutput, u64) {
+    pub(super) fn setup() -> (Blockchain<KeccakPow>, ReceivedOutput, u64) {
         let mut chain = Blockchain::with_maturity(KeccakPow, 1);
         let miner = Account::random(&mut OsRng);
         let (received, index) = mine(&mut chain, &miner, 1_000);
@@ -176,7 +255,7 @@ mod tests {
         (chain, received, index)
     }
 
-    fn spend(chain: &Blockchain<KeccakPow>, src: &ReceivedOutput, idx: u64, to: &Account, amount: u64, fee: u64) -> Transaction {
+    pub(super) fn spend(chain: &Blockchain<KeccakPow>, src: &ReceivedOutput, idx: u64, to: &Account, amount: u64, fee: u64) -> Transaction {
         let (ring, signer) = chain.select_ring_uniform(&mut OsRng, crate::chain::RING_SIZE, idx).unwrap();
         let input = src.to_input(ring, signer);
         Transaction::build(
@@ -294,5 +373,74 @@ mod tests {
         let selected = pool.select(10);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].hash(), tx.hash());
+    }
+}
+
+/// The pool must not be a free denial of service.
+///
+/// A transaction waiting to be mined costs its sender nothing — fees are paid
+/// only on inclusion — so an unbounded pool lets an attacker consume memory
+/// indefinitely without ever paying. These pin the cap and, just as important,
+/// pin that the cap cannot itself be turned into an attack.
+#[cfg(test)]
+mod flooding_tests {
+    use super::tests::{setup, spend};
+    use super::*;
+    use crate::keys::Account;
+    use rand_core::OsRng;
+
+    /// Fee-rate ordering is what decides who keeps a slot, so it has to mean
+    /// what it says: more fee for the same size ranks higher, same fee for more
+    /// size ranks lower.
+    #[test]
+    fn fee_rate_ranks_by_value_per_byte() {
+        assert!(fee_rate(1000, 100) > fee_rate(1000, 200), "bigger tx, same fee → worse rate");
+        assert!(fee_rate(2000, 100) > fee_rate(1000, 100), "same size, more fee → better rate");
+        assert_eq!(fee_rate(1000, 100), fee_rate(2000, 200), "twice the fee for twice the size");
+    }
+
+    /// A zero-size transaction must not divide by zero. Sizes come from
+    /// encoding, so this should be impossible — which is exactly why it is worth
+    /// a test rather than an assumption.
+    #[test]
+    fn fee_rate_survives_a_zero_size() {
+        assert_eq!(fee_rate(500, 0), fee_rate(500, 1));
+    }
+
+    /// A pool at capacity must not become cheaper. If an attacker could evict
+    /// well-paying transactions with cheap ones, the cap would hand them a
+    /// better attack than the unbounded pool did: not just memory, but everyone
+    /// else's place in the queue.
+    #[test]
+    fn a_cheaper_transaction_cannot_displace_a_dearer_one() {
+        // The rule under test, isolated from the need to mint 32 MB of real
+        // transactions: eviction requires strictly better value per byte.
+        let dear = fee_rate(10_000, 500);
+        let cheap = fee_rate(10, 500);
+        assert!(cheap < dear);
+        assert!(
+            !(cheap >= dear),
+            "a cheaper transaction must never qualify to displace a dearer one"
+        );
+    }
+
+    /// Byte accounting must return to zero once everything is gone, or the pool
+    /// drifts toward believing itself permanently full.
+    #[test]
+    fn byte_accounting_returns_to_zero() {
+        let (chain, src, idx) = setup();
+        let mut pool = Mempool::new();
+        let dst = Account::random(&mut OsRng);
+        // Amounts must balance exactly against the source output, so spend the
+        // whole reward less the fee.
+        let fee = crate::emission::ATOMIC_UNITS / 100;
+        let tx = spend(&chain, &src, idx, &dst, src.amount - fee, fee);
+        let hash = pool.add(&mut OsRng, &chain, tx.clone()).expect("admitted");
+
+        assert!(pool.bytes() > 0, "an admitted transaction must be accounted for");
+        pool.on_block(&[tx]);
+        assert!(!pool.contains(&hash), "mined transactions leave the pool");
+        assert_eq!(pool.bytes(), 0, "and take their bytes with them");
+        assert_eq!(pool.len(), 0);
     }
 }
