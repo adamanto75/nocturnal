@@ -92,14 +92,26 @@ impl Mempool {
             return Err(MempoolError::AlreadyKnown);
         }
 
-        // Chain-level validity (also rejects images already spent on-chain).
-        chain.validate_tx(rng, &tx).map_err(MempoolError::Invalid)?;
-
         // No key image may collide with another unconfirmed transaction.
+        //
+        // This runs BEFORE signature verification, and the order is the whole
+        // point. A rejected transaction is never stored, so it never reaches the
+        // `AlreadyKnown` check above: an attacker signs a single double-spend
+        // once and replays it forever, and every copy would otherwise cost a
+        // full CLSAG-over-16 plus Bulletproofs+ verification to throw away.
+        // Peers may send 5000 messages a second, so that is several CPU-seconds
+        // of work per second of wall clock, for free, per connection.
+        //
+        // Checking the images first makes the replay as cheap to refuse as it
+        // is to send. Nothing here depends on the transaction being valid — it
+        // is a lookup of images we have already accepted.
         let images = tx.key_images();
         if images.iter().any(|i| self.claimed_images.contains_key(i)) {
             return Err(MempoolError::PoolConflict);
         }
+
+        // Chain-level validity (also rejects images already spent on-chain).
+        chain.validate_tx(rng, &tx).map_err(MempoolError::Invalid)?;
 
         // Admit under a byte cap, evicting the worst-paying transactions to make
         // room — but only for a transaction that pays better than what it
@@ -299,6 +311,33 @@ mod tests {
         assert_eq!(pool.len(), 1);
     }
 
+    /// A conflicting transaction must be refused by the key-image lookup, not
+    /// by signature verification — otherwise one pre-signed double-spend,
+    /// replayed, buys an attacker unbounded CLSAG and range-proof work.
+    ///
+    /// The transaction here is *both* conflicting and invalid. Verifying first
+    /// would report `Invalid`; checking images first reports `PoolConflict`,
+    /// which is what pins the order.
+    #[test]
+    fn a_conflicting_transaction_is_refused_before_it_is_verified() {
+        let (chain, src, idx) = setup();
+        let bob = Account::random(&mut OsRng);
+        let reward = src.amount;
+        let tx1 = spend(&chain, &src, idx, &bob, reward - ATOMIC_UNITS / 100, ATOMIC_UNITS / 100);
+        let mut tx2 =
+            spend(&chain, &src, idx, &bob, reward - 2 * (ATOMIC_UNITS / 100), 2 * (ATOMIC_UNITS / 100));
+        // Same key image as tx1, and now unverifiable as well.
+        tx2.outputs[0].commitment = Opening::random(1, &mut OsRng).commit();
+
+        let mut pool = Mempool::new();
+        pool.add(&mut OsRng, &chain, tx1).unwrap();
+        assert_eq!(
+            pool.add(&mut OsRng, &chain, tx2),
+            Err(MempoolError::PoolConflict),
+            "a replayed double-spend must cost a hash lookup, not a verification"
+        );
+    }
+
     #[test]
     fn rejects_invalid_transaction() {
         let (chain, src, idx) = setup();
@@ -360,6 +399,47 @@ mod tests {
 
         pool.on_block(std::slice::from_ref(&tx));
         assert!(pool.is_empty());
+    }
+
+    /// The same guarantee one level down: a transaction spending an output
+    /// that is already spent on-chain must be refused by the key-image lookup,
+    /// not by verifying its signature. Replaying such a transaction is free for
+    /// the sender, so it must be nearly free to refuse.
+    ///
+    /// The replayed copy is corrupted as well, so verifying first would report
+    /// `InvalidTx`; the lookup running first reports `DoubleSpend`.
+    #[test]
+    fn a_spent_output_is_detected_before_the_signature_is_verified() {
+        let (mut chain, src, idx) = setup();
+        let bob = Account::random(&mut OsRng);
+        let reward = src.amount;
+        let tx = spend(&chain, &src, idx, &bob, reward - ATOMIC_UNITS / 100, ATOMIC_UNITS / 100);
+
+        // Confirm it, so its key image is spent on-chain.
+        let miner = Account::random(&mut OsRng);
+        let subsidy = base_reward(chain.emitted());
+        let cb = Coinbase::create(&mut OsRng, chain.height(), &address(&miner), subsidy + tx.fee);
+        let mut block = Block {
+            header: BlockHeader {
+                major_version: 1,
+                minor_version: 0,
+                timestamp: crate::block::GENESIS_TIMESTAMP + 50_000,
+                prev_id: chain.tip_id(),
+                nonce: 0,
+            },
+            coinbase: cb,
+            tx_hashes: vec![tx.hash()],
+        };
+        block.mine(&KeccakPow, chain.next_difficulty());
+        chain.add_block(&mut OsRng, &block, std::slice::from_ref(&tx)).unwrap();
+
+        // Now replay it, corrupted.
+        let mut replay = tx.clone();
+        replay.outputs[0].commitment = Opening::random(1, &mut OsRng).commit();
+        assert!(
+            matches!(chain.validate_tx(&mut OsRng, &replay), Err(ChainError::DoubleSpend)),
+            "a replayed spend must cost a lookup, not a CLSAG verification"
+        );
     }
 
     #[test]

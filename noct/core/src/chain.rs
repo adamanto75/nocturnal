@@ -677,7 +677,19 @@ impl<P: ProofOfWork> Blockchain<P> {
         rng: &mut R,
         tx: &Transaction,
     ) -> Result<(), ChainError> {
-        tx.verify(rng).map_err(ChainError::InvalidTx)?;
+        // Cheap, structural rejections first; the signature check last.
+        //
+        // Verification is a CLSAG over a ring of 16 plus a Bulletproofs+ range
+        // proof — milliseconds. Everything below it here is a length comparison
+        // or a hash lookup. A peer may send 5000 messages a second, and a
+        // transaction rejected here is never stored, so it never becomes
+        // "already known": one pre-signed transaction spending an output that
+        // is already spent on-chain could be replayed forever, buying an
+        // attacker unbounded verification work for the cost of the bandwidth.
+        //
+        // Rejecting early is safe in a way that admitting early would not be:
+        // nothing is recorded, and a transaction still has to verify before it
+        // is accepted anywhere.
         let height = self.height();
         for input in &tx.inputs {
             // Exactly, not at least — see `RING_SIZE`. A larger ring is no more
@@ -701,6 +713,7 @@ impl<P: ProofOfWork> Blockchain<P> {
                 return Err(ChainError::DoubleSpend);
             }
         }
+        tx.verify(rng).map_err(ChainError::InvalidTx)?;
         Ok(())
     }
 
