@@ -210,6 +210,16 @@ pub struct Discovery {
     /// How many book entries each gossip source has been allowed to contribute,
     /// so no single peer can fill the book and shut everyone else out.
     gossip_quota: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+    /// Addresses that turned out to be us, learned from our own handshake
+    /// nonce coming back.
+    ///
+    /// `self_addr` is the *bind* address, and a node bound to `0.0.0.0` never
+    /// matches the address peers actually know it by. So a node gossiped its
+    /// own address, learned it back, and dialed itself forever — every cycle,
+    /// burning outbound slots it did not have to spare. Harmless per attempt
+    /// (the nonce check catches it) and permanent, which is the bad
+    /// combination: never an error, never fixed.
+    self_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
     /// The addresses the operator configured with `--seed`/`--peer`.
     ///
     /// Held apart from `book` because they mean something the book cannot say:
@@ -336,7 +346,21 @@ impl Discovery {
             ephemeral: false,
             gossip_quota: Arc::new(Mutex::new(HashMap::new())),
             seeds: Arc::new(Mutex::new(HashSet::new())),
+            self_addrs: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Record that `addr` is one of our own addresses, and stop dialing it.
+    pub fn note_self_address(&self, addr: SocketAddr) {
+        if self.self_addrs.lock().unwrap().insert(addr) {
+            eprintln!("{addr} is us; not dialing it again");
+        }
+        self.book.lock().unwrap().remove(&addr);
+        self.seeds.lock().unwrap().remove(&addr);
+    }
+
+    fn is_self_address(&self, addr: &SocketAddr) -> bool {
+        *addr == self.self_addr || self.self_addrs.lock().unwrap().contains(addr)
     }
 
     /// Learn addresses the operator configured explicitly.
@@ -618,7 +642,7 @@ impl Discovery {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|a| **a != self.self_addr && !connected.contains(*a))
+                .filter(|a| !self.is_self_address(a) && !connected.contains(*a))
                 .copied()
                 .collect();
             (c, isolated)
@@ -645,7 +669,7 @@ impl Discovery {
                 self.seeds.lock().unwrap().iter().copied().collect();
             let seeds: Vec<SocketAddr> = seeds
                 .into_iter()
-                .filter(|a| *a != self.self_addr && !self.is_banned(a))
+                .filter(|a| !self.is_self_address(a) && !self.is_banned(a))
                 .collect();
             if !seeds.is_empty() {
                 // Backoff is deliberately ignored here. It exists to stop a
@@ -858,6 +882,14 @@ fn spawn_peer_reader(
                         break;
                     }
                     if disc.is_self_nonce(nonce) {
+                        // Remember which address that was, so the next cycle
+                        // spends its slot on a peer instead of on us.
+                        if let Some(a) = dialed {
+                            disc.note_self_address(a);
+                        }
+                        if let Some(ip) = peer_ip {
+                            disc.note_self_address(SocketAddr::new(ip, port));
+                        }
                         end_reason = "we dialed ourselves";
                         break;
                     }
@@ -1976,6 +2008,40 @@ mod book_flooding_tests {
             d.dial_candidates().first(),
             Some(&seed),
             "a node with no peers has nothing better to spend a dial slot on"
+        );
+    }
+
+    /// A node bound to 0.0.0.0 does not recognize its own public address, so
+    /// it dialed itself on every cycle forever. Once the handshake reveals it,
+    /// the address must leave the dial rotation for good.
+    #[test]
+    fn an_address_discovered_to_be_us_is_never_dialed_again() {
+        let d = disc();
+        let me: SocketAddr = "10.10.10.82:19333".parse().unwrap();
+        d.learn([me]);
+        assert!(
+            d.dial_candidates().contains(&me),
+            "test needs the address to start out dialable"
+        );
+
+        d.note_self_address(me); // as the self-nonce check now does
+
+        assert!(
+            !d.dial_candidates().contains(&me),
+            "a node must not keep spending outbound slots dialing itself"
+        );
+    }
+
+    /// Learning it back from gossip must not undo that.
+    #[test]
+    fn gossip_cannot_reintroduce_our_own_address_as_a_dial_target() {
+        let d = disc();
+        let me: SocketAddr = "10.10.10.82:19333".parse().unwrap();
+        d.note_self_address(me);
+        d.learn_gossip_from(Some("8.8.8.8".parse().unwrap()), [me]);
+        assert!(
+            !d.dial_candidates().contains(&me),
+            "our own address must stay out of the rotation however it arrives"
         );
     }
 
