@@ -298,6 +298,22 @@ pub const BAN_THRESHOLD: u32 = 100;
 /// How long a banned peer stays banned.
 pub const BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 
+/// How far past the fork point a single branch collection will pull.
+///
+/// A reorg is capped at [`MAX_REORG_DEPTH`], so a branch that reaches that far
+/// beyond the point where we and the peer diverged already carries enough
+/// cumulative difficulty to settle the question. Collecting further buys
+/// nothing.
+///
+/// Before this existed the upper bound was the *peer's* tip, which is not a
+/// bound at all when we are behind. A node at height 630 on the testnet opened
+/// two collections of 4,418 and 4,415 blocks — the entire remaining chain,
+/// twice, buffered in memory before a single block of it was applied, while the
+/// blocks its sequential sync had asked for were discarded as out-of-order.
+/// Sync ran roughly a hundred times slower than the same node with one peer,
+/// and on a long chain the memory alone would end it.
+pub const MAX_COLLECT_SPAN: u64 = 2 * MAX_REORG_DEPTH;
+
 /// Seed nodes for the **testnet**.
 ///
 /// Two nodes on deliberately separate uplinks, so one line failing does not take
@@ -826,7 +842,13 @@ impl NodeState {
         // Never below 1: genesis is shared by every honest peer and cannot be
         // replaced, so a fork can only ever start at height 1 or later.
         let from = self.chain.height().saturating_sub(MAX_REORG_DEPTH).max(1);
-        let to = self.peer_best_height.saturating_sub(1);
+        // Bounded: enough to decide a reorg, never the whole gap. If the peer
+        // really is far ahead, each collection attaches and the next one starts
+        // from the new tip, so the chain still advances — in bounded steps.
+        let to = self
+            .peer_best_height
+            .saturating_sub(1)
+            .min(from.saturating_add(MAX_COLLECT_SPAN));
         if to < from {
             return;
         }
@@ -1040,6 +1062,30 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A node far behind must not treat the whole gap as a reorg candidate.
+    ///
+    /// The upper bound used to be the peer's tip, so a node at height 630 with
+    /// a peer at 4948 opened a 4,418-block collection — buffered in memory,
+    /// applied only at the end, and discarding its sequential-sync replies the
+    /// whole time.
+    #[test]
+    fn a_branch_collection_is_bounded_however_far_ahead_the_peer_is() {
+        let mut w = wallet();
+        let mut node = test_node(w.address());
+        mine_n(&mut node, &mut w, 200);
+        node.peer_best_height = 500_000; // a peer claiming to be far ahead
+
+        let mut out = Reaction::default();
+        node.begin_branch_collection(7, &mut out);
+
+        let collect = node.sync.get(&7).expect("a collection should have started");
+        let span = collect.to.saturating_sub(collect.next).saturating_add(1);
+        assert!(
+            span <= MAX_COLLECT_SPAN + 1,
+            "collection spans {span} blocks; it must be bounded by MAX_COLLECT_SPAN ({MAX_COLLECT_SPAN})"
+        );
+    }
     use super::*;
     use noct_core::address::Network;
     use noct_core::p2p::Wire;
