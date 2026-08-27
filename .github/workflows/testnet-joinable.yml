@@ -27,8 +27,23 @@ jobs:
     timeout-minutes: 25
     env:
       # Deliberately far below the live tip: this asserts "it really synced the
-      # chain", not "the chain is exactly this tall today".
-      MIN_HEIGHT: 100
+      # chain", not "the chain is exactly this tall today". It must stay ABOVE
+      # CHECK_HEIGHT, or the chain check below asks for a block the joiner has
+      # not reached yet and fails for the wrong reason.
+      MIN_HEIGHT: 1100
+      # A block on the canonical chain, and its hash as served by /block/.
+      #
+      # Height and peer count alone only prove the joiner reached *a* chain. On
+      # 2026-08-26 a seed served a dead fork for hours — diverged from the
+      # network around height 250 — and a joiner would have synced it to well
+      # past MIN_HEIGHT and reported success. Genesis cannot catch this either:
+      # a fork shares it, which is what makes it a fork.
+      #
+      # So pin a block far enough in to be past any plausible divergence and
+      # settled beyond reorg. If the testnet is ever reset this must be
+      # updated, and the failure says so.
+      CHECK_HEIGHT: 1000
+      CHECK_SHA256: 72ba67b5f6dc894f370b4f2fec9e6736ce42269b313319aa4a57e837c32678a2
 
     steps:
       - name: Download the newest published release, as a stranger would
@@ -102,7 +117,21 @@ jobs:
               echo "t=${i}0s peers=${peers} height=${height}"
               if [ "${peers:-0}" -ge 1 ] && [ "${height:-0}" -ge "${MIN_HEIGHT}" ]; then
                 echo "SYNCED: peers=${peers} height=${height}"
-                echo "peers=${peers} height=${height}" >> "$GITHUB_STEP_SUMMARY"
+                # Joined *a* chain. Now check it is the right one.
+                url="http://127.0.0.1:19334/block/${CHECK_HEIGHT}"
+                got=$(curl -fsS --max-time 10 "$url" | sha256sum | cut -d" " -f1)
+                if [ -z "$got" ]; then
+                  echo "::error::could not read block ${CHECK_HEIGHT} from the joiner's own RPC — that is a broken check, not a fork"
+                  echo "--- noctd.log ---"; tail -60 noctd.log
+                  exit 1
+                fi
+                if [ "$got" != "$CHECK_SHA256" ]; then
+                  echo "::error::joined a DIFFERENT chain — block ${CHECK_HEIGHT} is ${got}, expected ${CHECK_SHA256}. A seed is serving a fork, or the testnet was reset and CHECK_SHA256 needs updating."
+                  echo "--- noctd.log ---"; tail -60 noctd.log
+                  exit 1
+                fi
+                echo "CHAIN VERIFIED at height ${CHECK_HEIGHT}"
+                echo "peers=${peers} height=${height} chain verified at ${CHECK_HEIGHT}" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
               fi
             fi
