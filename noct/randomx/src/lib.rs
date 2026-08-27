@@ -63,9 +63,27 @@ struct Epoch {
 // from clones — themselves `Send` via `VmCell` — are handed to worker threads.
 unsafe impl Send for Epoch {}
 
+/// How many epoch caches to keep. Each holds a ~256 MB RandomX light cache.
+///
+/// The map used to be insert-only: every epoch a node lived through, or synced
+/// across, stayed for the life of the process. Seeds rotate every
+/// `RANDOMX_EPOCH_BLOCKS` (2048) — under three days at a two-minute target — so
+/// a node grew by a quarter of a gigabyte every few days without bound, and a
+/// sync from genesis allocated one cache per epoch it crossed. Measured on the
+/// testnet: a syncing node stepped from 882 MB to 1,162 MB as it passed height
+/// 4096, an epoch boundary, and held there until it crossed the next one.
+///
+/// A node needs the epoch it is in, and the one before it — for blocks either
+/// side of a boundary, and for a reorg reaching back across one. Three is that
+/// plus margin.
+const MAX_CACHED_EPOCHS: usize = 3;
+
 struct Inner {
-    /// One epoch per seed. Building the cache/VM is expensive, so they are kept.
+    /// The cached epochs, bounded by [`MAX_CACHED_EPOCHS`]. Building a cache and
+    /// VM is expensive, so they are kept — but not forever.
     epochs: HashMap<Vec<u8>, Epoch>,
+    /// Seeds in use order, least-recently-used first, to decide what to drop.
+    order: Vec<Vec<u8>>,
     /// The seed currently in effect — the VM `pow_hash` uses.
     current: Vec<u8>,
     /// Flags for the cache and the light verification VM.
@@ -111,6 +129,7 @@ impl RandomXPow {
         Ok(RandomXPow {
             inner: Arc::new(Mutex::new(Inner {
                 epochs,
+                order: vec![seed.to_vec()],
                 current: seed.to_vec(),
                 cache_flags,
                 mine_flags: cache_flags | RandomXFlag::FLAG_FULL_MEM,
@@ -127,6 +146,29 @@ impl RandomXPow {
     fn current_vm(&self) -> Arc<Mutex<VmCell>> {
         let inner = self.inner.lock().expect("randomx inner mutex poisoned");
         Arc::clone(&inner.epochs[&inner.current].verify)
+    }
+}
+
+impl Inner {
+    /// Mark `seed` as most recently used.
+    fn touch(&mut self, seed: &[u8]) {
+        self.order.retain(|s| s.as_slice() != seed);
+        self.order.push(seed.to_vec());
+    }
+
+    /// Drop least-recently-used epochs beyond the cap, never the current one.
+    ///
+    /// Dropping the map's entry is safe while mining is in flight: the cache and
+    /// dataset are `Arc`-backed, and a worker holding a clone keeps its own copy
+    /// alive until it is finished with it.
+    fn evict_old_epochs(&mut self) {
+        while self.epochs.len() > MAX_CACHED_EPOCHS {
+            let Some(pos) = self.order.iter().position(|s| *s != self.current) else {
+                break; // nothing evictable
+            };
+            let victim = self.order.remove(pos);
+            self.epochs.remove(&victim);
+        }
     }
 }
 
@@ -156,6 +198,8 @@ impl ProofOfWork for RandomXPow {
             inner.epochs.insert(seed.to_vec(), epoch);
         }
         inner.current = seed.to_vec();
+        inner.touch(seed);
+        inner.evict_old_epochs();
     }
 
     fn mining_hashers(&self, seed: &[u8; 32], count: usize) -> Vec<Hasher> {
@@ -168,6 +212,8 @@ impl ProofOfWork for RandomXPow {
                 let epoch = build_epoch(flags, seed).expect("failed to build RandomX epoch");
                 inner.epochs.insert(seed.to_vec(), epoch);
             }
+            inner.touch(seed);
+            inner.evict_old_epochs();
             let epoch = &inner.epochs[seed.as_slice()];
             (epoch.cache.clone(), inner.mine_flags, epoch.dataset.clone())
         };
@@ -224,6 +270,38 @@ mod tests {
     /// Rekeying to a new epoch seed genuinely changes the PoW function, and VMs
     /// are cached per seed (an epoch boundary costs one rebuild; returning to a
     /// known seed costs none).
+    #[test]
+    /// Walking forward through epochs, as a syncing node does, must not grow
+    /// without bound. Each epoch holds a ~256 MB cache, and the map used to keep
+    /// every one for the life of the process.
+    #[test]
+    fn epoch_caches_do_not_accumulate_without_bound() {
+        let pow = RandomXPow::new(&[0u8; 32]).unwrap();
+        for i in 1..=(MAX_CACHED_EPOCHS as u8 + 3) {
+            pow.reseed(&[i; 32]);
+            assert!(
+                pow.cached_vms() <= MAX_CACHED_EPOCHS,
+                "cached {} epochs, cap is {}",
+                pow.cached_vms(),
+                MAX_CACHED_EPOCHS
+            );
+        }
+    }
+
+    /// Whatever is evicted, it is never the epoch in use — that one is needed to
+    /// verify the very next block.
+    #[test]
+    fn the_current_epoch_is_never_evicted() {
+        let pow = RandomXPow::new(&[0u8; 32]).unwrap();
+        for i in 1..=(MAX_CACHED_EPOCHS as u8 + 3) {
+            pow.reseed(&[i; 32]);
+        }
+        let last = [MAX_CACHED_EPOCHS as u8 + 3; 32];
+        let before = pow.pow_hash(b"block blob");
+        pow.reseed(&last); // already current: must be a no-op, not a rebuild
+        assert_eq!(pow.pow_hash(b"block blob"), before);
+    }
+
     #[test]
     fn reseed_rotates_the_pow_and_caches_vms() {
         let pow = RandomXPow::new(&[0u8; 32]).unwrap();
