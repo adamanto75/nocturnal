@@ -913,6 +913,24 @@ impl NodeState {
         }
     }
 
+    /// How many branch collections in a row failed to reach a block this node
+    /// agrees with.
+    ///
+    /// A steady stream means this node has diverged from the network by more
+    /// than [`MAX_REORG_DEPTH`] and cannot rejoin by reorganising — it will keep
+    /// extending its own dead fork until someone resyncs it.
+    ///
+    /// Deliberately *not* self-healing. A node that threw its chain away on
+    /// seeing a heavier one would have given up the very protection
+    /// `MAX_REORG_DEPTH` exists to provide, and an attacker offering a heavier
+    /// chain could capture an established node the way they cannot today. So the
+    /// node reports the condition and leaves the decision to an operator — but
+    /// it has to be *visible* to be acted on, and a warning in a log is only
+    /// visible to whoever is reading the log.
+    pub fn reorgs_without_ancestor(&self) -> u32 {
+        self.reorgs_without_ancestor
+    }
+
     /// Release everything held on behalf of a peer whose session has ended.
     ///
     /// A branch collection buffers blocks in memory and was only ever removed
@@ -1190,6 +1208,23 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A coinbase must not become spendable while a reorg deep enough to erase
+    /// it is still something this node would accept. Otherwise a reorg between
+    /// the two depths unspends already-spent freshly-mined coins — exactly what
+    /// the maturity rule exists to prevent.
+    ///
+    /// The two constants live in different crates, so nothing but this test
+    /// stops one moving without the other.
+    #[test]
+    fn a_coinbase_matures_no_sooner_than_the_deepest_reorg_we_accept() {
+        assert!(
+            noct_core::chain::COINBASE_MATURITY >= MAX_REORG_DEPTH,
+            "COINBASE_MATURITY ({}) must be >= MAX_REORG_DEPTH ({})",
+            noct_core::chain::COINBASE_MATURITY,
+            MAX_REORG_DEPTH
+        );
+    }
 
     /// A peer that starts a branch collection and leaves must not keep its
     /// buffered blocks alive. Peer ids are per connection, so without this a

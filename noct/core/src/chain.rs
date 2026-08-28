@@ -92,23 +92,29 @@ pub const GAMMA_SCALE: f64 = 1.0 / GAMMA_RATE;
 /// member — matching the intent of Monero's `unlock_time` on coinbase outputs
 /// (Monero uses 60). Non-coinbase outputs have no maturity requirement.
 ///
-/// # KNOWN GAP: this is smaller than the deepest reorg a node will accept
+/// # Why 100, and not Monero's 60
 ///
-/// [`noct_node::MAX_REORG_DEPTH`] is **100**, and its own documentation says it
-/// "caps how deep a reorg we will consider at all". So a reorg between 61 and
-/// 100 blocks is permitted, and would invalidate a coinbase that had already
-/// matured and been spent — the precise outcome this constant exists to
-/// prevent. The rule protects against *short* reorgs only.
+/// This must be at least as deep as the deepest reorg a node will accept, or the
+/// rule protects against *short* reorgs only: with maturity at 60 and
+/// [`noct_node::MAX_REORG_DEPTH`] at 100, a reorg of 61 to 100 blocks was
+/// permitted and would invalidate a coinbase that had already matured and been
+/// spent — the precise outcome this constant exists to prevent.
 ///
-/// The invariant that would close it is `COINBASE_MATURITY >= MAX_REORG_DEPTH`.
-/// Raising this is a consensus change; lowering the reorg cap is node policy but
-/// leaves a node that falls further behind unable to rejoin without resyncing.
-/// Neither has been chosen yet, so the gap is documented rather than hidden.
+/// The invariant is `COINBASE_MATURITY >= MAX_REORG_DEPTH`, and it is pinned by
+/// a test. There were two ways to close it. Lowering the reorg cap to 60 needs
+/// no consensus change, which is tempting, but a node that falls further behind
+/// than the cap can never rejoin by reorganising — it is stranded on its own
+/// fork until someone resyncs it by hand. On this network that is not a
+/// theoretical failure: it is the one that actually happens. A tighter cap makes
+/// it happen sooner, so the cap stayed at 100 and this rose to meet it.
 ///
-/// For context, neither Bitcoin (maturity 100) nor Monero (60) caps reorg depth
-/// at all; both rely on hashrate making deep reorgs impractical rather than on
-/// an explicit bound.
-pub const COINBASE_MATURITY: u64 = 60;
+/// 100 is also Bitcoin's maturity. Neither Bitcoin nor Monero caps reorg depth
+/// at all, relying on hashrate to make deep reorgs impractical; this chain does
+/// cap it, which is what makes the invariant necessary here.
+///
+/// The cost is that a miner waits 100 blocks rather than 60 — about three and a
+/// half hours at a two-minute target, against Bitcoin's sixteen.
+pub const COINBASE_MATURITY: u64 = 100;
 
 /// Errors from validating a block against the chain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

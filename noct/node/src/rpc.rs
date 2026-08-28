@@ -380,7 +380,7 @@ fn handle_client(
             let peer_count = peers.count();
             let node = state.lock().unwrap();
             let json = format!(
-                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\"}}",
+                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
                 node.height(),
                 node.num_outputs(),
                 node.emitted(),
@@ -395,6 +395,11 @@ fn handle_client(
                 // which looks like a network fault rather than a build mistake.
                 // Publishing it lets a client refuse to start instead of guessing.
                 crate::pow_name(),
+                // Whether this node looks stranded on a fork it cannot leave.
+                // The condition is permanent and its only other symptom is
+                // being slow, so monitoring has to be able to see it without
+                // anyone reading a log.
+                node.reorgs_without_ancestor() >= 8,
             );
             respond(reader.get_mut(), "200 OK", &json)
         }
