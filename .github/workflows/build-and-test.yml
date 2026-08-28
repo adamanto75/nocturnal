@@ -1,0 +1,72 @@
+name: build and test
+
+# There was no CI that compiled or tested this repository. Every `cargo test`
+# was run by hand on a developer machine, which meant a green local run was the
+# only evidence anything worked, and nothing checked a pull request at all.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace:
+    name: workspace build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # The crates live in noct/, not at the repository root.
+    defaults:
+      run:
+        working-directory: noct
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned, not `stable`: this project builds on 1.82 and edition 2021, and
+      # a toolchain that moves on its own turns an unrelated release into a
+      # broken build on a morning nobody changed anything.
+      - name: Install Rust 1.82
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.82 --profile minimal
+          rustup default 1.82
+          rustc --version
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  randomx:
+    name: randomx crate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: noct
+    steps:
+      - uses: actions/checkout@v4
+
+      # `randomx` is deliberately excluded from the workspace: it builds the
+      # RandomX C++ library and needs cmake, so `cargo test` in a plain shell
+      # must not require it. Excluded also means never compiled — the same trap
+      # that was called out for `swap` — and the proof-of-work lives here, so it
+      # gets its own job rather than no coverage at all.
+      - name: Install Rust 1.82
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.82 --profile minimal
+          rustup default 1.82
+
+      - name: Build tools
+        run: |
+          set -euo pipefail
+          cmake --version
+          c++ --version
+
+      - name: Test the RandomX crate
+        run: cargo test --manifest-path randomx/Cargo.toml --locked
