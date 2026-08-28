@@ -643,8 +643,34 @@ impl NodeState {
         if !self.seen_txs.insert(tx.hash()) {
             return (Relay::Drop, 0); // already processed → stops gossip loops
         }
-        if self.chain.validate_tx(rng, &tx).is_err() {
-            return (Relay::Drop, MISBEHAVIOR_INVALID_TX); // never relay invalid txs
+        match self.chain.validate_tx(rng, &tx) {
+            Ok(()) => {}
+            // "We cannot tell yet" is not misbehaviour.
+            //
+            // Both of these are judged against *our* chain: a ring member we
+            // have not synced yet is unknown to us, and coinbase maturity is
+            // measured from our height. A node that is behind therefore rejects
+            // transactions the rest of the network considers perfectly valid,
+            // and at 20 points a time it bans the peers feeding it after five of
+            // them — including its only seed. It then sits at zero peers,
+            // stranded at the height it stopped, having done it to itself.
+            //
+            // Seen while syncing a fresh node against the live testnet: it
+            // scored seed1, the load node and a third peer to exactly 100 each
+            // and stalled at height 5350 with no peers left.
+            //
+            // This is the same reasoning the block path already applies to
+            // `TimestampTooFarAhead`: a verdict that depends on our own state
+            // says nothing about the sender. Rejection stays — the transaction
+            // is dropped and never relayed — only the penalty goes. It is also
+            // cheap to reject, being a hash lookup before any signature work.
+            Err(ChainError::UnknownRingMember) | Err(ChainError::ImmatureCoinbase) => {
+                return (Relay::Drop, 0);
+            }
+            // Anything else is bad regardless of where we are: a failed
+            // signature or range proof, a double spend of an image we already
+            // have on chain.
+            Err(_) => return (Relay::Drop, MISBEHAVIOR_INVALID_TX),
         }
         // Stay in the stem only if we can actually relay it onward; with no peer
         // to stem to we must fluff now, or the transaction is silently lost.
@@ -1334,6 +1360,45 @@ mod tests {
             let (block, txs) = node.mine_block(&mut OsRng).unwrap();
             w.scan_block(&block, &txs);
         }
+    }
+
+    #[test]
+    /// A node that is behind must not punish peers for relaying transactions it
+    /// cannot validate yet.
+    ///
+    /// The ring members are real; this node simply has not synced the blocks
+    /// carrying them. At 20 points a time it banned the peers feeding it after
+    /// five such transactions — its only seed included — and stranded itself at
+    /// zero peers. Observed against the live testnet at height 5350.
+    #[test]
+    fn a_syncing_node_does_not_score_transactions_it_cannot_validate_yet() {
+        // A node that has the whole chain, and a transaction built on it.
+        let miner = wallet();
+        let mut ahead = test_node(miner.address());
+        let mut miner_view = miner;
+        mine_n(&mut ahead, &mut miner_view, 16);
+
+        let bob = wallet();
+        let spendable = miner_view.unspent().next().cloned().unwrap();
+        let fee = noct_core::emission::ATOMIC_UNITS / 100;
+        let payments =
+            [noct_core::tx::Payment { destination: bob.address(), amount: spendable.amount() - fee }];
+        let tx = miner_view
+            .build_transaction(&mut OsRng, &ahead.chain, &payments, fee, DEFAULT_RING_SIZE)
+            .unwrap();
+
+        // A node still near genesis: the ring members do not exist for it yet.
+        let mut behind = test_node(bob.address());
+        assert!(
+            behind.chain.validate_tx(&mut OsRng, &tx).is_err(),
+            "test needs this node to be unable to validate the transaction"
+        );
+
+        let r = behind.react(&mut OsRng, 0, Wire::Tx(tx, Phase::Fluff), false);
+        assert_eq!(
+            r.misbehavior, 0,
+            "a peer must not be scored for a transaction we are merely too far behind to check"
+        );
     }
 
     #[test]
