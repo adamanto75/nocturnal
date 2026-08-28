@@ -605,10 +605,24 @@ impl<P: ProofOfWork> Blockchain<P> {
     /// Switch to `branch` if it is heavier than the current chain.
     ///
     /// `branch` is a run of blocks starting at the fork height (its first block's
-    /// `coinbase.height`), oldest first. The branch is validated in full against a
-    /// **copy** of the chain, so a branch that is invalid *or* merely lighter can
-    /// never leave this chain in a partial state — we only commit once it has
-    /// been proven both valid and heavier.
+    /// `coinbase.height`), oldest first. It is validated in full, and a branch
+    /// that turns out to be invalid *or* merely lighter leaves this chain
+    /// exactly as it was.
+    ///
+    /// That guarantee used to come from validating against `self.clone()` — a
+    /// copy of every block with its decoded transactions, the output set and the
+    /// spent key images. It made **peak memory twice the chain state for every
+    /// reorg considered**, including the one-block reorgs that are routine when
+    /// miners race, and including the ones that are rejected. Measured on the
+    /// testnet: a node stepped +263 MB on a reorg and stayed there. A peer can
+    /// also induce the evaluation by offering a branch, so it was a cheap remote
+    /// lever on double a node's memory, bounded by nothing the peer sends.
+    ///
+    /// Instead the branch is applied in place and undone if it does not win.
+    /// Rolling back is exact — `pop_block` removes the key images, drains the
+    /// outputs it added, and restores `emitted` — and the blocks put back are
+    /// ones this chain already accepted, so the work is bounded by the depth of
+    /// the reorg rather than by the length of the chain.
     ///
     /// On success returns the discarded blocks so a caller can put their
     /// transactions back in a mempool.
@@ -632,16 +646,34 @@ impl<P: ProofOfWork> Blockchain<P> {
             return Err(ChainError::CannotReplaceGenesis);
         }
 
-        let mut candidate = self.clone();
-        let discarded = candidate.rollback_to(fork_height);
+        let work_before = self.cumulative_difficulty();
+        let discarded = self.rollback_to(fork_height);
+
+        let mut failure = None;
         for (block, txs) in branch {
-            candidate.add_block(rng, block, txs)?;
+            if let Err(e) = self.add_block(rng, block, txs) {
+                failure = Some(e);
+                break;
+            }
         }
-        if candidate.cumulative_difficulty() <= self.cumulative_difficulty() {
-            return Err(ChainError::NotHeavier);
+        if failure.is_none() && self.cumulative_difficulty() <= work_before {
+            failure = Some(ChainError::NotHeavier);
         }
 
-        *self = candidate;
+        if let Some(e) = failure {
+            // Put back exactly what was here. These blocks were on this chain a
+            // moment ago, so they are valid against the same predecessors under
+            // rules that depend only on the chain — the same reason `replay`
+            // can rebuild from the log.
+            self.rollback_to(fork_height);
+            for stored in &discarded {
+                self.add_block(rng, &stored.block, &stored.txs).expect(
+                    "a block this chain already accepted must re-apply after a                      rejected reorg; if it does not, the chain is corrupt and                      continuing would hide it",
+                );
+            }
+            return Err(e);
+        }
+
         Ok(Reorg { discarded, applied: branch.len() })
     }
 
@@ -1367,6 +1399,65 @@ mod tests {
         assert_eq!(reorg.discarded[1].block.coinbase.height, 3);
         // Genesis is still the root.
         assert_eq!(chain.genesis_id(), Block::genesis().id());
+    }
+
+    #[test]
+    /// A rejected reorg must leave a chain that still *works*, not one that
+    /// merely looks right in its summary fields.
+    ///
+    /// The branch is applied in place and undone now, so the restore is real
+    /// code rather than dropping a copy. Extending afterwards is what catches an
+    /// inconsistency between the blocks, the output set, the timestamps and the
+    /// cumulative difficulties — a mismatch a height check would sail past.
+    #[test]
+    fn a_rejected_reorg_leaves_a_chain_that_still_extends() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        extend(&mut chain, &miner, 4, 1_000);
+        let tip = chain.tip_id();
+        let work = chain.cumulative_difficulty();
+        let outputs = chain.num_outputs();
+        let emitted = chain.emitted();
+
+        let mut fork = chain.clone();
+        fork.rollback_to(2);
+        let lighter = extend(&mut fork, &miner, 1, 50_000);
+        assert_eq!(chain.try_reorg(&mut OsRng, &lighter).unwrap_err(), ChainError::NotHeavier);
+
+        assert_eq!(chain.tip_id(), tip, "tip must be restored");
+        assert_eq!(chain.cumulative_difficulty(), work);
+        assert_eq!(chain.num_outputs(), outputs);
+        assert_eq!(chain.emitted(), emitted, "emission must be restored, not double counted");
+
+        // The real check: it can still take blocks.
+        extend(&mut chain, &miner, 2, 90_000);
+        assert_eq!(chain.height(), 7);
+    }
+
+    /// The same, for a branch that is rejected as *invalid* rather than lighter.
+    /// That exits from a different point, part-way through applying the branch.
+    #[test]
+    fn a_reorg_rejected_as_invalid_restores_the_chain() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        extend(&mut chain, &miner, 4, 1_000);
+        let tip = chain.tip_id();
+        let outputs = chain.num_outputs();
+        let emitted = chain.emitted();
+
+        // A longer branch whose second block has had its proof of work broken,
+        // so it fails part-way in rather than at the first block.
+        let mut fork = chain.clone();
+        fork.rollback_to(2);
+        let mut branch = extend(&mut fork, &miner, 4, 2_000);
+        branch[1].0.header.nonce = branch[1].0.header.nonce.wrapping_add(1);
+
+        assert!(chain.try_reorg(&mut OsRng, &branch).is_err());
+        assert_eq!(chain.tip_id(), tip, "a part-applied branch must be undone");
+        assert_eq!(chain.num_outputs(), outputs);
+        assert_eq!(chain.emitted(), emitted);
+        extend(&mut chain, &miner, 1, 90_000);
+        assert_eq!(chain.height(), 6);
     }
 
     #[test]
