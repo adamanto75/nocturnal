@@ -472,6 +472,14 @@ pub struct NodeState {
     pow: NodePow,
     seen_txs: BoundedSet,
     seen_blocks: BoundedSet,
+    /// Peers whose blocks this node has rejected as invalid.
+    ///
+    /// One such peer is a bad peer. All of them is usually this node: a build
+    /// whose consensus parameters differ from the network's finds every honest
+    /// block invalid, bans everyone for serving them, and strands itself at the
+    /// first block it disagrees about — with nothing in the log to say the
+    /// disagreement is its own.
+    peers_serving_invalid_blocks: std::collections::HashSet<usize>,
     /// Transactions currently buffered across all open branch collections, so
     /// the memory they hold has a ceiling rather than just a block count.
     collected_txs: usize,
@@ -517,6 +525,7 @@ impl NodeState {
             seen_blocks: BoundedSet::default(),
             reorgs_without_ancestor: 0,
             collected_txs: 0,
+            peers_serving_invalid_blocks: std::collections::HashSet::new(),
             peer_best_height: 0,
             store: None,
             sync: HashMap::new(),
@@ -908,6 +917,22 @@ impl NodeState {
                 // is invisible to the peer it lands on, so a wrong one here is
                 // a partition that nobody can explain from either side.
                 eprintln!("peer {peer}: block {block_height} rejected as invalid ({e:?}) — penalising");
+                // And if it is *everyone*, say the other thing out loud.
+                if self.peers_serving_invalid_blocks.insert(peer)
+                    && self.peers_serving_invalid_blocks.len() == 4
+                {
+                    eprintln!(
+                        concat!(
+                            "WARNING: blocks from 4 different peers have now been rejected as ",
+                            "invalid. Either several peers are misbehaving at once, or this ",
+                            "node's consensus rules differ from the network's — which is the ",
+                            "likelier reading when it is all of them. Check that this build ",
+                            "matches its peers on proof-of-work, network, and the consensus ",
+                            "constants (coinbase maturity in particular). A node that ",
+                            "disagrees will ban every honest peer and strand itself here."
+                        )
+                    );
+                }
                 out.misbehavior += MISBEHAVIOR_INVALID_BLOCK
             }
         }
@@ -1208,6 +1233,40 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A node whose consensus rules differ from the network's rejects every
+    /// honest block, bans everyone, and strands itself. Observed for real: a
+    /// build with `COINBASE_MATURITY` raised to 100 met the live testnet at
+    /// block 922, rejected it as `ImmatureCoinbase`, scored all three of its
+    /// peers to the ban threshold and sat at zero peers.
+    ///
+    /// Rejecting is right — the block *is* invalid by our rules, and we cannot
+    /// tell a bad peer from our own bad build. Staying quiet about it is not.
+    #[test]
+    fn rejecting_blocks_from_many_peers_is_tracked_as_our_own_problem() {
+        let mut w = wallet();
+        let mut ahead = test_node(w.address());
+        mine_n(&mut ahead, &mut w, 6);
+        let mut node = test_node(w.address());
+
+        // The block this node needs next, backdated so it fails on the median
+        // rule — at our own tip height, so it actually reaches validation.
+        let mut bad = ahead.chain.block_at(node.chain.height()).expect("mined").block.clone();
+        bad.header.timestamp = 0;
+
+        for peer in 0..4 {
+            let out = node.react(&mut OsRng, peer, Wire::Block(bad.clone(), vec![]), false);
+            assert_eq!(
+                out.misbehavior, MISBEHAVIOR_INVALID_BLOCK,
+                "an invalid block must still be scored"
+            );
+        }
+        assert_eq!(
+            node.peers_serving_invalid_blocks.len(),
+            4,
+            "each distinct peer serving an invalid block must be counted, so a node              that disagrees with everyone can notice it is the odd one out"
+        );
+    }
 
     /// A coinbase must not become spendable while a reorg deep enough to erase
     /// it is still something this node would accept. Otherwise a reorg between
