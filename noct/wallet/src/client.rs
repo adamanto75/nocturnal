@@ -294,6 +294,26 @@ impl BlockCache {
     }
 }
 
+/// Refuse to sync from a node that is shorter than we have already scanned.
+///
+/// A node behind us is not a node with nothing to send: it no longer has the
+/// chain we scanned. `sync` only ever moves forward, so without this it returns
+/// `Ok` having done nothing and the wallet keeps answering with balances from a
+/// branch that no longer exists — until the node grows past our height and the
+/// next block fails to extend, which may be a long time on a chain that reorged
+/// deeply.
+///
+/// Reporting it lets the caller rebuild, the same trade the block cache already
+/// makes: this can cost time, never correctness.
+fn node_must_still_have_our_chain(node_height: u64, scanned_height: u64) -> Result<(), String> {
+    if node_height < scanned_height {
+        return Err(format!(
+            "node is at height {node_height} but we have scanned to              {scanned_height}; it has reorganised below our tip"
+        ));
+    }
+    Ok(())
+}
+
 /// Download every block the wallet is missing, **validate** each into `chain`
 /// (the node is untrusted), and scan it into `wallet`. Returns the height
 /// reached. When a `cache` is given, each newly validated block is appended to
@@ -305,6 +325,15 @@ pub fn sync<P: ProofOfWork>(
     cache: Option<&BlockCache>,
 ) -> Result<u64, String> {
     let target = client.height()?;
+    // A node shorter than us is not a node with nothing to send: it is a node
+    // that no longer has the chain we scanned. The loop below only ever moves
+    // forward, so without this it returns Ok having done nothing, and the wallet
+    // keeps answering with balances from a branch that no longer exists — until
+    // the node grows past our height and the next block fails to extend.
+    //
+    // Report it instead and let the caller rebuild. That is the same trade the
+    // cache already makes: this can cost time, never correctness.
+    node_must_still_have_our_chain(target, chain.height())?;
     let mut rng = rand_core::OsRng;
     // Genesis (height 0) is applied locally by `Blockchain::new`, never
     // downloaded, so scan it once up front: it records the founder premine (if
@@ -458,6 +487,18 @@ pub fn json_str(s: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_shorter_than_our_scan_is_refused() {
+        // Equal or ahead is ordinary.
+        assert!(node_must_still_have_our_chain(100, 100).is_ok());
+        assert!(node_must_still_have_our_chain(101, 100).is_ok());
+
+        // Behind means it no longer has what we scanned. Returning Ok here left
+        // the wallet reporting balances from an abandoned branch.
+        let e = node_must_still_have_our_chain(99, 100).unwrap_err();
+        assert!(e.contains("reorganised"), "the error should say why: {e}");
+    }
 
     #[test]
     fn noct_amount_roundtrips() {
