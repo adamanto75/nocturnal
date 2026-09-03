@@ -1210,7 +1210,11 @@ fn run_payouts(
     // pool can never pay anyone. Hardcoding Mainnet here meant a testnet pool
     // credited miners forever and paid out nothing — it fails safe, but it fails
     // totally, and only on the network you would test payouts on.
-    let (chain, wallet, _h) = match load_synced_wallet(&client, account, network, cache) {
+    // No issued subaddresses to re-register: the pool receives block rewards at
+    // its main address and pays miners out of them, and never hands out a
+    // subaddress. If it ever does, they have to be recorded and passed here, or
+    // the payout wallet will not see what was sent to them.
+    let (chain, wallet, _h) = match load_synced_wallet(&client, account, network, cache, &[]) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("payout skipped: wallet sync failed: {e}");
