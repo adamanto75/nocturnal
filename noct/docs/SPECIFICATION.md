@@ -685,7 +685,20 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
    cumulative difficulties, as in Monero's implementation. Short-chain and
    epoch-boundary behaviour are covered by tests. Retained here so an auditor
    confirms the pairing rather than assuming it is a bug.
-8. **OPEN — node memory holds the whole chain.** Every block is retained with its
+8. **SCOPE — the atomic-swap crate is not part of a launch.** `noct-swap`
+   implements cross-group (ed25519 <-> secp256k1) DLEQ for ETH<->NOCT swaps on
+   serai's `dleq` under its `experimental` feature. That construction is
+   **unaudited and has no formal proofs** — only `dleq`'s single-curve part was
+   audited — and the crate says so itself.
+
+   It is a workspace member so that it keeps compiling and its tests keep
+   running (an excluded crate rots unnoticed), but **no shipped binary links
+   it**: nothing in `node`, `wallet`, `pool` or `web` depends on `noct-swap`.
+   Recorded here so a reviewer neither spends effort auditing frontier crypto
+   that is out of scope, nor assumes it is absent from the tree. Shipping swaps
+   would make that dependency a launch decision in its own right.
+
+9. **OPEN — node memory holds the whole chain.** Every block is retained with its
    decoded transactions, so resident memory grows with chain length (~23 KB per
    block measured on testnet). The validation state proper — the output set and
    spent key images — is a small fraction of it. Serving blocks from the on-disk
