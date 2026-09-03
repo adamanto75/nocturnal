@@ -320,6 +320,19 @@ impl<P: ProofOfWork> Blockchain<P> {
     }
 
     /// The hash of the genesis block this chain is rooted at.
+    /// The id of the block at `height`, without touching its body.
+    ///
+    /// Ids are kept in their own vector, so answering "what is the hash at this
+    /// height" costs an index rather than a look at the stored block. That
+    /// matters for the two callers that only ever wanted the id — the RandomX
+    /// epoch seed, which reaches up to 2048 blocks back, and the fork check that
+    /// asks whether a peer's block at some height differs from ours. Both went
+    /// through the full `StoredBlock`, which is what keeps every block's decoded
+    /// transactions reachable and therefore alive.
+    pub fn block_id_at(&self, height: u64) -> Option<[u8; 32]> {
+        self.block_ids.get(usize::try_from(height).ok()?).copied()
+    }
+
     pub fn genesis_id(&self) -> [u8; 32] {
         self.block_ids[0]
     }
@@ -340,7 +353,7 @@ impl<P: ProofOfWork> Blockchain<P> {
     /// to genesis for the first epoch). Seedless PoW ignores the value.
     pub fn seed_for_height(&self, height: u64) -> [u8; 32] {
         let seed_height = crate::pow::randomx_seed_height(height);
-        self.block_at(seed_height).map(|s| s.block.id()).unwrap_or_else(|| self.genesis_id())
+        self.block_id_at(seed_height).unwrap_or_else(|| self.genesis_id())
     }
 
     // --- state queries ---------------------------------------------------
@@ -1467,6 +1480,31 @@ mod tests {
     }
 
     #[test]
+    /// The id vector and the stored blocks must never disagree. They are
+    /// updated in different places, and a caller that trusts the cheap one would
+    /// silently act on a stale hash.
+    #[test]
+    fn block_id_at_agrees_with_the_stored_block() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        extend(&mut chain, &miner, 4, 1_000);
+
+        for h in 0..chain.height() {
+            assert_eq!(
+                chain.block_id_at(h),
+                chain.block_at(h).map(|s| s.block.id()),
+                "id and stored block disagree at height {h}"
+            );
+        }
+        assert_eq!(chain.block_id_at(0), Some(chain.genesis_id()));
+        assert_eq!(chain.block_id_at(chain.height()), None, "past the tip is None");
+
+        // And it must follow a rollback, not go stale.
+        chain.rollback_to(2);
+        assert_eq!(chain.block_id_at(2), None, "rolled-back heights are gone");
+        assert_eq!(chain.block_id_at(1), chain.block_at(1).map(|s| s.block.id()));
+    }
+
     fn reorg_rejects_a_lighter_branch_and_changes_nothing() {
         let mut chain = Blockchain::with_maturity(KeccakPow, 1);
         let miner = Account::random(&mut OsRng);

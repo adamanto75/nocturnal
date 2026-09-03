@@ -937,7 +937,7 @@ impl NodeState {
         if block_height < self.chain.height() {
             // A block at a height we already have. If it differs from ours, the
             // peer is on a competing branch worth evaluating.
-            let ours = self.chain.block_at(block_height).map(|s| s.block.id());
+            let ours = self.chain.block_id_at(block_height);
             if ours != Some(block.id()) {
                 // Remember this trigger so a replay of the same block cannot make
                 // us re-download the whole branch again (bandwidth amplification).
