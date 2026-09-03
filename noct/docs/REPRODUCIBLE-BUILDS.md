@@ -40,15 +40,28 @@ Every binary should match. If one does not, **say so publicly** — a mismatch
 either means the environment differs (see below) or that a published binary does
 not correspond to its source, and only one of those is harmless.
 
-## Why the archive hash will not match
+## The archive is reproducible too
 
-The release ships a `.tar.gz`, and its hash covers archive metadata — file
-timestamps and ordering — which is not yet made deterministic. Compare the
-**binaries inside**, not the archive.
+It was not, until `deploy/package-release.sh` existed. The release ships a
+`.tar.gz`, and a tar records far more than its contents: the order operands were
+given in, the order a directory walk returned, every file's mtime, owner and group
+names, pax headers carrying atime/ctime, and a gzip header holding the source
+filename and the time it was compressed. Any one of those varying gives a
+different hash from identical files.
 
-That is a real remaining gap, not a technicality to wave away. It means the
-published `SHA256SUMS.txt` cannot itself be reproduced, only the contents it
-refers to.
+`package-release.sh` pins all of them, so the published `SHA256SUMS.txt` can be
+reproduced rather than merely its contents checked by hand:
+
+```
+SOURCE_DATE_EPOCH=1 deploy/package-release.sh nocturnal-vX.Y.Z.tar.gz noctd noct-cli ...
+```
+
+The one that is easy to miss is operand order: `--sort=name` orders what tar
+finds when it walks a *directory*, and does not reorder paths listed explicitly
+on the command line. Packaging the same three files as `f1 f2 f3` and `f3 f1 f2`
+produced two different archives until the script sorted them itself. It was
+caught by testing exactly that, along with changing every file's mtime — both
+now produce the same bytes.
 
 ## What makes the build reproducible
 
