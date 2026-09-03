@@ -46,6 +46,7 @@ fn main() {
     let mut rpc_tls_cert: Option<std::path::PathBuf> = None;
     let mut rpc_tls_key: Option<std::path::PathBuf> = None;
     let mut data_dir: Option<std::path::PathBuf> = None;
+    let mut allow_pow_mismatch = false;
     let mut mine_interval_ms: u64 = 2000;
     // Default to all cores but one, so the machine stays usable while mining.
     let mut mine_threads: usize = std::thread::available_parallelism()
@@ -91,6 +92,7 @@ fn main() {
                     .filter(|&n| n >= 1)
                     .unwrap_or_else(|| fail("--mine-threads needs a positive number"));
             }
+            "--allow-pow-mismatch" => allow_pow_mismatch = true,
             "--mine-interval-ms" => {
                 i += 1;
                 mine_interval_ms = args
@@ -191,6 +193,7 @@ fn main() {
     }
 
     if let Err(e) = run(Config {
+        allow_pow_mismatch,
         network,
         p2p_listen: p2p,
         rpc_listen: rpc,

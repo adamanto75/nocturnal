@@ -66,6 +66,62 @@ pub fn new_pow() -> NodePow {
     noct_randomx::RandomXPow::new(RANDOMX_SEED).expect("failed to initialise RandomX")
 }
 
+/// Whether `network` will only accept nodes built with real RandomX.
+///
+/// The proof-of-work is a build-time feature, and nothing in the protocol
+/// checked it. A node built with the Keccak placeholder handshakes normally,
+/// then disagrees with every block the network produces: it rejects honest
+/// blocks as `BadPow`, bans the peers that served them, and strands itself —
+/// or, if it is the one mining, produces blocks nobody else will accept.
+///
+/// Both directions were observed on the testnet. The symptom in each case was a
+/// node stuck at one height with no peers, which reads as a network fault
+/// rather than a build mistake, and cost an hour to identify.
+///
+/// So the network states what it requires and the node refuses to start
+/// otherwise. Mainnet has no override: a node that cannot validate mainnet's
+/// proof-of-work has no business on mainnet, and a flag to bypass that would
+/// eventually be set by someone who did not read this.
+pub fn network_requires_randomx(network: noct_core::address::Network) -> bool {
+    match network {
+        noct_core::address::Network::Mainnet => true,
+        // The public testnet mines RandomX, so the same mismatch applies. A
+        // local Keccak network is still useful for development, which is what
+        // `--allow-pow-mismatch` is for.
+        noct_core::address::Network::Testnet => true,
+    }
+}
+
+/// Decide whether a node may start, given the network, what this build can
+/// actually hash, and whether the operator asked to override.
+///
+/// `Err` refuses; `Ok(Some(w))` starts with a warning; `Ok(None)` is fine.
+/// Split out from [`run`] so both outcomes are testable — the compile-time
+/// feature flag is passed in rather than read, so one build can exercise both.
+pub fn pow_gate(
+    network: noct_core::address::Network,
+    built_with_randomx: bool,
+    allow_mismatch: bool,
+    pow: &str,
+) -> Result<Option<String>, String> {
+    if !network_requires_randomx(network) || built_with_randomx {
+        return Ok(None);
+    }
+    let mainnet = matches!(network, noct_core::address::Network::Mainnet);
+    if mainnet || !allow_mismatch {
+        return Err(format!(
+            "this build uses {pow} but the {network:?} network requires RandomX.
+             It would reject every block the network produces, ban the peers that              served them, and strand itself at the first one.
+             Rebuild with `--features randomx`.{}",
+            if mainnet { "" } else { "
+For a local Keccak network, pass --allow-pow-mismatch." }
+        ));
+    }
+    Ok(Some(format!(
+        "WARNING: running {pow} against a network that expects RandomX because          --allow-pow-mismatch was given. This node cannot validate the public          chain and must not be exposed to it."
+    )))
+}
+
 /// Human-readable name of the active PoW (for startup logging).
 pub fn pow_name() -> &'static str {
     if cfg!(feature = "randomx") {
@@ -100,6 +156,10 @@ pub struct Config {
     pub ephemeral: bool,
     /// Where coinbase rewards are paid.
     pub miner_address: Address,
+    /// Run even though this build's proof-of-work is not the one the network
+    /// requires. For local development against a Keccak network only; ignored
+    /// on mainnet.
+    pub allow_pow_mismatch: bool,
     /// Start with the background miner running (it can be toggled later via RPC).
     pub mine: bool,
     /// Number of mining worker threads (cores to grind on).
@@ -130,6 +190,15 @@ pub struct Config {
 /// Start the node: P2P listener, outbound dials, RPC server, and (optionally) a
 /// background miner. Blocks the calling thread.
 pub fn run(config: Config) -> std::io::Result<()> {
+    // Fail closed on the proof-of-work before anything else: a node that cannot
+    // validate this network's blocks cannot do anything useful on it, and every
+    // failure downstream of here would be reported as somebody else's fault.
+    match pow_gate(config.network, cfg!(feature = "randomx"), config.allow_pow_mismatch, pow_name()) {
+        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+        Ok(Some(warning)) => eprintln!("{warning}"),
+        Ok(None) => {}
+    }
+
     // Fail closed. The RPC is an administrative surface — it starts and stops
     // mining, and accepts blocks and transactions — so serving it off-box
     // without a token would hand those controls to anyone who can reach the
@@ -1233,6 +1302,40 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Mainnet must never run on the placeholder proof-of-work, and no flag may
+    /// buy an exception. A node that cannot validate mainnet's work has nothing
+    /// useful to do there, and an override would eventually be set by someone
+    /// who had not read why it exists.
+    #[test]
+    fn mainnet_refuses_a_keccak_build_even_when_overridden() {
+        assert!(pow_gate(Network::Mainnet, false, false, "Keccak").is_err());
+        assert!(
+            pow_gate(Network::Mainnet, false, true, "Keccak").is_err(),
+            "--allow-pow-mismatch must not apply to mainnet"
+        );
+    }
+
+    /// The testnet mines RandomX too, so the same mismatch strands a node there.
+    /// It refuses by default, but a local Keccak network is a legitimate thing
+    /// to develop against.
+    #[test]
+    fn testnet_refuses_by_default_but_can_be_overridden() {
+        let refused = pow_gate(Network::Testnet, false, false, "Keccak");
+        assert!(refused.is_err());
+        assert!(
+            refused.unwrap_err().contains("--allow-pow-mismatch"),
+            "the refusal should say how to run a local Keccak network"
+        );
+        assert!(matches!(pow_gate(Network::Testnet, false, true, "Keccak"), Ok(Some(_))));
+    }
+
+    /// A build that matches the network starts silently, on either network.
+    #[test]
+    fn a_matching_build_starts_without_comment() {
+        assert!(matches!(pow_gate(Network::Mainnet, true, false, "RandomX"), Ok(None)));
+        assert!(matches!(pow_gate(Network::Testnet, true, false, "RandomX"), Ok(None)));
+    }
 
     /// A node whose consensus rules differ from the network's rejects every
     /// honest block, bans everyone, and strands itself. Observed for real: a

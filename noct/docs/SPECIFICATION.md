@@ -621,29 +621,56 @@ a short backoff rather than discarding work that cost real hashing.
 
 ## 16. Known limitations (pre-mainnet)
 
-These are intentional gaps to close, or decisions to ratify, before mainnet.
-They are called out here so an audit covers them explicitly.
+These are the gaps to close, or decisions to ratify, before mainnet. They are
+called out here so an audit covers them explicitly. Items marked **CLOSED** are
+recorded so a reviewer can check the resolution rather than rediscover the gap.
 
-1. **Coinbase maturity — implemented** (`COINBASE_MATURITY = 60`, §13.1). Retained
-   here only to flag for the audit that the depth (60) and the enforce-over-all-
-   ring-members approach should be reviewed, and that the premine is subject to
-   it (spendable at height ≥ 60).
-2. **Decoy selection is uniform**, not recency/gamma-weighted. Uniform selection
-   is a weaker anonymity heuristic than Monero's; revisit before mainnet.
-3. **Mainnet PoW gating.** The default build is the Keccak placeholder; only the
-   `randomx` feature build is mainnet-valid. There is no consensus rule
-   preventing a Keccak-built node from participating — mainnet builds must be
-   RandomX, and this should be enforced/parameterized, not left to the build.
-4. **Genesis/network parameters are placeholders** — mainnet address tags,
-   genesis timestamp, and the RandomX genesis seed must be finalized.
-5. **Subaddress lookahead is bounded** (account 0, indices < 200, no persisted
-   counter beyond the daemon's issue file). Deep or multi-account subaddress use
-   needs persisted wallet state.
-6. **Deep-partition resync** beyond `MAX_REORG_DEPTH` is not handled.
-7. **Difficulty cold-start** and the sorted-timestamp/chronological-work pairing
-   should be reviewed for edge behavior on short chains and at epoch boundaries.
-
----
+1. **CLOSED — coinbase maturity.** `COINBASE_MATURITY = 100` (§13.1), raised from
+   60 so that it is never shallower than `MAX_REORG_DEPTH` (100). Below that
+   depth a reorg between the two values could invalidate a coinbase that had
+   already matured and been spent. The invariant `COINBASE_MATURITY >=
+   MAX_REORG_DEPTH` is pinned by a test, because the two constants live in
+   different crates. Worth an auditor's attention: the rule is enforced over
+   *every ring member*, not just the real spend, and the premine is subject to it.
+2. **CLOSED — decoy selection is recency-weighted**, not uniform. Wallets call
+   `select_ring_recency_biased`, which samples ages from a gamma distribution in
+   log space (`GAMMA_SHAPE`/`GAMMA_SCALE`) and maps them to heights, following
+   Monero. `select_ring_uniform` is retained for tests and as a fallback when the
+   sampled age exceeds the chain. The *shape* of the distribution is what carries
+   the privacy, so it is worth checking against Monero's rather than assuming.
+3. **CLOSED — proof-of-work gating.** The PoW was a build-time feature with
+   nothing in the protocol checking it, so a Keccak-built node could handshake
+   and then disagree with every block on the network. `network_requires_randomx`
+   now states what each network needs and the node refuses to start otherwise.
+   Mainnet has no override; `--allow-pow-mismatch` exists for local Keccak
+   networks and is ignored on mainnet.
+4. **OPEN — genesis and network parameters are placeholders.** Mainnet address
+   tags, the genesis timestamp and the RandomX genesis seed must be finalised.
+   These are immutable once mainnet genesis exists.
+5. **OPEN — wallet state is not persisted.** Subaddress lookahead is bounded
+   (account 0, indices < 200, no persisted counter beyond the daemon's issue
+   file) and the CLI re-scans from genesis on every command. Both are workable at
+   testnet length and neither is at mainnet length.
+6. **OPEN by decision — deep-partition resync.** A node that diverges by more
+   than `MAX_REORG_DEPTH` cannot rejoin by reorganising and must be resynced.
+   Automatic recovery was considered and rejected: a node that discarded its
+   chain on seeing a heavier one would surrender exactly the protection
+   `MAX_REORG_DEPTH` provides, letting an attacker with a heavier chain capture
+   an established node. The node reports the condition instead — repeated
+   failures to reach a common ancestor are logged, and `/info` carries a
+   `stranded` flag for monitoring.
+7. **REVIEWED — difficulty.** The retarget is Monero-style: a 720-block window,
+   15-block lag, 60 outlier timestamps trimmed from each end, and a 2x per-block
+   step clamp. Sorted timestamps are paired with chronologically-ordered
+   cumulative difficulties, as in Monero's implementation. Short-chain and
+   epoch-boundary behaviour are covered by tests. Retained here so an auditor
+   confirms the pairing rather than assuming it is a bug.
+8. **OPEN — node memory holds the whole chain.** Every block is retained with its
+   decoded transactions, so resident memory grows with chain length (~23 KB per
+   block measured on testnet). The validation state proper — the output set and
+   spent key images — is a small fraction of it. Serving blocks from the on-disk
+   log instead would bound this; it dictates node hardware requirements, so it
+   belongs before mainnet.
 
 ## 17. Dependency and audit notes
 
