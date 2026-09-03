@@ -644,9 +644,29 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
    now states what each network needs and the node refuses to start otherwise.
    Mainnet has no override; `--allow-pow-mismatch` exists for local Keccak
    networks and is ignored on mainnet.
-4. **OPEN — genesis and network parameters are placeholders.** Mainnet address
-   tags, the genesis timestamp and the RandomX genesis seed must be finalised.
-   These are immutable once mainnet genesis exists.
+4. **OPEN — two mainnet identity constants are still placeholders.** Both are
+   immutable once mainnet genesis exists.
+   * **Address tag** (`Network::tag`, mainnet `0x13`) — the source calls it an
+     "arbitrary, stable placeholder". It decides what every address *looks
+     like*: `0x13` is why the published premine address begins `C4do37…`, as
+     Monero's tag makes its addresses begin `4`.
+   * **Genesis timestamp** (`GENESIS_TIMESTAMP = 1_750_000_000`, ≈ 15 June 2025)
+     — a round number rather than a real date. Besides chain identity it feeds
+     the difficulty cold-start (item 7): a genesis far behind the first mined
+     block makes the first retarget window span that whole gap, collapsing
+     difficulty to `MIN_DIFFICULTY` and needing roughly twenty 2x steps to
+     recover — a window in which blocks are close to free. Setting genesis near
+     actual launch removes the problem rather than managing it.
+
+   **Not a placeholder, despite earlier drafts of this section saying so: the
+   RandomX seed.** Epoch seeds are chain-derived — `seed_for_height` returns the
+   id of the block at `randomx_seed_height`, falling back to the genesis id for
+   the first epoch. `RANDOMX_SEED` only constructs the initial PoW object before
+   the first reseed and carries no consensus meaning.
+
+   The premine keys are likewise **not** placeholders: they are real, published,
+   and pinned by a test that fails the build if the founder keys change without
+   every published copy being updated.
 5. **OPEN — wallet state is not persisted.** Subaddress lookahead is bounded
    (account 0, indices < 200, no persisted counter beyond the daemon's issue
    file) and the CLI re-scans from genesis on every command. Both are workable at
