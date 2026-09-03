@@ -167,11 +167,61 @@ fn cmd_seed(path: &str) {
 fn cmd_balance(path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
     let account = load_account(path);
     let (_chain, wallet, height) =
-        load_synced_wallet(&NodeClient::with_token(node.clone(), token.clone()), account, network, cache_path(path))
+        load_synced_wallet(&NodeClient::with_token(node.clone(), token.clone()), account, network, cache_path(path), &load_issued(path))
             .unwrap_or_else(|e| fail(&e));
     println!("synced to height {height}");
     println!("balance: {} NOCT", format_noct(wallet.balance()));
     println!("outputs: {} ({} unspent)", wallet.outputs().len(), wallet.unspent().count());
+}
+
+/// Where the CLI records the subaddresses it has handed out.
+///
+/// `Wallet::new` pre-derives a lookahead window on account 0 and nothing else.
+/// This command will issue any `(account, index)` asked of it, so without a
+/// record the next command reconstructs a wallet that has never heard of it,
+/// scans without its keys, and reports no funds for an address this very tool
+/// printed. The seed still derives the money; the wallet simply cannot see it,
+/// which looks the same from outside.
+fn issued_path(wallet_path: &str) -> String {
+    format!("{wallet_path}.subaddr-issued")
+}
+
+/// Read the recorded pairs. A malformed line is skipped rather than fatal: a
+/// corrupt record should cost visibility of one address, not use of the wallet.
+fn load_issued(wallet_path: &str) -> Vec<(u32, u32)> {
+    let Ok(text) = std::fs::read_to_string(issued_path(wallet_path)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let a = parts.next()?.parse().ok()?;
+            let i = parts.next()?.parse().ok()?;
+            Some((a, i))
+        })
+        .collect()
+}
+
+/// Record a pair, if it is not already there.
+fn record_issued(wallet_path: &str, account: u32, index: u32) {
+    if load_issued(wallet_path).contains(&(account, index)) {
+        return;
+    }
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(issued_path(wallet_path)) {
+        Ok(mut f) => {
+            if writeln!(f, "{account} {index}").is_err() {
+                eprintln!("warning: could not record subaddress ({account}, {index});");
+                eprintln!("         funds sent to it may not show up after this command.");
+            }
+        }
+        // Worth saying out loud rather than failing: the address is still valid
+        // and still receives, but this wallet will not see it again.
+        Err(e) => {
+            eprintln!("warning: could not open {}: {e}", issued_path(wallet_path));
+            eprintln!("         funds sent to ({account}, {index}) may not show up later.");
+        }
+    }
 }
 
 fn cmd_subaddress(args: &[String], path: &str, network: Network) {
@@ -180,6 +230,7 @@ fn cmd_subaddress(args: &[String], path: &str, network: Network) {
     let index = flag(args, "--index")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or_else(|| fail("subaddress needs --index N (1 or higher; 0 is your main address)"));
+    record_issued(path, account, index);
     let addr = wallet.subaddress(account, index);
     println!("subaddress ({account}, {index}):");
     println!("{}", addr.encode());
@@ -188,7 +239,7 @@ fn cmd_subaddress(args: &[String], path: &str, network: Network) {
 fn cmd_history(path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
     let account = load_account(path);
     let (_chain, wallet, height) =
-        load_synced_wallet(&NodeClient::with_token(node.clone(), token.clone()), account, network, cache_path(path))
+        load_synced_wallet(&NodeClient::with_token(node.clone(), token.clone()), account, network, cache_path(path), &load_issued(path))
             .unwrap_or_else(|e| fail(&e));
     println!("synced to height {height}");
     if wallet.history().is_empty() {
@@ -222,7 +273,7 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
     let account = load_account(path);
     let client = NodeClient::with_token(node.clone(), token.clone());
     let (chain, wallet, height) =
-        load_synced_wallet(&client, account, network, cache_path(path)).unwrap_or_else(|e| fail(&e));
+        load_synced_wallet(&client, account, network, cache_path(path), &load_issued(path)).unwrap_or_else(|e| fail(&e));
     println!("synced to height {height}; balance {} NOCT", format_noct(wallet.balance()));
 
     let payments = [Payment { destination, amount }];

@@ -149,6 +149,28 @@ impl Wallet {
         wallet
     }
 
+    /// Register subaddresses this wallet has handed out before, so a scan sees
+    /// the funds paid to them.
+    ///
+    /// `new` pre-derives a lookahead window of [`SUBADDRESS_LOOKAHEAD`]
+    /// addresses on account 0, and anything outside it is only known to the
+    /// wallet that issued it. A reconstructed wallet does not know it ever
+    /// issued `(7, 5000)` — or `(0, 250)`, one past the window — so it scans
+    /// without those keys registered and reports no funds. The money is not
+    /// lost, since the seed still derives it, but the wallet will neither show
+    /// nor spend it, which is indistinguishable from lost to whoever is looking.
+    ///
+    /// So whatever issued them has to remember, and hand them back here before
+    /// the scan. Registering an address twice is harmless.
+    pub fn register_issued(&mut self, issued: impl IntoIterator<Item = (u32, u32)>) {
+        for (account, index) in issued {
+            let sub = SubaddressIndex::new(account, index);
+            if !sub.is_main() {
+                self.register_subaddress(sub);
+            }
+        }
+    }
+
     /// Derive and remember the subaddress at `sub`, so outputs paid to it are
     /// recognised when scanning.
     fn register_subaddress(&mut self, sub: SubaddressIndex) {
@@ -448,6 +470,75 @@ mod tests {
         for w in wallets.iter_mut() {
             w.scan_block(&block, txs);
         }
+    }
+
+    /// Funds paid to a subaddress outside the lookahead window are invisible to
+    /// a wallet that does not know it issued it — which is every wallet
+    /// reconstructed from the seed, since `new` only pre-derives the window.
+    ///
+    /// The money is not lost: the same seed derives it, and registering the
+    /// address makes it appear. But a wallet that cannot see funds cannot spend
+    /// them either, and from outside that is indistinguishable from losing them.
+    #[test]
+    fn a_subaddress_beyond_the_lookahead_needs_registering_after_a_restart() {
+        // Maturity 1: this is about which keys a scan knows, not about how long
+        // a coinbase takes to ripen.
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let alice_account = Account::random(&mut OsRng);
+        let mut alice = Wallet::new(alice_account, Network::Mainnet);
+        alice.scan_block(&Block::genesis(), &[]);
+        let mut bob = fresh_wallet();
+        let bob_addr = bob.address();
+
+        // Well outside the window `new` pre-derives, and on another account.
+        let far = (7, SUBADDRESS_LOOKAHEAD + 4_800);
+        let alice_sub = alice.subaddress(far.0, far.1);
+
+        // Fund Bob and warm the chain so there are decoys to sign against.
+        mine_and_scan(&mut chain, &mut [&mut alice, &mut bob], &bob_addr, &[], 1_000);
+        let filler = Account::random(&mut OsRng);
+        let filler_addr = Address::new(Network::Mainnet, filler.spend_public, filler.view_public);
+        for i in 0..15 {
+            mine_and_scan(&mut chain, &mut [&mut alice, &mut bob], &filler_addr, &[], 1_200 + i * 130);
+        }
+
+        // Bob pays the far subaddress.
+        let amount = ATOMIC_UNITS / 10;
+        let fee = ATOMIC_UNITS / 100;
+        let payments = [Payment { destination: alice_sub, amount }];
+        let tx = bob.build_transaction(&mut OsRng, &chain, &payments, fee, DEFAULT_RING_SIZE).unwrap();
+        mine_and_scan(
+            &mut chain,
+            &mut [&mut alice, &mut bob],
+            &filler_addr,
+            std::slice::from_ref(&tx),
+            50_000,
+        );
+        assert_eq!(alice.balance(), amount, "the issuer must see what it was paid");
+
+        // Rescan the whole chain with a wallet rebuilt from the same seed, as a
+        // later command or a restart does. It has never heard of that address.
+        let rescan = |w: &mut Wallet| {
+            w.scan_block(&Block::genesis(), &[]);
+            for h in 1..chain.height() {
+                let stored = chain.block_at(h).expect("mined");
+                w.scan_block(&stored.block, &stored.txs);
+            }
+        };
+
+        let mut restarted = Wallet::new(alice_account, Network::Mainnet);
+        rescan(&mut restarted);
+        assert_eq!(
+            restarted.balance(),
+            0,
+            "this is the bug: a scan without the issued key reports nothing"
+        );
+
+        // Handing the record back before scanning is what fixes it.
+        let mut recovered = Wallet::new(alice_account, Network::Mainnet);
+        recovered.register_issued([far]);
+        rescan(&mut recovered);
+        assert_eq!(recovered.balance(), amount, "registering it recovers the funds");
     }
 
     #[test]

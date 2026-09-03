@@ -106,16 +106,24 @@ fn main() {
     // Resume from the on-disk block cache (offline; new blocks pulled lazily on
     // the first request), so a restart doesn't re-download the whole chain.
     let cache_path = format!("{wallet_path}.cache");
-    let (chain, wallet, cache) = replay_cache(account, network, &cache_path);
 
     // Next subaddress index to issue, resumed from disk (min 1; 0 is the main
-    // address).
+    // address). Read *before* the wallet is built, because everything already
+    // issued has to be registered before the first scan.
     let subaddr_path = format!("{wallet_path}.subaddr");
     let next_subaddress = std::fs::read_to_string(&subaddr_path)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(1)
         .max(1);
+
+    // `Wallet::new` pre-derives a lookahead window on account 0. This daemon
+    // issues sequentially, so once it has handed out more than that window it
+    // was scanning without the keys for the newest ones registered — and
+    // reported no funds for addresses it had itself given out. Resuming the
+    // counter alone was never enough.
+    let issued: Vec<(u32, u32)> = (0..next_subaddress).map(|i| (0, i)).collect();
+    let (chain, wallet, cache) = replay_cache(account, network, &cache_path, &issued);
 
     let app = Arc::new(Mutex::new(App {
         chain,

@@ -370,13 +370,14 @@ pub fn load_synced_wallet(
     account: Account,
     network: Network,
     cache_path: impl Into<PathBuf>,
+    issued: &[(u32, u32)],
 ) -> Result<(Blockchain<TrustedPow>, Wallet, u64), String> {
     let cache = BlockCache::new(cache_path);
-    match build_synced(client, account, network, &cache, true) {
+    match build_synced(client, account, network, &cache, true, issued) {
         Ok(result) => Ok(result),
         Err(_) => {
             cache.clear();
-            build_synced(client, account, network, &cache, false)
+            build_synced(client, account, network, &cache, false, issued)
         }
     }
 }
@@ -391,11 +392,13 @@ pub fn replay_cache(
     account: Account,
     network: Network,
     cache_path: impl Into<PathBuf>,
+    issued: &[(u32, u32)],
 ) -> (Blockchain<TrustedPow>, Wallet, BlockCache) {
     let cache = BlockCache::new(cache_path);
     let genesis = |chain: &mut Blockchain<TrustedPow>, wallet: &mut Wallet| {
         *chain = Blockchain::for_network(network, TrustedPow);
         *wallet = Wallet::new(account, network);
+        wallet.register_issued(issued.iter().copied());
         wallet.scan_block(&Block::genesis_for(network.params()), &[]);
     };
     let mut chain = Blockchain::for_network(network, TrustedPow);
@@ -419,9 +422,14 @@ fn build_synced(
     network: Network,
     cache: &BlockCache,
     use_cache: bool,
+    issued: &[(u32, u32)],
 ) -> Result<(Blockchain<TrustedPow>, Wallet, u64), String> {
     let mut chain = Blockchain::for_network(network, TrustedPow);
     let mut wallet = Wallet::new(account, network);
+    // Before anything is scanned: a subaddress outside the lookahead window is
+    // only known to whatever issued it, and a scan without its keys registered
+    // silently reports no funds.
+    wallet.register_issued(issued.iter().copied());
     let mut rng = rand_core::OsRng;
     // Genesis first, so global-index assignment lines up before any cached or
     // downloaded block is scanned.

@@ -667,10 +667,27 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
    The premine keys are likewise **not** placeholders: they are real, published,
    and pinned by a test that fails the build if the founder keys change without
    every published copy being updated.
-5. **OPEN — wallet state is not persisted.** Subaddress lookahead is bounded
-   (account 0, indices < 200, no persisted counter beyond the daemon's issue
-   file) and the CLI re-scans from genesis on every command. Both are workable at
-   testnet length and neither is at mainnet length.
+5. **PARTLY CLOSED — wallet state.**
+   * **Issued subaddresses are now remembered.** `Wallet::new` pre-derives a
+     lookahead window of `SUBADDRESS_LOOKAHEAD` (200) on account 0 and nothing
+     else, so anything outside it was known only to the wallet that issued it.
+     A wallet rebuilt from the seed scanned without those keys registered and
+     reported **no funds** for an address it had itself handed out — the daemon
+     past index 200, and the CLI for any `--account`/`--index` outside the
+     window. The seed still derives the money, but a wallet that cannot see
+     funds cannot spend them, which from outside is the same as losing them.
+     The CLI records issued pairs beside the key file, the daemon re-registers
+     everything up to its resumed counter, and both hand them to
+     `Wallet::register_issued` before the first scan. A test pins the failure
+     and the recovery.
+   * **OPEN — scan state is still not persisted.** The block *cache* means a
+     command no longer re-downloads the chain (an earlier draft of this section
+     claimed it did; that had not been true for some time), but the wallet still
+     re-derives every cached block on each run. That is O(chain) local work per
+     command: fine at testnet length, not at mainnet length. Persisting the
+     scanned state — owned outputs, spent flags, the subaddress map — is the
+     remaining half, and it needs care around reorgs: the wallet currently gets
+     its reorg safety from rebuilding, which persisted state would remove.
 6. **OPEN by decision — deep-partition resync.** A node that diverges by more
    than `MAX_REORG_DEPTH` cannot rejoin by reorganising and must be resynced.
    Automatic recovery was considered and rejected: a node that discarded its
