@@ -1,0 +1,59 @@
+name: fuzz
+
+# The cargo-fuzz targets were written but had never been executed: libFuzzer
+# needs a nightly toolchain, and the machine they were written on had none.
+# Targets that never run are not coverage, so they run here instead — a short
+# bounded pass on every push, which catches the crash that is reachable from the
+# seed corpus rather than pretending to be an exhaustive campaign.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: seconds to run each target
+        default: "60"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: noct
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly and cargo-fuzz
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --profile minimal
+          rustup component add --toolchain nightly rust-src
+          cargo install cargo-fuzz --locked
+
+      - name: Fuzz the wire decoders
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '60' }}
+        run: |
+          set -euo pipefail
+          for target in wire_decode wire_roundtrip; do
+            echo "::group::$target"
+            # -max_total_time bounds the run; a crash exits non-zero and fails
+            # the job, leaving the reproducer in fuzz/artifacts/.
+            cargo +nightly fuzz run "$target" -- \
+              -max_total_time="${SECONDS_PER_TARGET}" -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+      - name: Keep any crash reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: noct/fuzz/artifacts/
+          if-no-files-found: ignore
