@@ -24,7 +24,7 @@ use noct_core::block::Block;
 use noct_core::chain::{Blockchain, OutputSet};
 use noct_core::keys::Account;
 use noct_core::pow::ProofOfWork;
-use noct_core::ring::{KeyImage, RingMember};
+use noct_core::ring::KeyImage;
 use noct_core::stealth::TxKeypair;
 use noct_core::subaddress::{self, SubaddressIndex};
 use noct_core::tx::{InputSecret, Payment, ReceivedOutput, Transaction, TxError};
@@ -36,6 +36,7 @@ pub const SUBADDRESS_LOOKAHEAD: u32 = 200;
 
 pub mod client;
 pub mod joint;
+pub mod outputs;
 pub mod mnemonic;
 
 /// The ring size every transaction uses: 1 real member + N−1 decoys.
@@ -327,12 +328,6 @@ impl Wallet {
     /// amount actually spendable right now.
     pub fn balance(&self) -> u64 {
         self.unspent().map(OwnedOutput::amount).sum()
-    }
-
-    /// The ring member `[P, C]` for an owned output (its entry in the chain's
-    /// output set).
-    fn owned_member(owned: &OwnedOutput) -> RingMember {
-        RingMember::new(owned.output.one_time_key, owned.output.opening.commit())
     }
 
     /// Balance that can be spent against `chain` right now — excludes coinbase
