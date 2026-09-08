@@ -767,20 +767,82 @@ impl<P: ProofOfWork> Blockchain<P> {
         tx.verify(rng).map_err(ChainError::InvalidTx)?;
         Ok(())
     }
+}
 
-    // --- decoy selection -------------------------------------------------
+/// The view of the output set that decoy selection needs.
+///
+/// Ring selection is privacy-critical, and it must exist in exactly one place.
+/// A node holds the whole chain; a wallet holds only the output set and never
+/// the block bodies — but both can answer the questions below, so both get the
+/// *same* selector. A second implementation is how a wallet quietly ends up
+/// drawing decoys from a different distribution than the one that was analysed,
+/// and nothing about the transaction it produces would look wrong.
+pub trait OutputSet {
+    /// How many outputs exist.
+    fn output_count(&self) -> u64;
+
+    /// Height of the tip, which is what maturity is measured against.
+    fn tip_height(&self) -> u64;
+
+    /// Blocks a coinbase output must age before it may be referenced.
+    fn coinbase_maturity(&self) -> u64;
+
+    /// The ring member at a global index.
+    ///
+    /// Returned **by value**, not by reference, so an implementation is free to
+    /// keep the set compressed and decompress on demand. That is what lets a
+    /// wallet hold the set at all: a point is 32 bytes on the wire against 160
+    /// decompressed, and only the members actually chosen for a ring — sixteen
+    /// of them — ever need decompressing.
+    fn member_at(&self, index: u64) -> Option<RingMember>;
+
+    /// Height of the block that created this output, and whether it is coinbase.
+    fn meta_at(&self, index: u64) -> Option<(u64, bool)>;
+
+    /// May the output at `index` be referenced by a transaction at `at_height`?
+    fn spendable_at(&self, index: u64, at_height: u64) -> bool {
+        match self.meta_at(index) {
+            Some((height, true)) => at_height >= height.saturating_add(self.coinbase_maturity()),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// As [`Self::spendable_at`], at the current tip.
+    fn spendable_now(&self, index: u64) -> bool {
+        self.spendable_at(index, self.tip_height())
+    }
+
+    /// `partition_point` over output heights, which are non-decreasing in index
+    /// because outputs are appended in block order. Written as an explicit
+    /// binary search rather than a slice method so it also serves an
+    /// implementation that has no slice to hand.
+    fn partition_point_by_height(&self, pred: &dyn Fn(u64) -> bool) -> usize {
+        let (mut lo, mut hi) = (0usize, self.output_count() as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.meta_at(mid as u64) {
+                Some((h, _)) if pred(h) => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        lo
+    }
 
     /// Select a ring of `ring_size` members for the real output at
-    /// `real_index`, choosing decoys **uniformly** from the output set. Returns
-    /// the ring (real member placed at the returned signer index) and that index.
+    /// `real_index`, choosing decoys **uniformly**. Returns the ring (real
+    /// member at the returned signer index) and that index.
     ///
     /// `None` if the set is too small for the requested ring size.
-    pub fn select_ring_uniform<R: rand_core::RngCore + rand_core::CryptoRng>(
+    fn select_ring_uniform<R: rand_core::RngCore + rand_core::CryptoRng>(
         &self,
         rng: &mut R,
         ring_size: usize,
         real_index: u64,
-    ) -> Option<(Vec<RingMember>, usize)> {
+    ) -> Option<(Vec<RingMember>, usize)>
+    where
+        Self: Sized,
+    {
         self.assemble_ring(rng, ring_size, real_index, |rng, n| {
             (rng.next_u64() % n as u64) as usize
         })
@@ -789,15 +851,17 @@ impl<P: ProofOfWork> Blockchain<P> {
     /// Like [`Self::select_ring_uniform`] but biased toward **recent** outputs
     /// via a gamma-shaped age distribution (a simplification of Monero's
     /// output-time gamma; see the module note).
-    pub fn select_ring_recency_biased<R: rand_core::RngCore + rand_core::CryptoRng>(
+    fn select_ring_recency_biased<R: rand_core::RngCore + rand_core::CryptoRng>(
         &self,
         rng: &mut R,
         ring_size: usize,
         real_index: u64,
-    ) -> Option<(Vec<RingMember>, usize)> {
-        let height = self.height();
-        let meta = &self.output_meta;
-        self.assemble_ring(rng, ring_size, real_index, move |rng, n| {
+    ) -> Option<(Vec<RingMember>, usize)>
+    where
+        Self: Sized,
+    {
+        let height = self.tip_height();
+        self.assemble_ring(rng, ring_size, real_index, |rng, n| {
             // Sample log(age in seconds), exponentiate to an age, and convert
             // that to a block height. Mapping through *height* rather than
             // straight to an index matters: outputs are not spread evenly over
@@ -822,7 +886,7 @@ impl<P: ProofOfWork> Blockchain<P> {
 
             // First output at or after that height. Heights are non-decreasing
             // in index, so this is a binary search.
-            let lo = meta.partition_point(|m| m.height < target_height);
+            let lo = self.partition_point_by_height(&|h| h < target_height);
             if lo >= n {
                 // Age fell inside the newest block: take from the tip.
                 return n - 1;
@@ -830,7 +894,11 @@ impl<P: ProofOfWork> Blockchain<P> {
             // Outputs sharing that height are interchangeable in age, so pick
             // among them uniformly rather than always taking the first — which
             // would make the earliest output in a block a permanent favourite.
-            let hi = meta.partition_point(|m| m.height <= meta[lo].height).min(n);
+            let lo_height = match self.meta_at(lo as u64) {
+                Some((h, _)) => h,
+                None => return n - 1,
+            };
+            let hi = self.partition_point_by_height(&|h| h <= lo_height).min(n);
             if hi > lo + 1 {
                 lo + (rng.next_u64() as usize) % (hi - lo)
             } else {
@@ -839,20 +907,23 @@ impl<P: ProofOfWork> Blockchain<P> {
         })
     }
 
-    // Shared ring assembly: draw distinct decoy indices via `pick`, place the
-    // real member at a random position.
+    /// Shared ring assembly: draw distinct decoy indices via `pick`, place the
+    /// real member at a random position.
     fn assemble_ring<R: rand_core::RngCore + rand_core::CryptoRng>(
         &self,
         rng: &mut R,
         ring_size: usize,
         real_index: u64,
         mut pick: impl FnMut(&mut R, usize) -> usize,
-    ) -> Option<(Vec<RingMember>, usize)> {
-        let n = self.outputs.len();
+    ) -> Option<(Vec<RingMember>, usize)>
+    where
+        Self: Sized,
+    {
+        let n = self.output_count() as usize;
         if ring_size == 0 || ring_size > n {
             return None;
         }
-        let real = self.output(real_index)?;
+        let real = self.member_at(real_index)?;
 
         // Only outputs a transaction may legally reference are eligible decoys:
         // an immature coinbase would make the ring invalid under the
@@ -864,17 +935,20 @@ impl<P: ProofOfWork> Blockchain<P> {
         // is spendable outright, and only that suffix (at most `maturity`
         // blocks' worth of outputs) needs examining. Scanning the whole output
         // set here instead would make every ring assembly cost O(chain size).
-        let height = self.height();
-        let cutoff = height.saturating_sub(self.maturity);
-        let mature_boundary = self.output_meta.partition_point(|m| m.height <= cutoff);
+        let height = self.tip_height();
+        let cutoff = height.saturating_sub(self.coinbase_maturity());
+        let mature_boundary = self.partition_point_by_height(&|h| h <= cutoff);
         debug_assert!(
-            self.output_meta.windows(2).all(|w| w[0].height <= w[1].height),
+            (1..n).all(|i| {
+                self.meta_at(i as u64 - 1).map(|m| m.0) <= self.meta_at(i as u64).map(|m| m.0)
+            }),
             "output heights must be non-decreasing for the suffix bound to hold"
         );
         // Spendable = the whole mature prefix, plus non-coinbase outputs in the
         // recent suffix.
-        let recent_spendable: Vec<usize> =
-            (mature_boundary..n).filter(|&i| !self.output_meta[i].coinbase).collect();
+        let recent_spendable: Vec<usize> = (mature_boundary..n)
+            .filter(|&i| !self.meta_at(i as u64).map(|m| m.1).unwrap_or(true))
+            .collect();
         let spendable_count = mature_boundary + recent_spendable.len();
         if spendable_count < ring_size {
             return None;
@@ -887,7 +961,7 @@ impl<P: ProofOfWork> Blockchain<P> {
         let mut attempts = 0usize;
         while chosen.len() < ring_size {
             let idx = pick(rng, n);
-            if self.output_spendable_at(idx as u64, height) {
+            if self.spendable_at(idx as u64, height) {
                 chosen.insert(idx);
             }
             attempts += 1;
@@ -911,10 +985,28 @@ impl<P: ProofOfWork> Blockchain<P> {
             if pos == signer_index {
                 ring.push(real);
             } else {
-                ring.push(self.outputs[d.next().unwrap()]);
+                ring.push(self.member_at(d.next().unwrap() as u64)?);
             }
         }
         Some((ring, signer_index))
+    }
+}
+
+impl<P: ProofOfWork> OutputSet for Blockchain<P> {
+    fn output_count(&self) -> u64 {
+        self.outputs.len() as u64
+    }
+    fn tip_height(&self) -> u64 {
+        self.height()
+    }
+    fn coinbase_maturity(&self) -> u64 {
+        self.maturity
+    }
+    fn member_at(&self, index: u64) -> Option<RingMember> {
+        self.outputs.get(usize::try_from(index).ok()?).copied()
+    }
+    fn meta_at(&self, index: u64) -> Option<(u64, bool)> {
+        self.output_meta.get(usize::try_from(index).ok()?).map(|m| (m.height, m.coinbase))
     }
 }
 

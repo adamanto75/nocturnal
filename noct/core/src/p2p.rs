@@ -353,7 +353,7 @@ mod tests {
     use super::*;
     use crate::address::{Address, Network as Net};
     use crate::block::{Block, BlockHeader, Coinbase};
-    use crate::chain::Blockchain;
+    use crate::chain::{Blockchain, OutputSet};
     use crate::emission::{base_reward, ATOMIC_UNITS};
     use crate::keys::Account;
     use crate::pow::KeccakPow;

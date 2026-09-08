@@ -219,6 +219,7 @@ impl Mempool {
 mod tests {
     use super::*;
     use crate::address::{Address, Network};
+    use crate::chain::OutputSet;
     use crate::amounts::Opening;
     use crate::block::{Block, BlockHeader, Coinbase};
     use crate::emission::{base_reward, ATOMIC_UNITS};

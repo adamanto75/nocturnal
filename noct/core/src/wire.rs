@@ -480,7 +480,7 @@ mod tests {
     use crate::address::{Address, Network};
     use crate::amounts::Opening;
     use crate::block::{BlockHeader, Coinbase};
-    use crate::chain::Blockchain;
+    use crate::chain::{Blockchain, OutputSet};
     use crate::emission::{base_reward, ATOMIC_UNITS};
     use crate::keys::{Account, PrivateKey};
     use crate::pow::KeccakPow;

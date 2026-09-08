@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use curve25519_dalek::scalar::Scalar;
 use noct_core::address::{Address, Network};
 use noct_core::block::Block;
-use noct_core::chain::Blockchain;
+use noct_core::chain::{Blockchain, OutputSet};
 use noct_core::keys::Account;
 use noct_core::pow::ProofOfWork;
 use noct_core::ring::{KeyImage, RingMember};
@@ -339,7 +339,11 @@ impl Wallet {
     /// outputs still within the maturity window.
     pub fn spendable_balance<P: ProofOfWork>(&self, chain: &Blockchain<P>) -> u64 {
         self.unspent()
-            .filter(|o| chain.is_spendable(&Self::owned_member(o)))
+            // By index, not by looking the member up in a membership map: the
+            // wallet already knows where its own outputs sit, and asking by
+            // index is what lets this work against a store that keeps only the
+            // output set rather than the whole chain.
+            .filter(|o| chain.spendable_now(o.global_index))
             .map(OwnedOutput::amount)
             .sum()
     }
@@ -373,7 +377,7 @@ impl Wallet {
             if in_total >= out_total {
                 break;
             }
-            if !chain.is_spendable(&Self::owned_member(owned)) {
+            if !chain.spendable_now(owned.global_index) {
                 continue;
             }
             in_total = in_total.checked_add(owned.amount()).ok_or(WalletError::Overflow)?;
