@@ -21,8 +21,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -77,21 +79,145 @@ const DIAL_BACKOFF_MAX_SHIFT: u32 = 10;
 /// write-off would be its own kind of forgetting.
 const DIAL_BACKOFF_CAP_SECS: u64 = 1800;
 
-/// A per-peer writer; the mutex serializes all sends to that socket.
-type PeerWriter = Arc<Mutex<TcpStream>>;
+/// Backlog we will carry for one peer before giving up on it.
+///
+/// This is the whole defence against a peer that stops reading: its queue is
+/// its own, and when the queue is full the peer is dropped rather than the
+/// sender being made to wait.
+///
+/// Sized small on purpose. Inbound connections are not capped, so the real
+/// bound is this times however many peers an attacker cares to open — and a
+/// generous per-peer allowance would trade the stall this fixes for a memory
+/// exhaustion that is worse. A megabyte is ~170 blocks at current sizes: ample
+/// slack for a healthy peer, and a peer further behind than that on its own
+/// socket is not one worth keeping.
+const MAX_QUEUED_BYTES: usize = 1024 * 1024;
 
-/// Send a message to a peer, taking its write mutex. Best effort.
-fn send_via(writer: &PeerWriter, msg: &Wire) {
-    if let Ok(mut s) = writer.lock() {
-        let _ = send_message(&mut s, msg);
+/// Longest a peer's own writer thread will wait on a single socket write.
+///
+/// Belt and braces: the queue already means a stalled write blocks nobody else,
+/// but without this the writer thread itself would sit in `write_all` until the
+/// kernel's TCP retransmission timeout — which is what turned one silent peer
+/// into a ~15-minute network outage on the testnet.
+const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One peer's outbound queue, drained by that peer's own writer thread.
+///
+/// **Nothing that sends to a peer ever touches its socket.** That is the point.
+/// Sends used to be blocking `write_all`s made directly from whichever thread
+/// happened to be relaying — in practice a *different* peer's reader thread —
+/// with no write timeout. A peer that completed the handshake and then simply
+/// stopped reading filled its receive window, the next broadcast blocked in
+/// `write_all` forever, and the reader thread that made the call stopped
+/// reading its own peer. Worse, `send` takes the target's lock before writing,
+/// so every other reader thread piled up behind the stuck one: one silent peer,
+/// sending nothing and costing nothing, halted the node's entire p2p until the
+/// kernel gave up on the socket ~15 minutes later. Observed live, not theorised.
+///
+/// Nothing scored misbehaviour for it either — the peer was perfectly
+/// well-behaved by every check the node had. So the fix has to be structural:
+/// a slow peer must cost only its own queue.
+struct PeerLink {
+    tx: Sender<Arc<Vec<u8>>>,
+    /// Bytes currently queued. Bounding *bytes* rather than message count is
+    /// deliberate: messages run to [`MAX_MESSAGE_BYTES`], so a depth-based
+    /// bound would be a memory bound in name only.
+    queued: Arc<AtomicUsize>,
+    /// A clone of the socket, kept solely to force the connection closed. The
+    /// shutdown also wakes the reader thread out of its blocking read, so the
+    /// existing cleanup path runs and the peer leaves the registry.
+    sock: TcpStream,
+}
+
+impl PeerLink {
+    /// Take ownership of a connection's send side: spawn its writer thread and
+    /// return a handle to its queue.
+    fn spawn(sock: TcpStream) -> io::Result<PeerWriter> {
+        let _ = sock.set_write_timeout(Some(PEER_WRITE_TIMEOUT));
+        let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let link = Arc::new(PeerLink { tx, queued: Arc::clone(&queued), sock: sock.try_clone()? });
+        thread::spawn(move || drain_to_socket(rx, sock, queued));
+        Ok(link)
+    }
+
+    /// Queue a pre-encoded frame. Never blocks.
+    fn enqueue(&self, frame: Arc<Vec<u8>>) {
+        let len = frame.len();
+        // Reserve the space atomically, so concurrent senders cannot each pass
+        // the check and jointly overshoot the cap.
+        //
+        // The test is on the backlog *already* queued, not on what it would
+        // become: a message is never refused for its own size. Otherwise a peer
+        // would be disconnected over something we chose to send it — a large
+        // block arriving on a peer with a little backlog — which is our fault,
+        // not misbehaviour on its part. The cost is that the true ceiling is
+        // this cap plus one message.
+        let reserved = self.queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+            (q <= MAX_QUEUED_BYTES).then_some(q + len)
+        });
+        if reserved.is_err() {
+            // The peer is not draining what we have already given it. Dropping
+            // it is the correct outcome, not a failure: an unbounded queue here
+            // would just move the denial of service from time to memory.
+            self.close();
+            return;
+        }
+        if self.tx.send(frame).is_err() {
+            // Writer thread is gone; the connection is finished either way.
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+        }
+    }
+
+    /// Force the connection shut. Idempotent, and safe to call from any thread.
+    fn close(&self) {
+        let _ = self.sock.shutdown(Shutdown::Both);
+    }
+
+    #[cfg(test)]
+    fn queued_bytes(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
     }
 }
 
-/// Send a length-prefixed wire message.
-pub fn send_message(stream: &mut TcpStream, msg: &Wire) -> io::Result<()> {
+/// A handle to one peer's outbound queue.
+type PeerWriter = Arc<PeerLink>;
+
+/// One peer's writer thread: the only place a peer's socket is ever written to.
+fn drain_to_socket(rx: Receiver<Arc<Vec<u8>>>, mut sock: TcpStream, queued: Arc<AtomicUsize>) {
+    while let Ok(frame) = rx.recv() {
+        queued.fetch_sub(frame.len(), Ordering::AcqRel);
+        // A timed-out `write_all` may have written part of a frame, which
+        // leaves the stream desynchronised — so any error ends the connection
+        // rather than being retried or skipped past.
+        if sock.write_all(&frame).is_err() || sock.flush().is_err() {
+            let _ = sock.shutdown(Shutdown::Both);
+            return;
+        }
+    }
+}
+
+/// Queue a message for a peer. Best effort, and never blocks the caller.
+fn send_via(writer: &PeerWriter, msg: &Wire) {
+    writer.enqueue(Arc::new(encode_frame(msg)));
+}
+
+/// Encode a message with its length prefix, ready to go on the wire.
+fn encode_frame(msg: &Wire) -> Vec<u8> {
     let bytes = wire::encode_message(msg);
-    stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    stream.write_all(&bytes)?;
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&bytes);
+    frame
+}
+
+/// Send a length-prefixed wire message, blocking until it is written.
+///
+/// Only for callers that own the socket outright — the handshake in tests, and
+/// tools speaking the protocol directly. Peer traffic goes through
+/// [`PeerLink`], which is what keeps one slow peer from stalling the node.
+pub fn send_message(stream: &mut TcpStream, msg: &Wire) -> io::Result<()> {
+    stream.write_all(&encode_frame(msg))?;
     stream.flush()
 }
 
@@ -147,11 +273,16 @@ impl Peers {
     }
 
     /// Flood a message to every peer (best effort). Snapshots the peer list so
-    /// the registry lock is not held during the network sends.
+    /// the registry lock is not held while queuing, and encodes once rather
+    /// than once per peer.
+    ///
+    /// Queuing cannot block, so — unlike the blocking version this replaced —
+    /// one unresponsive peer no longer stops the message reaching the others.
     pub fn flood(&self, msg: &Wire) {
+        let frame = Arc::new(encode_frame(msg));
         let writers: Vec<PeerWriter> = self.inner.lock().unwrap().values().cloned().collect();
         for w in &writers {
-            send_via(w, msg);
+            w.enqueue(Arc::clone(&frame));
         }
     }
 
@@ -810,7 +941,7 @@ pub fn register_connection(
         }
     }
     let peer_ip = socket_addr.map(|a| a.ip());
-    let writer: PeerWriter = Arc::new(Mutex::new(stream.try_clone()?));
+    let writer = PeerLink::spawn(stream.try_clone()?)?;
     let peer_id = peers.add(Arc::clone(&writer));
     spawn_peer_reader(stream, writer, peer_id, peer_ip, state.clone(), peers.clone(), disc.clone(), dialed);
     Ok(())
@@ -839,20 +970,13 @@ fn spawn_peer_reader(
             disc.mark_connected(a);
         }
 
-        // Handshake first, then kick off initial block download.
-        if let Ok(mut w) = writer.lock() {
-            if send_message(&mut w, &disc.version()).is_err()
-                || send_message(&mut w, &Wire::GetTip).is_err()
-            {
-                if let Some(a) = peer_listen {
-                    disc.unmark(&a);
-                }
-                // This connection never got going; it must still leave the
-                // registry, or it holds a socket for the life of the process.
-                peers.remove(peer_id);
-                return;
-            }
-        }
+        // Handshake first, then kick off initial block download. Both are
+        // queued, not written here: a peer that accepts a connection and then
+        // never reads must not be able to wedge the thread that greets it.
+        // If the socket is already dead the writer thread closes it, and the
+        // read below fails immediately — taking the normal cleanup path.
+        send_via(&writer, &disc.version());
+        send_via(&writer, &Wire::GetTip);
 
         // Per-connection rate limiting and misbehavior accumulation.
         let mut window = Instant::now();
@@ -939,10 +1063,7 @@ fn spawn_peer_reader(
                     continue;
                 }
                 Wire::GetPeers => {
-                    let reply = Wire::Peers(disc.share(peer_listen));
-                    if let Ok(mut w) = writer.lock() {
-                        let _ = send_message(&mut w, &reply);
-                    }
+                    send_via(&writer, &Wire::Peers(disc.share(peer_listen)));
                     continue;
                 }
                 Wire::Peers(addrs) => {
@@ -972,18 +1093,8 @@ fn spawn_peer_reader(
                 }
             }
 
-            if let Ok(mut w) = writer.lock() {
-                for m in &reaction.reply {
-                    if send_message(&mut w, m).is_err() {
-                        if let Some(a) = peer_listen {
-                            disc.unmark(&a);
-                        }
-                        if let Some(n) = peer_nonce {
-                            disc.release_nonce(n);
-                        }
-                        return;
-                    }
-                }
+            for m in &reaction.reply {
+                send_via(&writer, m);
             }
             for m in reaction.broadcast {
                 peers.flood(&m);
@@ -1331,6 +1442,118 @@ mod tests {
 }
 
 #[cfg(test)]
+mod slow_peer_tests {
+    use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    /// A connected peer that never reads a byte, plus the node-side link to it.
+    /// The returned `TcpStream` is the peer's own end, held open and ignored —
+    /// which is the entire attack.
+    fn silent_peer(listener: &TcpListener) -> (TcpStream, PeerWriter) {
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).unwrap();
+        let node_side = listener.accept().unwrap().0;
+        (peer, PeerLink::spawn(node_side).unwrap())
+    }
+
+    /// The largest message the decoder accepts, so a few hundred of them
+    /// exceed any socket buffer and the silent peer really does stop absorbing
+    /// writes. It has to stay decodable: the live peer asserts on the content.
+    fn bulky_message(addr: SocketAddr) -> Wire {
+        Wire::Peers(vec![addr; noct_core::wire::MAX_PEERS_PER_MESSAGE])
+    }
+
+    /// **The regression test for the p2p deadlock.**
+    ///
+    /// One peer that completes a connection and then stops reading must not
+    /// delay delivery to any other peer. Before the per-peer queues, the flood
+    /// wrote to each peer in turn with a blocking `write_all` and no write
+    /// timeout, so the silent peer's full receive window stopped the loop dead
+    /// and every peer after it — and the calling thread — waited on the
+    /// kernel's TCP retransmission timeout, about fifteen minutes.
+    ///
+    /// Verified to bite: with the sends put back to blocking `write_all` and
+    /// the write timeout removed, this fails on the completion check after the
+    /// full 60s. That check is what actually detects a regression — the
+    /// delivery check ahead of it is a weaker signal, since peers are flooded
+    /// in `HashMap` order and the live one may simply be written to first.
+    #[test]
+    fn a_silent_peer_cannot_stall_delivery_to_the_others() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (_silent_peer, silent_link) = silent_peer(&listener);
+        let (mut live_peer, live_link) = silent_peer(&listener);
+
+        let peers = Peers::new();
+        peers.add(silent_link);
+        peers.add(live_link);
+
+        // Enough traffic that the silent peer's socket buffer is long full.
+        const ROUNDS: usize = 400;
+        let (done_tx, done_rx) = mpsc::channel();
+        let flooder = thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                peers.flood(&bulky_message(addr));
+            }
+            let _ = done_tx.send(());
+        });
+
+        // The live peer must still get its messages. Read one full frame; that
+        // is enough to prove traffic flowed past the silent peer.
+        let mut len_buf = [0u8; 4];
+        live_peer.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        live_peer
+            .read_exact(&mut len_buf)
+            .expect("live peer received nothing — a silent peer is blocking the flood");
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        live_peer.read_exact(&mut body).expect("live peer got a truncated frame");
+        assert_eq!(
+            wire::decode_message(&body).map(|m| matches!(m, Wire::Peers(_))),
+            Ok(true)
+        );
+
+        // And the flood itself must have finished rather than parked on the
+        // silent peer. 60s is not a performance bound; it is "not fifteen
+        // minutes", generous enough never to be flaky on a loaded machine.
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("flood never finished — a silent peer stalled the sender")
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("flood thread died"),
+        }
+        flooder.join().unwrap();
+    }
+
+    /// The queue is a bound, not a buffer. A peer that never drains must not
+    /// let us accumulate without limit — otherwise the fix would trade a
+    /// denial of service in time for one in memory, which an attacker would
+    /// happily take.
+    #[test]
+    fn a_silent_peers_queue_stays_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_silent_peer, link) = silent_peer(&listener);
+
+        let frame = Arc::new(encode_frame(&bulky_message(addr)));
+        // The ceiling is the cap plus one message, since a message is never
+        // refused for its own size.
+        let ceiling = MAX_QUEUED_BYTES + frame.len();
+        // Far more than that, if it admitted anything unbounded.
+        for _ in 0..(MAX_QUEUED_BYTES / frame.len()) * 8 {
+            link.enqueue(Arc::clone(&frame));
+            assert!(
+                link.queued_bytes() <= ceiling,
+                "queued {} bytes, over the {ceiling}-byte ceiling",
+                link.queued_bytes()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod registry_tests {
     use super::*;
 
@@ -1340,7 +1563,7 @@ mod registry_tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr).unwrap();
-        Arc::new(Mutex::new(client))
+        PeerLink::spawn(client).unwrap()
     }
 
     /// A dropped connection must leave the registry.
