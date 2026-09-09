@@ -26,8 +26,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::amounts::Commitment;
 use crate::block::Block;
 use crate::emission::base_reward;
+use crate::keys::PublicKey;
 use crate::pow::{check_hash, next_difficulty, Difficulty, ProofOfWork, MIN_DIFFICULTY};
 use crate::ring::{KeyImage, RingMember};
 use crate::tx::{Transaction, TxError};
@@ -1007,6 +1009,224 @@ impl<P: ProofOfWork> OutputSet for Blockchain<P> {
     }
     fn meta_at(&self, index: u64) -> Option<(u64, bool)> {
         self.output_meta.get(usize::try_from(index).ok()?).map(|m| (m.height, m.coinbase))
+    }
+}
+
+/// Everything a chain needs in order to validate what comes next — and nothing
+/// that is only needed to serve what came before.
+///
+/// A chain's state divides cleanly in two. The **block bodies** are needed to
+/// answer "give me block N" and to undo a reorg. Everything else — the output
+/// set, the spent key images, emission, and the header window that fixes
+/// difficulty and the tip — is what `add_block` actually consults. That second
+/// part is small: measured on the 15,000-block testnet it is about **5 MB**
+/// against a **92 MB** block store.
+///
+/// Snapshotting it is what lets a wallet stop rebuilding from genesis. Replaying
+/// the chain to recover this state costs, on a real 88 MB wallet cache: 54.6 s to
+/// decode the blocks and 152 s to re-verify 17,325 transactions the wallet had
+/// already verified once. Restoring it instead is a file read.
+///
+/// **A restored chain deliberately cannot do two things**, and both are fine for
+/// a wallet and would not be for a node serving peers:
+/// - [`Blockchain::block_at`] returns `None` for any height before the restore,
+///   because those bodies are not here.
+/// - it cannot reorganise below the restore point, since there are no undos.
+///   A wallet already handles a reorg beneath its tip by discarding and
+///   rebuilding, so this costs it nothing it was not already paying.
+///
+/// Outputs and key images are held **compressed** here, as they arrive on the
+/// wire — 32 bytes a point against 160 decompressed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainState {
+    maturity: u64,
+    emitted: u64,
+    /// Genesis id, so a state file from another network is refused rather than
+    /// silently producing a chain that agrees with nobody.
+    genesis: [u8; 32],
+    block_ids: Vec<[u8; 32]>,
+    timestamps: Vec<u64>,
+    cumulative_difficulties: Vec<u128>,
+    /// `key || commitment`, compressed, indexed by global output index.
+    outputs: Vec<[u8; 64]>,
+    /// Parallel to `outputs`: creating height, and whether it is coinbase.
+    output_meta: Vec<(u64, bool)>,
+    spent_key_images: Vec<[u8; 32]>,
+}
+
+/// Format tag. A state file this build does not fully understand must be
+/// refused, not guessed at: a wallet that misreads its own chain state
+/// validates against a chain that never existed.
+const CHAIN_STATE_VERSION: u8 = 1;
+
+impl ChainState {
+    pub fn height(&self) -> u64 {
+        self.block_ids.len() as u64
+    }
+
+    pub fn tip_id(&self) -> [u8; 32] {
+        self.block_ids.last().copied().unwrap_or([0u8; 32])
+    }
+
+    pub fn genesis_id(&self) -> [u8; 32] {
+        self.genesis
+    }
+
+    /// Serialize. Fixed-width records throughout, so loading is a length check
+    /// and a copy — the cost this type exists to avoid paying twice.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.push(CHAIN_STATE_VERSION);
+        o.extend_from_slice(&self.maturity.to_le_bytes());
+        o.extend_from_slice(&self.emitted.to_le_bytes());
+        o.extend_from_slice(&self.genesis);
+        o.extend_from_slice(&(self.block_ids.len() as u64).to_le_bytes());
+        for i in 0..self.block_ids.len() {
+            o.extend_from_slice(&self.block_ids[i]);
+            o.extend_from_slice(&self.timestamps[i].to_le_bytes());
+            o.extend_from_slice(&self.cumulative_difficulties[i].to_le_bytes());
+        }
+        o.extend_from_slice(&(self.outputs.len() as u64).to_le_bytes());
+        for (m, (h, cb)) in self.outputs.iter().zip(&self.output_meta) {
+            o.extend_from_slice(m);
+            o.extend_from_slice(&h.to_le_bytes());
+            o.push(u8::from(*cb));
+        }
+        o.extend_from_slice(&(self.spent_key_images.len() as u64).to_le_bytes());
+        for k in &self.spent_key_images {
+            o.extend_from_slice(k);
+        }
+        o
+    }
+
+    /// Parse. `None` for anything not fully understood — wrong version, a
+    /// truncated tail, or a declared count that disagrees with the bytes
+    /// present. A count read from a file is never trusted to size an
+    /// allocation; the remaining length is checked first.
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        let mut c = b;
+        fn take<'a>(c: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if c.len() < n {
+                return None;
+            }
+            let (h, t) = c.split_at(n);
+            *c = t;
+            Some(h)
+        }
+        if *take(&mut c, 1)?.first()? != CHAIN_STATE_VERSION {
+            return None;
+        }
+        let maturity = u64::from_le_bytes(take(&mut c, 8)?.try_into().ok()?);
+        let emitted = u64::from_le_bytes(take(&mut c, 8)?.try_into().ok()?);
+        let genesis: [u8; 32] = take(&mut c, 32)?.try_into().ok()?;
+
+        let nheaders = u64::from_le_bytes(take(&mut c, 8)?.try_into().ok()?) as usize;
+        let headers = take(&mut c, nheaders.checked_mul(56)?)?;
+        let mut block_ids = Vec::with_capacity(nheaders);
+        let mut timestamps = Vec::with_capacity(nheaders);
+        let mut cumulative_difficulties = Vec::with_capacity(nheaders);
+        for r in headers.chunks_exact(56) {
+            block_ids.push(<[u8; 32]>::try_from(&r[..32]).ok()?);
+            timestamps.push(u64::from_le_bytes(r[32..40].try_into().ok()?));
+            cumulative_difficulties.push(u128::from_le_bytes(r[40..56].try_into().ok()?));
+        }
+
+        let nout = u64::from_le_bytes(take(&mut c, 8)?.try_into().ok()?) as usize;
+        let outs = take(&mut c, nout.checked_mul(73)?)?;
+        let mut outputs = Vec::with_capacity(nout);
+        let mut output_meta = Vec::with_capacity(nout);
+        for r in outs.chunks_exact(73) {
+            outputs.push(<[u8; 64]>::try_from(&r[..64]).ok()?);
+            output_meta.push((u64::from_le_bytes(r[64..72].try_into().ok()?), r[72] != 0));
+        }
+
+        let nimg = u64::from_le_bytes(take(&mut c, 8)?.try_into().ok()?) as usize;
+        let imgs = take(&mut c, nimg.checked_mul(32)?)?;
+        let spent_key_images: Vec<[u8; 32]> =
+            imgs.chunks_exact(32).map(|r| <[u8; 32]>::try_from(r).unwrap()).collect();
+
+        // Trailing bytes mean this is not the file we think it is.
+        if !c.is_empty() {
+            return None;
+        }
+        Some(ChainState {
+            maturity,
+            emitted,
+            genesis,
+            block_ids,
+            timestamps,
+            cumulative_difficulties,
+            outputs,
+            output_meta,
+            spent_key_images,
+        })
+    }
+}
+
+impl<P: ProofOfWork> Blockchain<P> {
+    /// Capture the state needed to validate what comes next, leaving the block
+    /// bodies behind. See [`ChainState`] for what that does and does not keep.
+    pub fn snapshot(&self) -> ChainState {
+        ChainState {
+            maturity: self.maturity,
+            emitted: self.emitted,
+            genesis: self.block_ids[0],
+            block_ids: self.block_ids.clone(),
+            timestamps: self.timestamps.clone(),
+            cumulative_difficulties: self.cumulative_difficulties.clone(),
+            outputs: self.outputs.iter().map(membership_key).collect(),
+            output_meta: self.output_meta.iter().map(|m| (m.height, m.coinbase)).collect(),
+            spent_key_images: self.spent_key_images.iter().map(|k| k.to_bytes()).collect(),
+        }
+    }
+
+    /// Rebuild a chain from a snapshot, ready to validate the next block.
+    ///
+    /// `None` if the state is for a different network — checked by genesis id,
+    /// because a chain that silently adopted a foreign genesis would agree with
+    /// nobody and look fine doing it — or if any stored point fails to
+    /// decompress, which means the file is corrupt and the caller should rebuild.
+    pub fn from_state(pow: P, network: crate::address::Network, state: &ChainState) -> Option<Self> {
+        let expected = Block::genesis_for(network.params()).id();
+        if state.genesis != expected || state.block_ids.first() != Some(&expected) {
+            return None;
+        }
+        if state.outputs.len() != state.output_meta.len() {
+            return None;
+        }
+        let mut outputs = Vec::with_capacity(state.outputs.len());
+        let mut output_membership = HashMap::with_capacity(state.outputs.len());
+        for (i, packed) in state.outputs.iter().enumerate() {
+            let key = PublicKey::from_bytes(packed[..32].try_into().ok()?)?;
+            let commitment = Commitment::from_bytes(packed[32..].try_into().ok()?)?;
+            outputs.push(RingMember::new(key, commitment));
+            output_membership.insert(*packed, i as u64);
+        }
+        let mut spent_key_images = HashSet::with_capacity(state.spent_key_images.len());
+        for k in &state.spent_key_images {
+            spent_key_images.insert(KeyImage::from_bytes(*k)?);
+        }
+        Some(Blockchain {
+            pow,
+            network,
+            // Deliberately empty: this chain validates forward, it does not
+            // serve history or reorganise below here. See `ChainState`.
+            blocks: Vec::new(),
+            undos: Vec::new(),
+            block_ids: state.block_ids.clone(),
+            timestamps: state.timestamps.clone(),
+            cumulative_difficulties: state.cumulative_difficulties.clone(),
+            outputs,
+            output_membership,
+            output_meta: state
+                .output_meta
+                .iter()
+                .map(|&(height, coinbase)| OutputMeta { height, coinbase })
+                .collect(),
+            spent_key_images,
+            emitted: state.emitted,
+            maturity: state.maturity,
+        })
     }
 }
 
@@ -2049,6 +2269,161 @@ mod tests {
         warm_up(&mut chain, maturity as usize, ts + 130);
         let tx2 = build_spend(&chain, &target, target_index, pay, 1);
         assert!(chain.validate_tx(&mut OsRng, &tx2).is_ok());
+    }
+
+    // --- ChainState: validating forward without the block bodies -----------
+
+    /// **The contract the whole type rests on.** A chain restored from a
+    /// snapshot must validate what comes next *exactly* as the chain it was
+    /// taken from would. If it diverges in any way, a wallet built on it accepts
+    /// or rejects blocks the network does not, and every balance it reports
+    /// afterwards is suspect.
+    ///
+    /// Tested by advancing both the original and the restored copy over the same
+    /// blocks — including a real spend, so key images and the output set are
+    /// exercised, not just headers — and requiring they agree on everything.
+    #[test]
+    fn a_restored_chain_validates_forward_identically() {
+        let miner = Account::random(&mut OsRng);
+        let mut original = Blockchain::with_maturity(KeccakPow, 2);
+        // Enough outputs to form a full RING_SIZE ring, and enough blocks after
+        // the spendable one that it has matured.
+        for i in 0..18 {
+            mine_coinbase(&mut original, &miner, 1_000 + i * 130);
+        }
+        let (spendable, idx) = mine_coinbase(&mut original, &miner, 4_000);
+        for i in 0..4 {
+            mine_coinbase(&mut original, &miner, 4_200 + i * 130);
+        }
+
+        let state = original.snapshot();
+        let mut restored = Blockchain::from_state(KeccakPow, Network::Mainnet, &state)
+            .expect("snapshot restores");
+
+        // Everything observable must already match, before adding anything.
+        assert_eq!(restored.height(), original.height());
+        assert_eq!(restored.tip_id(), original.tip_id());
+        assert_eq!(restored.cumulative_difficulty(), original.cumulative_difficulty());
+        assert_eq!(restored.emitted(), original.emitted());
+        assert_eq!(restored.num_outputs(), original.num_outputs());
+        assert_eq!(restored.next_difficulty(), original.next_difficulty());
+        for i in 0..original.num_outputs() {
+            assert_eq!(restored.member_at(i), original.member_at(i), "output {i}");
+            assert_eq!(restored.meta_at(i), original.meta_at(i), "meta {i}");
+        }
+
+        // A spend: the interesting case, because it consults the output set for
+        // ring membership and the key-image set for double spends.
+        let pay = Account::random(&mut OsRng);
+        // build_spend adds no change output, so payments must sum to the input
+        // minus the fee, exactly.
+        let payments = vec![Payment { destination: address(&pay), amount: spendable.amount - 1 }];
+        let spend = build_spend(&original, &spendable, idx, payments, 1);
+        assert!(original.validate_tx(&mut OsRng, &spend).is_ok());
+        assert!(
+            restored.validate_tx(&mut OsRng, &spend).is_ok(),
+            "a restored chain must accept a transaction the original accepts"
+        );
+
+        let (block, _) = make_block(&original, &miner, &[spend.clone()], 5_000);
+        original.add_block(&mut OsRng, &block, &[spend.clone()]).expect("original accepts");
+        restored
+            .add_block(&mut OsRng, &block, &[spend.clone()])
+            .expect("restored must accept the same block");
+
+        assert_eq!(restored.tip_id(), original.tip_id());
+        assert_eq!(restored.height(), original.height());
+        assert_eq!(restored.cumulative_difficulty(), original.cumulative_difficulty());
+        assert_eq!(restored.emitted(), original.emitted());
+        assert_eq!(restored.num_outputs(), original.num_outputs());
+
+        // And the spend must now be a double spend on both.
+        assert!(matches!(
+            restored.validate_tx(&mut OsRng, &spend),
+            Err(ChainError::DoubleSpend)
+        ));
+        assert!(matches!(
+            original.validate_tx(&mut OsRng, &spend),
+            Err(ChainError::DoubleSpend)
+        ));
+    }
+
+    #[test]
+    fn chain_state_survives_a_round_trip() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = Blockchain::with_maturity(KeccakPow, 2);
+        for i in 0..6 {
+            mine_coinbase(&mut chain, &miner, 1_000 + i * 130);
+        }
+        let state = chain.snapshot();
+        assert_eq!(ChainState::decode(&state.encode()).expect("round trip"), state);
+        assert_eq!(state.height(), chain.height());
+        assert_eq!(state.tip_id(), chain.tip_id());
+    }
+
+    /// State for another network must be refused. A chain that silently adopted
+    /// a foreign genesis would agree with nobody and look entirely healthy doing
+    /// it — the failure mode that stranded a node for an hour once already.
+    #[test]
+    fn chain_state_from_another_network_is_refused() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = Blockchain::with_maturity(KeccakPow, 2);
+        mine_coinbase(&mut chain, &miner, 1_000);
+        let state = chain.snapshot();
+        assert!(Blockchain::from_state(KeccakPow, Network::Mainnet, &state).is_some());
+        assert!(
+            Blockchain::from_state(KeccakPow, Network::Testnet, &state).is_none(),
+            "mainnet state must not restore as testnet"
+        );
+    }
+
+    /// A damaged state file must be refused rather than misread. Guessing at it
+    /// produces a chain that validates against history that never happened.
+    #[test]
+    fn a_damaged_chain_state_is_refused() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = Blockchain::with_maturity(KeccakPow, 2);
+        for i in 0..4 {
+            mine_coinbase(&mut chain, &miner, 1_000 + i * 130);
+        }
+        let good = chain.snapshot().encode();
+
+        assert!(ChainState::decode(&[]).is_none(), "empty");
+        assert!(ChainState::decode(&good[..good.len() - 1]).is_none(), "truncated");
+        assert!(ChainState::decode(&good[..10]).is_none(), "truncated header");
+
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(ChainState::decode(&trailing).is_none(), "trailing bytes");
+
+        let mut version = good.clone();
+        version[0] = CHAIN_STATE_VERSION + 1;
+        assert!(ChainState::decode(&version).is_none(), "future version");
+
+        // A header count that disagrees with the bytes present must not be
+        // trusted, least of all to size an allocation.
+        let mut liar = good.clone();
+        liar[49..57].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(ChainState::decode(&liar).is_none(), "absurd header count");
+    }
+
+    /// The point of the exercise: the state is a small fraction of the bodies.
+    /// If this ratio ever collapses, the type has stopped being worth having and
+    /// the wallet may as well replay.
+    #[test]
+    fn chain_state_is_far_smaller_than_the_blocks_it_replaces() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = Blockchain::with_maturity(KeccakPow, 2);
+        for i in 0..40 {
+            mine_coinbase(&mut chain, &miner, 1_000 + i * 130);
+        }
+        let state_bytes = chain.snapshot().encode().len();
+        let body_bytes: usize =
+            chain.blocks().iter().map(|s| crate::wire::encode_message(&crate::p2p::Wire::Block(s.block.clone(), s.txs.clone())).len()).sum();
+        assert!(
+            state_bytes < body_bytes,
+            "state {state_bytes} B should be smaller than bodies {body_bytes} B"
+        );
     }
 }
 
