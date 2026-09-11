@@ -1732,7 +1732,6 @@ mod tests {
         assert_eq!(chain.genesis_id(), Block::genesis().id());
     }
 
-    #[test]
     /// A rejected reorg must leave a chain that still *works*, not one that
     /// merely looks right in its summary fields.
     ///
@@ -1791,7 +1790,6 @@ mod tests {
         assert_eq!(chain.height(), 6);
     }
 
-    #[test]
     /// The id vector and the stored blocks must never disagree. They are
     /// updated in different places, and a caller that trusts the cheap one would
     /// silently act on a stale hash.
@@ -1817,6 +1815,7 @@ mod tests {
         assert_eq!(chain.block_id_at(1), chain.block_at(1).map(|s| s.block.id()));
     }
 
+    #[test]
     fn reorg_rejects_a_lighter_branch_and_changes_nothing() {
         let mut chain = Blockchain::with_maturity(KeccakPow, 1);
         let miner = Account::random(&mut OsRng);

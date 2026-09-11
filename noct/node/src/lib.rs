@@ -1559,7 +1559,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// A node that is behind must not punish peers for relaying transactions it
     /// cannot validate yet.
     ///
