@@ -9,10 +9,11 @@
 //!
 //! Syncing downloads every block from the node and **validates** it locally into
 //! the wallet's own chain (the node is untrusted); that local chain also supplies
-//! ring decoys for spending. Only the spend key is persisted, but validated
-//! blocks are cached next to it (`FILE.cache`), so repeat commands replay the
-//! cache locally and pull only newly-mined blocks instead of re-syncing from
-//! genesis.
+//! ring decoys for spending. The key file (owner-only) is the wallet. Next to
+//! it, `FILE.cache.state` holds the chain state and the wallet's bookkeeping,
+//! so repeat commands pull only newly-mined blocks. It holds nothing that can
+//! spend, and is re-checked against the chain on load. `FILE.cache` keeps the
+//! validated blocks as a fallback for when that state cannot be used.
 
 use noct_core::address::{Address, Network};
 use noct_core::keys::Account;
@@ -79,7 +80,7 @@ fn cmd_new(path: &str, network: Network) {
     }
     let account = Account::random(&mut OsRng);
     let secret = hex::encode(account.spend_secret.to_bytes());
-    std::fs::write(path, &secret).unwrap_or_else(|e| fail(&format!("writing {path}: {e}")));
+    write_key_file(path, &secret);
     let address = Address::new(network, account.spend_public, account.view_public);
     println!("created wallet: {path}");
     println!("address: {}", address.encode());
@@ -149,14 +150,13 @@ fn cmd_restore(args: &[String], path: &str, network: Network) {
         println!("address: {}", address.encode());
         return;
     }
-    std::fs::write(path, hex::encode(secret)).unwrap_or_else(|e| fail(&format!("writing {path}: {e}")));
+    write_key_file(path, &hex::encode(secret));
     println!("restored wallet: {path}");
     println!("address: {}", address.encode());
 }
 
 fn cmd_seed(path: &str) {
-    let contents = std::fs::read_to_string(path)
-        .unwrap_or_else(|_| fail(&format!("no wallet at {path} — run `noct-cli new` first")));
+    let contents = read_key_file(path);
     let bytes: [u8; 32] = hex::decode(contents.trim())
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
@@ -286,15 +286,31 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
 }
 
 fn load(path: &str, network: Network) -> Wallet {
-    let contents = std::fs::read_to_string(path)
-        .unwrap_or_else(|_| fail(&format!("no wallet at {path} — run `noct-cli new` first")));
+    let contents = read_key_file(path);
     client::load_wallet_for(contents.trim(), network).unwrap_or_else(|e| fail(&e))
 }
 
 fn load_account(path: &str) -> Account {
+    let contents = read_key_file(path);
+    client::load_account(contents.trim()).unwrap_or_else(|e| fail(&e))
+}
+
+/// Write a new key file, owner-only. It is the whole wallet: a plain
+/// `std::fs::write` left it readable by every account on the machine.
+fn write_key_file(path: &str, secret_hex: &str) {
+    noct_wallet::secure_file::create_private(std::path::Path::new(path), secret_hex.as_bytes())
+        .unwrap_or_else(|e| fail(&format!("writing {path}: {e}")));
+}
+
+/// Read a key file, warning if other accounts on this machine can read it too.
+/// Keys written before `write_key_file` existed were.
+fn read_key_file(path: &str) -> String {
     let contents = std::fs::read_to_string(path)
         .unwrap_or_else(|_| fail(&format!("no wallet at {path} — run `noct-cli new` first")));
-    client::load_account(contents.trim()).unwrap_or_else(|e| fail(&e))
+    if noct_wallet::secure_file::is_exposed(std::path::Path::new(path)) {
+        eprintln!("warning: {path} is readable by other users on this machine. Fix it with:  chmod 600 {path}");
+    }
+    contents
 }
 
 /// Where a wallet's validated-block cache lives (next to its key file).

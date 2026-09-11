@@ -499,37 +499,60 @@ impl Transaction {
     where
         F: Fn(&PublicKey) -> Option<(SubaddressIndex, Scalar)>,
     {
-        let mut found = Vec::new();
-        for (i, output) in self.outputs.iter().enumerate() {
-            let index = i as u32;
-            let tx_public = self.output_tx_key(index);
-            let recovered = stealth::recovered_spend_public(account, &tx_public, index, &output.one_time_key);
-            let Some((subaddress, offset)) = resolve(&recovered) else {
-                continue;
-            };
-            let k = stealth::recipient_shared_scalar(account, &tx_public, index);
-            let amount = u64::from_le_bytes(xor_amount(output.encrypted_amount, &k));
-            let opening = Opening::new(amount, output_mask(&k));
-            // The recovered opening must reproduce the on-chain commitment;
-            // otherwise the output is malformed or not really ours.
-            if opening.commit() != output.commitment {
-                continue;
-            }
-            // One-time spend secret x = k + b + m (m = subaddress offset).
-            let spend_secret = PrivateKey(k + account.spend_secret.0 + offset);
-            let key_image = KeyImage::from_secret(&spend_secret);
-            found.push(ReceivedOutput {
-                index,
-                amount,
-                opening,
-                one_time_key: output.one_time_key,
-                spend_secret,
-                key_image,
-                subaddress,
-            });
-        }
-        found
+        self.outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, output)| {
+                let index = i as u32;
+                recover_output(account, &self.output_tx_key(index), index, output, &resolve)
+            })
+            .collect()
     }
+}
+
+/// Recover one transaction output for `account`, or `None` if it is not ours.
+///
+/// This is the whole of what [`Transaction::scan_with`] does per output, pulled
+/// out so a wallet can re-derive an output it already knows about from public
+/// data alone — the output, its position, and the transaction key that applies
+/// to it ([`Transaction::output_tx_key`]) — without the transaction around it.
+/// That is what lets a wallet persist its outputs without ever writing a spend
+/// secret or key image to disk: both come back from the account on load, by
+/// exactly the path a scan takes.
+///
+/// `resolve` behaves as in [`Transaction::scan_with`].
+pub fn recover_output<F>(
+    account: &Account,
+    tx_public: &PublicKey,
+    index: u32,
+    output: &Output,
+    resolve: F,
+) -> Option<ReceivedOutput>
+where
+    F: Fn(&PublicKey) -> Option<(SubaddressIndex, Scalar)>,
+{
+    let recovered = stealth::recovered_spend_public(account, tx_public, index, &output.one_time_key);
+    let (subaddress, offset) = resolve(&recovered)?;
+    let k = stealth::recipient_shared_scalar(account, tx_public, index);
+    let amount = u64::from_le_bytes(xor_amount(output.encrypted_amount, &k));
+    let opening = Opening::new(amount, output_mask(&k));
+    // The recovered opening must reproduce the on-chain commitment; otherwise
+    // the output is malformed or not really ours.
+    if opening.commit() != output.commitment {
+        return None;
+    }
+    // One-time spend secret x = k + b + m (m = subaddress offset).
+    let spend_secret = PrivateKey(k + account.spend_secret.0 + offset);
+    let key_image = KeyImage::from_secret(&spend_secret);
+    Some(ReceivedOutput {
+        index,
+        amount,
+        opening,
+        one_time_key: output.one_time_key,
+        spend_secret,
+        key_image,
+        subaddress,
+    })
 }
 
 impl ReceivedOutput {

@@ -356,15 +356,53 @@ pub fn sync<P: ProofOfWork>(
     Ok(chain.height())
 }
 
-/// Build a fully-synced wallet + validation chain, using an on-disk block cache
-/// so repeated runs don't re-download the chain from genesis.
+/// Where a wallet's persisted state lives: beside its block cache, as
+/// `CACHE.state`.
+pub fn state_path(cache_path: &std::path::Path) -> PathBuf {
+    let mut name = cache_path.as_os_str().to_owned();
+    name.push(".state");
+    PathBuf::from(name)
+}
+
+/// Load the persisted chain and wallet, if there is a state file and it checks
+/// out completely (see [`crate::state`]). Anything less is `None`, and the
+/// caller rebuilds.
+fn load_state(
+    path: &std::path::Path,
+    account: Account,
+    network: Network,
+    issued: &[(u32, u32)],
+) -> Option<(Blockchain<TrustedPow>, Wallet)> {
+    let bytes = std::fs::read(path).ok()?;
+    let (chain, wallet) = crate::state::decode(TrustedPow, account, network, &bytes, issued).ok()?;
+    // Every chain built here runs at the consensus maturity. A state saying
+    // otherwise was not written by this build, and a chain at a lower maturity
+    // would let the wallet pick coinbase outputs the network refuses to spend.
+    (noct_core::chain::OutputSet::coinbase_maturity(&chain) == noct_core::chain::COINBASE_MATURITY)
+        .then_some((chain, wallet))
+}
+
+/// Persist `chain` and `wallet` to `path`, owner-only and replaced atomically.
 ///
-/// On the fast path it replays the cache locally, then pulls only the blocks
-/// mined since. If the cache is stale or corrupt, or the node has reorged below
-/// our cached tip (a replayed or freshly-pulled block fails to extend the
-/// chain), the cache is discarded and the wallet is rebuilt from genesis — so
-/// caching can only ever cost time, never correctness. Returns the chain, the
-/// scanned wallet, and the height reached.
+/// The file reveals what the wallet owns but holds nothing that can spend it;
+/// see [`crate::state`].
+pub fn save_state(path: &std::path::Path, chain: &Blockchain<TrustedPow>, wallet: &Wallet) -> std::io::Result<()> {
+    crate::secure_file::replace_private(path, &crate::state::encode(chain, wallet))
+}
+
+/// Build a fully-synced wallet + validation chain, resuming from what earlier
+/// runs saved instead of re-downloading the chain from genesis.
+///
+/// Fastest first:
+/// 1. the saved state (`CACHE.state`): the chain state and wallet as the last
+///    run left them, re-checked on load, then only the blocks mined since;
+/// 2. the block cache: every validated block replayed, then the rest pulled;
+/// 3. a full rebuild from genesis.
+///
+/// Each step falls through to the next on any failure, including a node that
+/// has reorganised below the saved tip. So saving can only ever cost time,
+/// never correctness. Returns the chain, the scanned wallet, and the height
+/// reached, and saves the result for next time.
 pub fn load_synced_wallet(
     client: &NodeClient,
     account: Account,
@@ -372,14 +410,49 @@ pub fn load_synced_wallet(
     cache_path: impl Into<PathBuf>,
     issued: &[(u32, u32)],
 ) -> Result<(Blockchain<TrustedPow>, Wallet, u64), String> {
+    let cache_path = cache_path.into();
+    let state_file = state_path(&cache_path);
     let cache = BlockCache::new(cache_path);
-    match build_synced(client, account, network, &cache, true, issued) {
-        Ok(result) => Ok(result),
-        Err(_) => {
-            cache.clear();
-            build_synced(client, account, network, &cache, false, issued)
-        }
+    // Ask the node before anything else. Every path below syncs from it, and
+    // the fallback discards the block cache on any error. Without this, a node
+    // that was merely down cost the next run a full re-download.
+    client.height()?;
+
+    let result = match resume_from_state(client, account, network, &state_file, issued) {
+        Some(result) => result,
+        None => match build_synced(client, account, network, &cache, true, issued) {
+            Ok(result) => result,
+            Err(_) => {
+                cache.clear();
+                build_synced(client, account, network, &cache, false, issued)?
+            }
+        },
+    };
+    // Saving only ever speeds up the next run, so failing to is not fatal.
+    if let Err(e) = save_state(&state_file, &result.0, &result.1) {
+        eprintln!("warning: could not save wallet state to {}: {e}", state_file.display());
     }
+    Ok(result)
+}
+
+/// The fast path: restore the saved state and sync what was mined since.
+///
+/// `None` if there is no usable state, or the node no longer extends it.
+///
+/// This deliberately does not append to the block cache. The cache stays a
+/// clean prefix of the chain for the fallback to replay. Appending here would
+/// leave a gap in it whenever the state is ahead of it, and a duplicate run
+/// whenever it is behind.
+fn resume_from_state(
+    client: &NodeClient,
+    account: Account,
+    network: Network,
+    state_file: &std::path::Path,
+    issued: &[(u32, u32)],
+) -> Option<(Blockchain<TrustedPow>, Wallet, u64)> {
+    let (mut chain, mut wallet) = load_state(state_file, account, network, issued)?;
+    let height = sync(client, &mut chain, &mut wallet, None).ok()?;
+    Some((chain, wallet, height))
 }
 
 /// Build a wallet + validation chain from the on-disk cache **alone**, without
@@ -394,6 +467,11 @@ pub fn replay_cache(
     cache_path: impl Into<PathBuf>,
     issued: &[(u32, u32)],
 ) -> (Blockchain<TrustedPow>, Wallet, BlockCache) {
+    let cache_path = cache_path.into();
+    // The saved state, when there is a good one, makes replaying unnecessary.
+    if let Some((chain, wallet)) = load_state(&state_path(&cache_path), account, network, issued) {
+        return (chain, wallet, BlockCache::new(cache_path));
+    }
     let cache = BlockCache::new(cache_path);
     let genesis = |chain: &mut Blockchain<TrustedPow>, wallet: &mut Wallet| {
         *chain = Blockchain::for_network(network, TrustedPow);

@@ -20,7 +20,7 @@ use noct_core::keys::Account;
 use noct_core::tx::Payment;
 use noct_tls::Endpoint;
 use noct_wallet::client::{
-    format_noct, load_account, parse_noct, replay_cache, rpc_token_from_args, sync, BlockCache,
+    format_noct, load_account, parse_noct, replay_cache, rpc_token_from_args, save_state, state_path, sync, BlockCache,
     NodeClient, TrustedPow,
 };
 use noct_wallet::{Direction, Wallet, DEFAULT_RING_SIZE};
@@ -44,6 +44,11 @@ struct App {
     /// so a restart doesn't reissue the same ones.
     next_subaddress: u32,
     subaddr_path: String,
+    /// Saved chain + wallet state, so a restart resumes without replaying the
+    /// block cache. See `noct_wallet::state`.
+    state_path: std::path::PathBuf,
+    /// Tip the state file was last saved at, so an idle poll does not rewrite it.
+    saved_tip: [u8; 32],
 }
 
 /// Sync the app's chain from the node, extending the block cache. If a block
@@ -51,8 +56,8 @@ struct App {
 /// the cache is discarded and the wallet is rebuilt from genesis so the next
 /// poll recovers.
 fn sync_app(app: &mut App) -> Result<u64, String> {
-    match sync(&app.client, &mut app.chain, &mut app.wallet, Some(&app.cache)) {
-        Ok(height) => Ok(height),
+    let height = match sync(&app.client, &mut app.chain, &mut app.wallet, Some(&app.cache)) {
+        Ok(height) => height,
         Err(_) => {
             app.cache.clear();
             // Must be rebuilt on *this* wallet's network: `Blockchain::new` is
@@ -60,9 +65,22 @@ fn sync_app(app: &mut App) -> Result<u64, String> {
             // chain at the wrong genesis and reject every block the node sends.
             app.chain = Blockchain::for_network(app.network, TrustedPow);
             app.wallet = Wallet::new(app.account, app.network);
-            sync(&app.client, &mut app.chain, &mut app.wallet, Some(&app.cache))
+            // Everything issued has to be registered before the rescan, exactly
+            // as at startup, or funds at addresses past the lookahead window
+            // vanish from the rebuilt wallet.
+            app.wallet.register_issued((0..app.next_subaddress).map(|i| (0, i)));
+            sync(&app.client, &mut app.chain, &mut app.wallet, Some(&app.cache))?
+        }
+    };
+    // Keyed on the tip, not the height: a rebuild onto another branch can land
+    // at the height already saved.
+    if app.chain.tip_id() != app.saved_tip {
+        match save_state(&app.state_path, &app.chain, &app.wallet) {
+            Ok(()) => app.saved_tip = app.chain.tip_id(),
+            Err(e) => eprintln!("warning: could not save wallet state to {}: {e}", app.state_path.display()),
         }
     }
+    Ok(height)
 }
 
 fn main() {
@@ -93,6 +111,9 @@ fn main() {
     let key = std::fs::read_to_string(&wallet_path)
         .unwrap_or_else(|_| fail(&format!("no wallet at {wallet_path} — run `noct-cli new --wallet {wallet_path}` first")));
     let account = load_account(key.trim()).unwrap_or_else(|e| fail(&e));
+    if noct_wallet::secure_file::is_exposed(std::path::Path::new(&wallet_path)) {
+        eprintln!("warning: {wallet_path} is readable by other users on this machine. Fix it with:  chmod 600 {wallet_path}");
+    }
 
     // The wallet's 24-word BIP39 backup phrase, for the UI's "reveal seed" feature.
     let seed_phrase = {
@@ -123,6 +144,7 @@ fn main() {
     // reported no funds for addresses it had itself given out. Resuming the
     // counter alone was never enough.
     let issued: Vec<(u32, u32)> = (0..next_subaddress).map(|i| (0, i)).collect();
+    let state_path = state_path(std::path::Path::new(&cache_path));
     let (chain, wallet, cache) = replay_cache(account, network, &cache_path, &issued);
 
     let app = Arc::new(Mutex::new(App {
@@ -132,6 +154,9 @@ fn main() {
         cache,
         account,
         network,
+        state_path,
+        // Nothing saved yet this run, so the first successful sync writes one.
+        saved_tip: [0u8; 32],
         next_subaddress,
         subaddr_path,
     }));

@@ -1176,7 +1176,15 @@ impl<P: ProofOfWork> Blockchain<P> {
             cumulative_difficulties: self.cumulative_difficulties.clone(),
             outputs: self.outputs.iter().map(membership_key).collect(),
             output_meta: self.output_meta.iter().map(|m| (m.height, m.coinbase)).collect(),
-            spent_key_images: self.spent_key_images.iter().map(|k| k.to_bytes()).collect(),
+            spent_key_images: {
+                // Sorted, because the set iterates in a different order in
+                // every instance. Unsorted, the same chain snapshots to
+                // different bytes each time, and two snapshots of one chain
+                // compare unequal.
+                let mut images: Vec<[u8; 32]> = self.spent_key_images.iter().map(|k| k.to_bytes()).collect();
+                images.sort_unstable();
+                images
+            },
         }
     }
 

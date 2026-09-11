@@ -22,7 +22,7 @@ use curve25519_dalek::scalar::Scalar;
 use noct_core::address::{Address, Network};
 use noct_core::block::Block;
 use noct_core::chain::{Blockchain, OutputSet};
-use noct_core::keys::Account;
+use noct_core::keys::{Account, PublicKey};
 use noct_core::pow::ProofOfWork;
 use noct_core::ring::KeyImage;
 use noct_core::stealth::TxKeypair;
@@ -38,6 +38,8 @@ pub mod client;
 pub mod joint;
 pub mod outputs;
 pub mod mnemonic;
+pub mod secure_file;
+pub mod state;
 
 /// The ring size every transaction uses: 1 real member + N−1 decoys.
 ///
@@ -85,6 +87,25 @@ pub struct OwnedOutput {
     pub output: ReceivedOutput,
     /// Set once a block spends this output.
     pub spent: bool,
+    /// The public data this output was found with, which is all it takes to
+    /// find it again. See [`OutputSource`].
+    pub source: OutputSource,
+}
+
+/// Where an owned output came from, in terms that are public on chain.
+///
+/// Together with the output's global index (which gives its one-time key and
+/// commitment) and the account, this re-derives everything else — amount,
+/// opening, one-time spend secret, key image — by the same path a scan takes.
+/// It is what the wallet persists in place of any of those, so nothing on disk
+/// can spend. See [`state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSource {
+    /// A coinbase output. Its amount is public, so there is nothing to decrypt.
+    Coinbase { tx_public: PublicKey },
+    /// A transaction output: the transaction key that applies to it (see
+    /// [`Transaction::output_tx_key`]) and its amount as encrypted on chain.
+    Transaction { tx_public: PublicKey, encrypted_amount: [u8; 8] },
 }
 
 impl OwnedOutput {
@@ -224,7 +245,8 @@ impl Wallet {
         let coinbase_base = self.next_global_index;
         if let Some(received) = block.coinbase.scan(&self.account) {
             let amount = received.amount;
-            self.record(coinbase_base, received);
+            let source = OutputSource::Coinbase { tx_public: block.coinbase.tx_public };
+            self.record(coinbase_base, received, source);
             self.history.push(HistoryEntry {
                 height,
                 direction: Direction::Received,
@@ -247,7 +269,11 @@ impl Wallet {
             let mut received_here: u64 = 0;
             for received in received {
                 received_here = received_here.saturating_add(received.amount);
-                self.record(tx_base, received);
+                let source = OutputSource::Transaction {
+                    tx_public: tx.output_tx_key(received.index),
+                    encrypted_amount: tx.outputs[received.index as usize].encrypted_amount,
+                };
+                self.record(tx_base, received, source);
             }
             self.next_global_index += tx.outputs.len() as u64;
 
@@ -291,13 +317,13 @@ impl Wallet {
         }
     }
 
-    fn record(&mut self, base_index: u64, received: ReceivedOutput) {
+    fn record(&mut self, base_index: u64, received: ReceivedOutput, source: OutputSource) {
         let global_index = base_index + u64::from(received.index);
         // Avoid double-recording if a block is (re)scanned.
         if self.owned.iter().any(|o| o.global_index == global_index) {
             return;
         }
-        self.owned.push(OwnedOutput { global_index, output: received, spent: false });
+        self.owned.push(OwnedOutput { global_index, output: received, spent: false, source });
     }
 
     fn mark_spent(&mut self, image: &KeyImage) {

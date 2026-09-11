@@ -127,28 +127,46 @@ impl Coinbase {
     /// Scan the coinbase with an account's keys; if an output is addressed to it,
     /// recover it as a spendable [`ReceivedOutput`] (opening mask = 1).
     pub fn scan(&self, account: &Account) -> Option<ReceivedOutput> {
-        for (i, output) in self.outputs.iter().enumerate() {
-            let index = i as u32;
-            if stealth::expected_output(account, &self.tx_public, index) != output.one_time_key {
-                continue;
-            }
-            let opening = Opening::new(output.amount, Scalar::ONE);
-            debug_assert_eq!(opening.commit(), output.commitment);
-            let spend_secret = stealth::output_secret(account, &self.tx_public, index);
-            let key_image = KeyImage::from_secret(&spend_secret);
-            return Some(ReceivedOutput {
-                index,
-                amount: output.amount,
-                opening,
-                one_time_key: output.one_time_key,
-                spend_secret,
-                key_image,
-                // Coinbase outputs pay the miner's standard address.
-                subaddress: crate::subaddress::SubaddressIndex::MAIN,
-            });
-        }
-        None
+        self.outputs
+            .iter()
+            .enumerate()
+            .find_map(|(i, output)| recover_coinbase_output(account, &self.tx_public, i as u32, output))
     }
+}
+
+/// Recover one coinbase output for `account`, or `None` if it is not ours.
+///
+/// The per-output half of [`Coinbase::scan`], exposed so a wallet can
+/// re-derive a coinbase output it already knows about from public data alone —
+/// the spend secret and key image come back from the account, never from disk.
+pub fn recover_coinbase_output(
+    account: &Account,
+    tx_public: &PublicKey,
+    index: u32,
+    output: &CoinbaseOutput,
+) -> Option<ReceivedOutput> {
+    if stealth::expected_output(account, tx_public, index) != output.one_time_key {
+        return None;
+    }
+    let opening = Opening::new(output.amount, Scalar::ONE);
+    // Consensus already enforces this for every coinbase it accepts, so a scan
+    // never sees it fail. A wallet re-deriving an output from its own records
+    // can, and must not be handed an opening that does not open.
+    if opening.commit() != output.commitment {
+        return None;
+    }
+    let spend_secret = stealth::output_secret(account, tx_public, index);
+    let key_image = KeyImage::from_secret(&spend_secret);
+    Some(ReceivedOutput {
+        index,
+        amount: output.amount,
+        opening,
+        one_time_key: output.one_time_key,
+        spend_secret,
+        key_image,
+        // Coinbase outputs pay the miner's standard address.
+        subaddress: crate::subaddress::SubaddressIndex::MAIN,
+    })
 }
 
 /// A block header — the part that carries the proof of work.
