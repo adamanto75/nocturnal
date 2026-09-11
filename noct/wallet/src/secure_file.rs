@@ -44,10 +44,17 @@ pub fn create_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// The bytes go to a sibling temporary file, which is flushed to disk and then
 /// renamed over the target. A crash at any point leaves either the old contents
 /// or the new, never a torn mix of the two.
+///
+/// The temporary is named for this process. Two processes saving the same
+/// file (say a bot's own run and a command someone runs by hand against the
+/// same wallet) each rename a complete file of their own, and the last one
+/// wins. With one shared name, one could delete or rename the other's
+/// half-written file.
 pub fn replace_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = with_suffix(path, ".tmp");
-    // A leftover from an interrupted write. Remove it rather than write through
-    // it, since reopening it would keep whatever mode it was created with.
+    let tmp = with_suffix(path, &format!(".tmp.{}", std::process::id()));
+    // A leftover from an interrupted write by an earlier process that had
+    // this pid. Remove it rather than write through it, since reopening it
+    // would keep whatever mode it was created with.
     match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -132,12 +139,16 @@ mod tests {
         replace_private(&path, b"old").unwrap();
         replace_private(&path, b"new").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        assert!(!with_suffix(&path, ".tmp").exists(), "the temporary file must not survive");
+        let names = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect()
+        };
+        assert_eq!(names(&dir), ["state"], "the temporary file must not survive");
 
         // A stale temporary from a crash must not block, or leak into, the next write.
-        std::fs::write(with_suffix(&path, ".tmp"), b"torn").unwrap();
+        std::fs::write(with_suffix(&path, &format!(".tmp.{}", std::process::id())), b"torn").unwrap();
         replace_private(&path, b"newer").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"newer");
+        assert_eq!(names(&dir), ["state"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
