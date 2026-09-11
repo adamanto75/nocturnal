@@ -15,8 +15,14 @@
 //! owner-only for that reason. But whoever reads it cannot spend them, and
 //! cannot recognise an unspent one when it is later spent.
 //!
-//! **What is checked on load.** Every record is re-derived against the chain
-//! state stored beside it:
+//! **What is checked on load.** First a checksum over the whole file, so
+//! accidental damage is refused before anything is read. That matters because
+//! the chain state's points stay compressed and are only decompressed when
+//! used; without it, a damaged point would surface at some later spend as a
+//! ring that cannot be built. The checksum is no defence against deliberate
+//! edits, since whoever rewrites the file can recompute it. That is what the
+//! rest is for. Every record is re-derived against the chain state stored
+//! beside it:
 //! - the output must exist at the recorded global index;
 //! - the account must recover it there;
 //! - the recovered opening must open the chain's commitment;
@@ -43,8 +49,10 @@ use crate::{Direction, HistoryEntry, OutputSource, OwnedOutput, Wallet};
 
 const MAGIC: &[u8; 8] = b"NOCTWLST";
 /// Bumped whenever the layout changes. An older file is refused and rebuilt
-/// rather than misread.
-const STATE_VERSION: u8 = 1;
+/// rather than misread. Version 2 added the trailing checksum.
+const STATE_VERSION: u8 = 2;
+/// Trailing Keccak-256 over everything before it.
+const CHECKSUM: usize = 32;
 
 /// Global index 8, kind 1, tx key 32, output index 4, amount field 8,
 /// subaddress 4 + 4, spent 1.
@@ -136,6 +144,8 @@ pub fn encode<P: ProofOfWork>(chain: &Blockchain<P>, wallet: &Wallet) -> Vec<u8>
 
     o.extend_from_slice(&(chain_bytes.len() as u64).to_le_bytes());
     o.extend_from_slice(&chain_bytes);
+    let sum = keccak256(&o);
+    o.extend_from_slice(&sum);
     o
 }
 
@@ -156,7 +166,13 @@ pub fn decode<P: ProofOfWork>(
 ) -> Result<(Blockchain<P>, Wallet), StateError> {
     use StateError::Malformed;
 
-    let mut c = bytes;
+    let body_len = bytes.len().checked_sub(CHECKSUM).ok_or(Malformed)?;
+    let (body, sum) = bytes.split_at(body_len);
+    if keccak256(body)[..] != *sum {
+        return Err(Malformed);
+    }
+
+    let mut c = body;
     if take(&mut c, 8)? != &MAGIC[..] || take(&mut c, 1)?[0] != STATE_VERSION {
         return Err(Malformed);
     }
@@ -339,6 +355,22 @@ mod tests {
     /// Where the owned-output records start: magic, version, tag, output
     /// counter, record count.
     const OWNED_AT: usize = 8 + 1 + 32 + 8 + 8;
+
+    /// Append a valid checksum to `body`.
+    fn seal(mut body: Vec<u8>) -> Vec<u8> {
+        let sum = keccak256(&body);
+        body.extend_from_slice(&sum);
+        body
+    }
+
+    /// Recompute the checksum after an edit, as someone deliberately tampering
+    /// with the file would. The checks behind it are the real defence, and
+    /// these tests are about those.
+    fn reseal(bytes: &mut Vec<u8>) {
+        let body = bytes.len() - CHECKSUM;
+        bytes.truncate(body);
+        *bytes = seal(std::mem::take(bytes));
+    }
 
     fn mine(chain: &mut Blockchain<KeccakPow>, to: &Address, txs: &[Transaction], ts: u64) -> Block {
         let fees: u64 = txs.iter().map(|t| t.fee).sum();
@@ -547,6 +579,7 @@ mod tests {
         let refused = |edit: &dyn Fn(&mut Vec<u8>)| {
             let mut bytes = good.clone();
             edit(&mut bytes);
+            reseal(&mut bytes);
             restore(&s, &bytes).err()
         };
         let at = |rec: usize| Some(StateError::Inconsistent { global_index: le_u64(&good[rec..rec + 8]) });
@@ -593,7 +626,22 @@ mod tests {
         let counter = 8 + 1 + 32;
         let n = le_u64(&bytes[counter..counter + 8]) + 1;
         bytes[counter..counter + 8].copy_from_slice(&n.to_le_bytes());
+        reseal(&mut bytes);
         assert_eq!(restore(&s, &bytes).err(), Some(StateError::OutOfStep));
+    }
+
+    /// Damage anywhere is refused at load, before any of it is believed. The
+    /// chain state's points are only decompressed when used, so this is what
+    /// stops a damaged one reaching a spend.
+    #[test]
+    fn accidental_damage_anywhere_is_refused() {
+        let s = scenario();
+        let good = encode(&s.chain, &s.alice);
+        for at in [0, OWNED_AT + 3, good.len() / 2, good.len() - CHECKSUM - 1, good.len() - 1] {
+            let mut bad = good.clone();
+            bad[at] ^= 0x10;
+            assert_eq!(restore(&s, &bad).err(), Some(StateError::Malformed), "byte {at}");
+        }
     }
 
     #[test]
@@ -605,22 +653,28 @@ mod tests {
         assert_eq!(restore(&s, &good[..good.len() - 1]).err(), Some(StateError::Malformed), "truncated");
         assert_eq!(restore(&s, &good[..40]).err(), Some(StateError::Malformed), "truncated header");
 
-        let mut trailing = good.clone();
+        // The rest are sealed, so they reach the parser rather than stopping
+        // at the checksum.
+        let mut trailing = good[..good.len() - CHECKSUM].to_vec();
         trailing.push(0);
+        let trailing = seal(trailing);
         assert_eq!(restore(&s, &trailing).err(), Some(StateError::Malformed), "trailing byte");
 
         let mut version = good.clone();
         version[8] = STATE_VERSION + 1;
+        reseal(&mut version);
         assert_eq!(restore(&s, &version).err(), Some(StateError::Malformed), "future version");
 
         // A count that disagrees with the bytes must not be trusted, least of
         // all to size an allocation.
         let mut liar = good.clone();
         liar[OWNED_AT - 8..OWNED_AT].copy_from_slice(&u64::MAX.to_le_bytes());
+        reseal(&mut liar);
         assert_eq!(restore(&s, &liar).err(), Some(StateError::Malformed), "absurd count");
 
         let mut bad_flag = good.clone();
         bad_flag[OWNED_AT + 61] = 2;
+        reseal(&mut bad_flag);
         assert_eq!(restore(&s, &bad_flag).err(), Some(StateError::Malformed), "non-boolean flag");
     }
 }

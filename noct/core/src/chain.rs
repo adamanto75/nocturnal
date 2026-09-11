@@ -215,13 +215,22 @@ pub struct Blockchain<P: ProofOfWork> {
     timestamps: Vec<u64>,
     cumulative_difficulties: Vec<u128>,
 
-    outputs: Vec<RingMember>,
+    /// Every output as `key || commitment`, compressed, by global index.
+    ///
+    /// Held compressed: a decompressed point is 160 bytes against 32, and
+    /// decompressing (with the torsion check) costs ~44 µs. Rings need sixteen
+    /// members, so [`Self::output`] decompresses those on demand; nothing else
+    /// needs the points at all. See [`unpack_member`].
+    outputs: Vec<[u8; 64]>,
     /// Membership key → global index, so a ring member can be resolved back to
     /// its output (for the coinbase-maturity check).
     output_membership: HashMap<[u8; 64], u64>,
     /// Per-output metadata, parallel to `outputs` (indexed by global index).
     output_meta: Vec<OutputMeta>,
-    spent_key_images: HashSet<KeyImage>,
+    /// Spent key images, by canonical encoding. Equivalent to a set of points:
+    /// `KeyImage` hashes by this same encoding, and every point has exactly
+    /// one.
+    spent_key_images: HashSet<[u8; 32]>,
     emitted: u64,
     /// Blocks a coinbase output must be buried before it can be spent. Always
     /// [`COINBASE_MATURITY`] in production; tests may lower it via
@@ -244,6 +253,17 @@ fn membership_key(m: &RingMember) -> [u8; 64] {
     k[..32].copy_from_slice(&m.key.to_bytes());
     k[32..].copy_from_slice(&m.commitment.to_bytes());
     k
+}
+
+/// The inverse of [`membership_key`]: decompress a stored output.
+///
+/// Every stored output was decoded from the wire by these same `from_bytes`
+/// (or derived, for coinbases) and re-encoded canonically by
+/// [`membership_key`], so for anything a chain accepted this cannot fail.
+fn unpack_member(packed: &[u8; 64]) -> Option<RingMember> {
+    let key = PublicKey::from_bytes(packed[..32].try_into().ok()?)?;
+    let commitment = Commitment::from_bytes(packed[32..].try_into().ok()?)?;
+    Some(RingMember::new(key, commitment))
 }
 
 /// Wall-clock seconds since the Unix epoch, for the future-timestamp bound.
@@ -387,7 +407,7 @@ impl<P: ProofOfWork> Blockchain<P> {
 
     /// The output at a global index, if it exists.
     pub fn output(&self, index: u64) -> Option<RingMember> {
-        self.outputs.get(usize::try_from(index).ok()?).copied()
+        self.outputs.get(usize::try_from(index).ok()?).and_then(unpack_member)
     }
 
     /// The block accepted at `height` (with its transactions), if we have it.
@@ -410,7 +430,7 @@ impl<P: ProofOfWork> Blockchain<P> {
 
     /// Has `image` already been spent on this chain?
     pub fn is_spent(&self, image: &KeyImage) -> bool {
-        self.spent_key_images.contains(image)
+        self.spent_key_images.contains(&image.to_bytes())
     }
 
     /// Fork choice: would a competing chain of `their_cumulative_difficulty`
@@ -545,7 +565,7 @@ impl<P: ProofOfWork> Blockchain<P> {
                 self.push_output(member, height, false);
             }
             for image in tx.key_images() {
-                self.spent_key_images.insert(image);
+                self.spent_key_images.insert(image.to_bytes());
             }
         }
 
@@ -560,8 +580,9 @@ impl<P: ProofOfWork> Blockchain<P> {
 
     fn push_output(&mut self, member: RingMember, height: u64, coinbase: bool) {
         let index = self.outputs.len() as u64;
-        self.output_membership.insert(membership_key(&member), index);
-        self.outputs.push(member);
+        let key = membership_key(&member);
+        self.output_membership.insert(key, index);
+        self.outputs.push(key);
         self.output_meta.push(OutputMeta { height, coinbase });
     }
 
@@ -588,13 +609,13 @@ impl<P: ProofOfWork> Blockchain<P> {
         // Its inputs are no longer spent.
         for tx in &stored.txs {
             for image in tx.key_images() {
-                self.spent_key_images.remove(&image);
+                self.spent_key_images.remove(&image.to_bytes());
             }
         }
         // Its outputs no longer exist. (Outputs are only ever appended, so the
         // block's outputs are exactly the tail past `outputs_len_before`.)
-        for member in self.outputs.drain(undo.outputs_len_before..) {
-            self.output_membership.remove(&membership_key(&member));
+        for key in self.outputs.drain(undo.outputs_len_before..) {
+            self.output_membership.remove(&key);
         }
         self.output_meta.truncate(undo.outputs_len_before);
 
@@ -789,7 +810,7 @@ impl<P: ProofOfWork> Blockchain<P> {
             }
         }
         for image in tx.key_images() {
-            if self.spent_key_images.contains(&image) {
+            if self.spent_key_images.contains(&image.to_bytes()) {
                 return Err(ChainError::DoubleSpend);
             }
         }
@@ -1032,7 +1053,7 @@ impl<P: ProofOfWork> OutputSet for Blockchain<P> {
         self.maturity
     }
     fn member_at(&self, index: u64) -> Option<RingMember> {
-        self.outputs.get(usize::try_from(index).ok()?).copied()
+        self.output(index)
     }
     fn meta_at(&self, index: u64) -> Option<(u64, bool)> {
         self.output_meta.get(usize::try_from(index).ok()?).map(|m| (m.height, m.coinbase))
@@ -1201,14 +1222,14 @@ impl<P: ProofOfWork> Blockchain<P> {
             block_ids: self.block_ids.clone(),
             timestamps: self.timestamps.clone(),
             cumulative_difficulties: self.cumulative_difficulties.clone(),
-            outputs: self.outputs.iter().map(membership_key).collect(),
+            outputs: self.outputs.clone(),
             output_meta: self.output_meta.iter().map(|m| (m.height, m.coinbase)).collect(),
             spent_key_images: {
                 // Sorted, because the set iterates in a different order in
                 // every instance. Unsorted, the same chain snapshots to
                 // different bytes each time, and two snapshots of one chain
                 // compare unequal.
-                let mut images: Vec<[u8; 32]> = self.spent_key_images.iter().map(|k| k.to_bytes()).collect();
+                let mut images: Vec<[u8; 32]> = self.spent_key_images.iter().copied().collect();
                 images.sort_unstable();
                 images
             },
@@ -1219,8 +1240,15 @@ impl<P: ProofOfWork> Blockchain<P> {
     ///
     /// `None` if the state is for a different network — checked by genesis id,
     /// because a chain that silently adopted a foreign genesis would agree with
-    /// nobody and look fine doing it — or if any stored point fails to
-    /// decompress, which means the file is corrupt and the caller should rebuild.
+    /// nobody and look fine doing it — or if the state could not have come from
+    /// a chain (a repeated output or key image).
+    ///
+    /// **Points are not checked here.** They are kept compressed and
+    /// decompressed only when a ring asks for them; decompressing all of them
+    /// was the whole cost of a restore (5 s for 49k outputs on the testnet, and
+    /// growing with the chain). A caller loading a state from disk must know
+    /// the bytes are the ones it wrote — the wallet's state file carries a
+    /// checksum for exactly this.
     pub fn from_state(pow: P, network: crate::address::Network, state: &ChainState) -> Option<Self> {
         let expected = Block::genesis_for(network.params()).id();
         if state.genesis != expected || state.block_ids.first() != Some(&expected) {
@@ -1229,17 +1257,15 @@ impl<P: ProofOfWork> Blockchain<P> {
         if state.outputs.len() != state.output_meta.len() {
             return None;
         }
-        let mut outputs = Vec::with_capacity(state.outputs.len());
-        let mut output_membership = HashMap::with_capacity(state.outputs.len());
-        for (i, packed) in state.outputs.iter().enumerate() {
-            let key = PublicKey::from_bytes(packed[..32].try_into().ok()?)?;
-            let commitment = Commitment::from_bytes(packed[32..].try_into().ok()?)?;
-            outputs.push(RingMember::new(key, commitment));
-            output_membership.insert(*packed, i as u64);
-        }
-        let mut spent_key_images = HashSet::with_capacity(state.spent_key_images.len());
-        for k in &state.spent_key_images {
-            spent_key_images.insert(KeyImage::from_bytes(*k)?);
+        let outputs = state.outputs.clone();
+        let output_membership: HashMap<[u8; 64], u64> =
+            outputs.iter().enumerate().map(|(i, key)| (*key, i as u64)).collect();
+        let spent_key_images: HashSet<[u8; 32]> = state.spent_key_images.iter().copied().collect();
+        // `add_block` refuses a duplicate output and a repeated key image, so a
+        // state holding either did not come from a chain. A duplicate output
+        // would also make the membership index ambiguous.
+        if output_membership.len() != outputs.len() || spent_key_images.len() != state.spent_key_images.len() {
+            return None;
         }
         Some(Blockchain {
             pow,
@@ -2091,7 +2117,7 @@ mod tests {
             f.extend_from_slice(&d.to_le_bytes());
         }
         for m in outputs {
-            f.extend_from_slice(&membership_key(m));
+            f.extend_from_slice(m);
         }
         let mut membership: Vec<([u8; 64], u64)> =
             output_membership.iter().map(|(k, v)| (*k, *v)).collect();
@@ -2104,7 +2130,7 @@ mod tests {
             f.extend_from_slice(&m.height.to_le_bytes());
             f.push(m.coinbase as u8);
         }
-        let mut images: Vec<[u8; 32]> = spent_key_images.iter().map(|i| i.to_bytes()).collect();
+        let mut images: Vec<[u8; 32]> = spent_key_images.iter().copied().collect();
         images.sort();
         for i in images {
             f.extend_from_slice(&i);
@@ -2204,8 +2230,13 @@ mod tests {
     // the very mechanism meant to hide it. These pin the shape on a real chain.
 
     /// Map a ring member back to its output index, for inspecting a ring.
+    ///
+    /// Through the membership index, which is what it is for. This used to scan
+    /// every output comparing decompressed points: free while the chain held
+    /// them decompressed, and three hours of torsion checks per test run once it
+    /// did not.
     fn index_of(chain: &Blockchain<KeccakPow>, m: &RingMember) -> Option<u64> {
-        (0..chain.num_outputs()).find(|&i| chain.output(i).as_ref() == Some(m))
+        chain.output_index(m)
     }
 
     fn chain_with_history() -> Blockchain<KeccakPow> {
