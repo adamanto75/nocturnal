@@ -656,16 +656,43 @@ impl<P: ProofOfWork> Blockchain<P> {
         P: Clone,
     {
         let first = branch.first().ok_or(ChainError::EmptyBranch)?;
-        let fork_height = first.0.coinbase.height;
-        if fork_height > self.height() {
+        if first.0.coinbase.height > self.height() {
             return Err(ChainError::BadPrevId); // gap: nothing to attach to
         }
         // A branch may never replace genesis. This is what makes the chain's
         // identity immutable: any candidate must descend from *our* block 0, so a
         // foreign chain cannot be adopted no matter how much work it carries.
-        if fork_height == 0 {
+        if first.0.coinbase.height == 0 {
             return Err(ChainError::CannotReplaceGenesis);
         }
+
+        // Skip the part of the branch this chain already has. A node collects a
+        // branch from `MAX_REORG_DEPTH` below its tip, so on an ordinary orphan
+        // race all but a block or two of it are our own blocks. Starting from
+        // the branch's first block rolled back ~100 blocks and re-validated
+        // them — and, when the branch lost, re-validated the 100 it had just
+        // dropped — then reported every one of them as discarded.
+        //
+        // A block whose id equals ours at its height *is* our block: the id
+        // commits to the header, `prev_id` included, and through the Merkle
+        // root to every transaction. Re-applying it to the same predecessor
+        // would reproduce exactly the state already here, so skipping it cannot
+        // change the outcome, only its cost.
+        let shared = branch
+            .iter()
+            .take_while(|(block, _)| {
+                usize::try_from(block.coinbase.height)
+                    .ok()
+                    .and_then(|h| self.block_ids.get(h))
+                    == Some(&block.id())
+            })
+            .count();
+        let branch = &branch[shared..];
+        let Some(first) = branch.first() else {
+            // Nothing in it that we do not already have.
+            return Err(ChainError::NotHeavier);
+        };
+        let fork_height = first.0.coinbase.height;
 
         let work_before = self.cumulative_difficulty();
         let discarded = self.rollback_to(fork_height);
@@ -1844,6 +1871,113 @@ mod tests {
         assert_eq!(chain.tip_id(), tip);
         assert_eq!(chain.cumulative_difficulty(), work);
         assert_eq!(chain.num_outputs(), outputs);
+    }
+
+    // --- branches collected the way a node collects them --------------------
+    //
+    // A node downloads a candidate branch from `MAX_REORG_DEPTH` below its tip,
+    // so the branch it hands `try_reorg` starts with a long run of blocks the
+    // chain already has. These tests build branches that way.
+
+    /// `chain`'s blocks from `from` to its tip, as a collected branch.
+    fn collected(chain: &Blockchain<KeccakPow>, from: u64) -> Vec<(Block, Vec<Transaction>)> {
+        (from..chain.height())
+            .map(|h| {
+                let s = chain.block_at(h).expect("mined");
+                (s.block.clone(), s.txs.clone())
+            })
+            .collect()
+    }
+
+    /// A chain of height 9 with a spend in it, so the state being compared
+    /// includes key images and non-coinbase outputs, not just coinbases.
+    fn chain_with_a_spend(miner: &Account) -> Blockchain<KeccakPow> {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let (received, index) = mine_coinbase(&mut chain, miner, 1_000);
+        warm_up(&mut chain, 15, 1_200);
+        let fee = ATOMIC_UNITS / 100;
+        let bob = Account::random(&mut OsRng);
+        let tx = build_spend(
+            &chain,
+            &received,
+            index,
+            vec![Payment { destination: address(&bob), amount: received.amount - fee }],
+            fee,
+        );
+        let (block, _) = make_block(&chain, miner, std::slice::from_ref(&tx), 40_000);
+        chain.add_block(&mut OsRng, &block, std::slice::from_ref(&tx)).unwrap();
+        extend(&mut chain, miner, 2, 41_000);
+        chain
+    }
+
+    /// **The fix.** An orphan race replaces a block or two, and that is all a
+    /// reorg should touch — not the whole collection window. Before, this
+    /// reported every block from the window's start as discarded (and the node
+    /// logged "dropped 100 blocks" for a one-block race), having rolled them all
+    /// back and validated them all again.
+    #[test]
+    fn a_reorg_leaves_the_blocks_it_already_has_alone() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = chain_with_a_spend(&miner);
+        let height = chain.height();
+
+        // A competing miner forks two blocks below the tip and gets further.
+        let mut fork = chain.clone();
+        fork.rollback_to(height - 2);
+        extend(&mut fork, &miner, 3, 90_000);
+
+        let reorg = chain.try_reorg(&mut OsRng, &collected(&fork, 2)).expect("heavier");
+        assert_eq!(reorg.discarded.len(), 2, "only the two replaced blocks");
+        assert_eq!(reorg.discarded[0].block.coinbase.height, height - 2);
+        assert_eq!(reorg.applied, 3, "only the blocks that were new");
+        // And the result is exactly the chain the branch describes.
+        assert_eq!(chain.snapshot(), fork.snapshot());
+    }
+
+    #[test]
+    fn a_losing_branch_with_a_shared_prefix_changes_nothing() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = chain_with_a_spend(&miner);
+        let before = chain.snapshot();
+
+        let mut fork = chain.clone();
+        fork.rollback_to(chain.height() - 2);
+        extend(&mut fork, &miner, 1, 90_000);
+
+        assert_eq!(chain.try_reorg(&mut OsRng, &collected(&fork, 2)).unwrap_err(), ChainError::NotHeavier);
+        assert_eq!(chain.snapshot(), before);
+        extend(&mut chain, &miner, 1, 95_000);
+    }
+
+    /// Offered only what it already has, a chain has nothing to switch to.
+    #[test]
+    fn a_branch_made_of_our_own_blocks_is_not_a_reorg() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = chain_with_a_spend(&miner);
+        let before = chain.snapshot();
+        let ours = collected(&chain, 2);
+        assert_eq!(chain.try_reorg(&mut OsRng, &ours).unwrap_err(), ChainError::NotHeavier);
+        assert_eq!(chain.snapshot(), before);
+    }
+
+    /// Skipping the shared prefix must not skip validating what follows it.
+    #[test]
+    fn an_invalid_block_after_the_shared_prefix_restores_the_chain() {
+        let miner = Account::random(&mut OsRng);
+        let mut chain = chain_with_a_spend(&miner);
+        let before = chain.snapshot();
+
+        let mut fork = chain.clone();
+        fork.rollback_to(chain.height() - 2);
+        extend(&mut fork, &miner, 4, 90_000);
+        let mut branch = collected(&fork, 2);
+        // Break the first block that differs from ours: its proof of work.
+        let first_new = branch.len() - 4;
+        branch[first_new].0.header.nonce = branch[first_new].0.header.nonce.wrapping_add(1);
+
+        assert!(chain.try_reorg(&mut OsRng, &branch).is_err());
+        assert_eq!(chain.snapshot(), before, "the chain must be exactly as it was");
+        extend(&mut chain, &miner, 1, 99_000);
     }
 
     /// Rolling back a spend must un-spend its key image and remove its outputs —
