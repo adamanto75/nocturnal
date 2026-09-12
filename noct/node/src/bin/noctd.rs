@@ -5,8 +5,9 @@
 //! ```
 //!
 //! Defaults: P2P on 127.0.0.1:9333, RPC on 127.0.0.1:9334. If no `--miner-address`
-//! is given, a fresh account is generated and its address + spend secret are
-//! printed (ephemeral — for testnet/dev only).
+//! is given, the node mines to `miner.key` in its data directory, creating that
+//! file (owner-only) on first start. With no `--data-dir` nothing persists, so it
+//! mines to a throwaway address instead and says so.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
@@ -152,14 +153,35 @@ fn main() {
         i += 1;
     }
 
-    let miner_address = miner_address.unwrap_or_else(|| {
-        let account = Account::random(&mut OsRng);
-        // Must be an address for *this* network, or the node refuses to start.
-        let address = Address::new(network, account.spend_public, account.view_public);
-        eprintln!("generated ephemeral miner account (NOT persisted):");
-        eprintln!("  address:      {}", address.encode());
-        eprintln!("  spend secret: {}", hex::encode(account.spend_secret.to_bytes()));
-        address
+    // Addresses are per-network, or the node refuses to start.
+    let miner_address = miner_address.unwrap_or_else(|| match &data_dir {
+        // Whatever this node mines is spendable only with this key, so it is
+        // kept in the data directory rather than printed to the log.
+        Some(dir) => {
+            let path = dir.join("miner.key");
+            let (account, created) =
+                noct_node::miner_account_at(&path).unwrap_or_else(|e| fail(&e));
+            let address = Address::new(network, account.spend_public, account.view_public);
+            eprintln!(
+                "miner account {} {}",
+                if created { "created at" } else { "loaded from" },
+                path.display()
+            );
+            eprintln!("  address: {}", address.encode());
+            eprintln!("  keep that file — it is the only way to spend what this node mines");
+            address
+        }
+        // Nothing persists without a data directory, so there is nowhere to
+        // keep the key and no point printing it: saying what that costs is
+        // more use than a secret in a log.
+        None => {
+            let account = Account::random(&mut OsRng);
+            let address = Address::new(network, account.spend_public, account.view_public);
+            eprintln!("throwaway miner account (no --data-dir, so nothing is saved):");
+            eprintln!("  address: {}", address.encode());
+            eprintln!("  anything mined to it CANNOT be spent later — pass --miner-address to keep it");
+            address
+        }
     });
 
     // Fold in the baked-in seed nodes (unless opted out), resolving any hostnames.

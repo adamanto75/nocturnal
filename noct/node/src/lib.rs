@@ -1293,6 +1293,37 @@ pub struct MiningJob {
 }
 
 /// Wall-clock seconds since the Unix epoch.
+/// The miner account a node uses when started without `--miner-address`.
+///
+/// Loaded from `path`, or generated and saved there owner-only. It is saved
+/// rather than held in memory because whatever the node mines can only ever be
+/// spent with this key. The old behaviour printed the secret to the log
+/// instead, which put a spendable key into every log collector and terminal
+/// scrollback that saw it — and still lost the funds if that line was lost.
+///
+/// Returns the account and whether it was newly created. A file that exists but
+/// does not parse is an error and is never replaced: a key file that looks
+/// wrong to us may still be the only copy of someone's funds.
+pub fn miner_account_at(
+    path: &std::path::Path,
+) -> Result<(noct_core::keys::Account, bool), String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok((noct_wallet::client::load_account(text.trim())?, false)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let account = noct_core::keys::Account::random(&mut rand_core::OsRng);
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+            }
+            let encoded = hex::encode(account.spend_secret.to_bytes());
+            noct_wallet::secure_file::create_private(path, encoded.as_bytes())
+                .map_err(|e| format!("writing {}: {e}", path.display()))?;
+            Ok((account, true))
+        }
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2394,5 +2425,54 @@ mod store_replay_tests {
             1,
             "and the damage is total: the chain is left at genesis alone"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod miner_key_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("noct-minerkey-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// It must survive a restart. A node that generated a fresh account every
+    /// start would scatter its rewards over keys nobody kept.
+    #[test]
+    fn a_miner_key_is_created_once_and_then_reused() {
+        let dir = scratch("reuse");
+        let path = dir.join("miner.key");
+
+        let (first, created) = miner_account_at(&path).expect("creates one");
+        assert!(created, "the first call creates it");
+        let (again, created) = miner_account_at(&path).expect("reuses it");
+        assert!(!created, "the second call must not create another");
+        assert_eq!(first.spend_public, again.spend_public, "same account back");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a spendable key must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key file we cannot read is not a key file to replace: it may be the
+    /// only copy of someone's funds.
+    #[test]
+    fn an_unreadable_miner_key_is_refused_not_overwritten() {
+        let dir = scratch("garbage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("miner.key");
+        std::fs::write(&path, b"not a key at all").unwrap();
+
+        assert!(miner_account_at(&path).is_err(), "must refuse it");
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a key at all", "untouched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
