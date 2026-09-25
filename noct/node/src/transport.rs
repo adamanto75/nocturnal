@@ -385,6 +385,16 @@ pub struct Discovery {
     /// Observed on the testnet: eight dials, eight slots, six of them dead
     /// GitHub Actions runners learned by gossip from the daily join test. The
     /// one peer that worked never got a slot.
+    /// Addresses that turned out to be a second route to a peer we already
+    /// have, and when to consider them again.
+    ///
+    /// Backing them off is not enough: `dial_candidates` deliberately falls
+    /// back to the least-bad address when everything is held back, so on a
+    /// node whose book is mostly dead the alias got picked every 15 s anyway.
+    /// Held for a bounded time rather than forever, because the real link can
+    /// drop and then this address is the way back — a permanent mark is the
+    /// reservation leak of `ce98fea` all over again.
+    redundant: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     /// Addresses this node has itself connected to. Only these (and the
     /// operator's own seeds) are gossiped: an address learned from someone
     /// else's handshake is hearsay until we reach it, and passing hearsay on is
@@ -484,6 +494,7 @@ impl Discovery {
             banned: Arc::new(Mutex::new(HashMap::new())),
             self_nonce: OsRng.next_u64(),
             peer_nonces: Arc::new(Mutex::new(HashSet::new())),
+            redundant: Arc::new(Mutex::new(HashMap::new())),
             reached: Arc::new(Mutex::new(HashSet::new())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             ephemeral: false,
@@ -556,6 +567,30 @@ impl Discovery {
         // its own kind of forgetting.
         let secs = DIAL_BACKOFF_BASE_SECS.saturating_mul(1u64 << entry.0.min(DIAL_BACKOFF_MAX_SHIFT));
         entry.1 = Instant::now() + Duration::from_secs(secs.min(DIAL_BACKOFF_CAP_SECS));
+    }
+
+    /// How long an alias of an already-connected peer stays out of the dial
+    /// queue. Long enough to stop the 15-second churn, short enough that a
+    /// dropped link is re-found promptly.
+    const REDUNDANT_HOLD: Duration = Duration::from_secs(600);
+
+    /// This address reached a peer we are already connected to by another
+    /// route. Hold it back; the peer is not new and the slot is better spent.
+    pub fn note_redundant_link(&self, addr: SocketAddr) {
+        self.redundant.lock().unwrap().insert(addr, Instant::now() + Self::REDUNDANT_HOLD);
+    }
+
+    /// Is this address a currently-held alias of a peer we already have?
+    fn is_redundant(&self, addr: &SocketAddr, now: Instant) -> bool {
+        let mut r = self.redundant.lock().unwrap();
+        match r.get(addr) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                r.remove(addr);
+                false
+            }
+            None => false,
+        }
     }
 
     /// A dial succeeded: forget its failure history entirely, and remember
@@ -811,7 +846,7 @@ impl Discovery {
         let now = Instant::now();
         let mut usable: Vec<SocketAddr> = candidates
             .into_iter()
-            .filter(|a| !self.is_banned(a) && !self.in_backoff(a, now))
+            .filter(|a| !self.is_banned(a) && !self.in_backoff(a, now) && !self.is_redundant(a, now))
             .collect();
 
         // With no peers at all, dial the operator's seeds before anything else.
@@ -880,7 +915,10 @@ impl Discovery {
         };
         let mut soonest: Option<(Instant, SocketAddr)> = None;
         for a in known {
-            if self.is_banned(&a) {
+            // The fallback ignores backoff on purpose, but it must not ignore
+            // this: an alias of a peer we already have is not a peer we are
+            // missing, and dialing it can only produce another duplicate.
+            if self.is_banned(&a) || self.is_redundant(&a, now2) {
                 continue;
             }
             let until = {
@@ -1070,7 +1108,7 @@ fn spawn_peer_reader(
                         // Not a failure — the host is plainly reachable — but
                         // the same "not now", and a later real link clears it.
                         if let Some(a) = dialed {
-                            disc.note_dial_failure(a);
+                            disc.note_redundant_link(a);
                         }
                         end_reason = "duplicate link to a peer we already have";
                         break;
@@ -1872,6 +1910,29 @@ mod dial_backoff_tests {
         d.learn_seeds([seed]);
         d.learn([seed]);
         assert_eq!(d.share(None), vec![seed]);
+    }
+
+    /// A second link to a peer we already have must not be retried every cycle
+    /// — including by the fallback that exists to prevent dial starvation.
+    ///
+    /// Backoff alone did NOT fix this in production: seed1 and seed2 are linked
+    /// over one address pair and each held the other's second address, so with
+    /// the rest of the book dead the fallback picked the alias every 15 s and
+    /// the pair logged hundreds of thousands of duplicate drops.
+    #[test]
+    fn a_duplicate_link_is_held_back_even_by_the_fallback() {
+        let d = disc();
+        let alias = a(1);
+        let dead = a(2);
+        d.learn([alias, dead]);
+        d.note_dial_failure(dead);           // everything else is held back
+        d.note_redundant_link(alias);
+
+        let c = d.dial_candidates();
+        assert!(
+            !c.contains(&alias),
+            "an alias of a peer we already have must not be offered, even as a last resort"
+        );
     }
 
     /// A second link to a peer we already have must not be retried every cycle.
