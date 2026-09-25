@@ -944,15 +944,25 @@ impl Discovery {
     /// all eight outbound slots on them before it ever reaches a real peer.
     /// Backoff protects US from a dead address; only this protects everyone we
     /// talk to.
-    fn share(&self, exclude: Option<SocketAddr>) -> Vec<SocketAddr> {
+    fn share(&self, requester: Option<SocketAddr>) -> Vec<SocketAddr> {
+        // What is worth sending depends on who is asking. A peer that reached
+        // us over a public address cannot use our LAN, and handing it
+        // 10.10.x.x fills its dial slots with addresses that can only time
+        // out. CI's joiner did exactly that on 2026-09-25: it synced 543
+        // blocks, learned five of our private addresses, spent every outbound
+        // slot on them and finished at zero peers. We have always filtered the
+        // gossip we RECEIVE for routability; this is the other half — not
+        // sending what the recipient cannot possibly use.
+        let private_peer = requester.map(|a| Self::is_private_scope(a.ip())).unwrap_or(false);
         let reached = self.reached.lock().unwrap();
         let seeds = self.seeds.lock().unwrap();
         self.book
             .lock()
             .unwrap()
             .iter()
-            .filter(|a| Some(**a) != exclude)
+            .filter(|a| Some(**a) != requester)
             .filter(|a| reached.contains(*a) || seeds.contains(*a))
+            .filter(|a| private_peer || !Self::is_private_scope(a.ip()))
             .take(MAX_SHARE)
             .copied()
             .collect()
@@ -1883,6 +1893,32 @@ mod dial_backoff_tests {
         format!("10.0.0.{n}:19333").parse().unwrap()
     }
 
+    /// **Why CI could not join.** A peer that reached us over a public address
+    /// cannot use our LAN: it spends its outbound slots on certain timeouts.
+    /// The joiner synced 543 blocks, learned five of our 10.10.x.x addresses
+    /// and ended at zero peers, unable to get back to a seed.
+    #[test]
+    fn a_public_peer_is_never_told_about_private_addresses() {
+        let d = disc();
+        let lan = a(1);
+        let public_addr: SocketAddr = "8.8.8.8:19333".parse().unwrap();
+        d.learn([lan, public_addr]);
+        d.note_dial_success(lan);
+        d.note_dial_success(public_addr);
+
+        let asked_from_outside: SocketAddr = "93.184.216.34:19333".parse().unwrap();
+        assert_eq!(
+            d.share(Some(asked_from_outside)),
+            vec![public_addr],
+            "an outside peer gets only addresses it could actually reach"
+        );
+
+        let asked_from_lan: SocketAddr = "10.0.0.9:19333".parse().unwrap();
+        let to_lan = d.share(Some(asked_from_lan));
+        assert!(to_lan.contains(&lan), "a LAN peer can use LAN addresses");
+        assert_eq!(to_lan.len(), 2, "and the public one as well");
+    }
+
     /// Hearsay is not evidence. An address we merely heard about must not be
     /// passed on as though we had reached it: that is how the testnet's seeds
     /// handed every newcomer a list of CI runners dead since August.
@@ -1893,11 +1929,13 @@ mod dial_backoff_tests {
         let hearsay = a(2);
         d.learn([reached, hearsay]);
 
-        assert!(d.share(None).is_empty(), "nothing is worth sharing before we reach anything");
+        // Asked by a LAN peer, so scope is not what is being tested here.
+        let asker: SocketAddr = "10.0.0.9:19333".parse().unwrap();
+        assert!(d.share(Some(asker)).is_empty(), "nothing worth sharing before we reach anything");
 
         d.note_dial_success(reached);
-        assert_eq!(d.share(None), vec![reached], "only the one we actually reached");
-        assert!(!d.share(None).contains(&hearsay));
+        assert_eq!(d.share(Some(asker)), vec![reached], "only the one we actually reached");
+        assert!(!d.share(Some(asker)).contains(&hearsay));
     }
 
     /// Configured seeds are the operator's own statement, not gossip, so they
@@ -1909,7 +1947,8 @@ mod dial_backoff_tests {
         let seed = a(3);
         d.learn_seeds([seed]);
         d.learn([seed]);
-        assert_eq!(d.share(None), vec![seed]);
+        let asker: SocketAddr = "10.0.0.9:19333".parse().unwrap();
+        assert_eq!(d.share(Some(asker)), vec![seed]);
     }
 
     /// A second link to a peer we already have must not be retried every cycle
