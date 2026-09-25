@@ -561,6 +561,20 @@ pub struct NodeState {
     reorgs_without_ancestor: u32,
     /// Highest height any peer has advertised — the initial-block-download target.
     peer_best_height: u64,
+    /// Per peer, what [`Self::peer_best_height`] was when we last *started* a
+    /// branch collection from it.
+    ///
+    /// This is what stops a replayed block from making us download the same
+    /// window again — a job that used to be done by marking the trigger block
+    /// seen. That was the wrong tool: a block marked seen is never reconsidered,
+    /// so after one failed escalation the same trigger could never escalate
+    /// again. A node forked deeper than [`MAX_REORG_DEPTH`] would therefore make
+    /// a single collection attempt, fail to find a common ancestor, and then go
+    /// quiet for good — never reaching the repeat count that raises `stranded`,
+    /// and never warning. Gating on the peer's advertised height keeps the
+    /// bandwidth protection (a replay does not raise it) while letting a real,
+    /// advancing network re-trigger the attempt.
+    collect_attempt_best: HashMap<usize, u64>,
     /// On-disk block log (writes happen off-thread); when present, every accepted
     /// block is queued for persistence.
     store: Option<AsyncStore>,
@@ -596,6 +610,7 @@ impl NodeState {
             collected_txs: 0,
             peers_serving_invalid_blocks: std::collections::HashSet::new(),
             peer_best_height: 0,
+            collect_attempt_best: HashMap::new(),
             store: None,
             sync: HashMap::new(),
             mining: MiningControl::new(false, 1),
@@ -939,9 +954,10 @@ impl NodeState {
             // peer is on a competing branch worth evaluating.
             let ours = self.chain.block_id_at(block_height);
             if ours != Some(block.id()) {
-                // Remember this trigger so a replay of the same block cannot make
-                // us re-download the whole branch again (bandwidth amplification).
-                self.seen_blocks.insert(block.id());
+                // Deliberately NOT marked seen: it was never applied, and the
+                // dedup above is only for blocks that were. Marking it here
+                // silenced escalation for good — one attempt, then nothing.
+                // `begin_branch_collection` does the rate limiting now.
                 self.begin_branch_collection(peer, out);
             }
             return;
@@ -970,7 +986,9 @@ impl NodeState {
             }
             // Right height but doesn't build on our tip: the peer forked from us.
             Err(ChainError::BadPrevId) => {
-                self.seen_blocks.insert(block.id()); // dedup replay of this trigger
+                // Not marked seen, for the reason given in the sibling case
+                // above: an unapplied block has to stay re-triggerable or a deep
+                // fork is never re-evaluated.
                 self.begin_branch_collection(peer, out);
             }
             // Ahead of *our* clock, not invalid. This is the only validity rule
@@ -1039,6 +1057,7 @@ impl NodeState {
     /// and that ordinary session churn causes by accident. This node has
     /// already been OOM-killed once in production.
     pub fn forget_peer(&mut self, peer: usize) {
+        self.collect_attempt_best.remove(&peer);
         if let Some(abandoned) = self.sync.remove(&peer) {
             let txs: usize = abandoned.blocks.iter().map(|(_, t)| t.len()).sum();
             self.collected_txs = self.collected_txs.saturating_sub(txs);
@@ -1058,6 +1077,18 @@ impl NodeState {
         if self.sync.contains_key(&peer) {
             return; // already collecting from this peer
         }
+        // We have already judged this peer at this advertised height, so whatever
+        // it just sent tells us nothing new. Waiting until it advertises a taller
+        // chain costs nothing when it is honest, and stops a replayed block from
+        // making us download the same window over and over.
+        if self
+            .collect_attempt_best
+            .get(&peer)
+            .is_some_and(|&tried_at| tried_at >= self.peer_best_height)
+        {
+            return;
+        }
+        self.collect_attempt_best.insert(peer, self.peer_best_height);
         // Never below 1: genesis is shared by every honest peer and cannot be
         // replaced, so a fork can only ever start at height 1 or later.
         let from = self.chain.height().saturating_sub(MAX_REORG_DEPTH).max(1);
@@ -1093,6 +1124,9 @@ impl NodeState {
         let reorg = match self.chain.try_reorg(rng, &branch) {
             Ok(r) => {
                 self.reorgs_without_ancestor = 0;
+                // The chain moved, so where every peer stands relative to us has
+                // to be judged afresh; a gate recorded before the switch is stale.
+                self.collect_attempt_best.clear();
                 r
             }
             // Benign outcomes — keep our chain, do not penalise the peer:
@@ -1784,8 +1818,21 @@ mod tests {
         assert_eq!(out2.misbehavior, 0, "an honest deep fork must not be penalised");
     }
 
+    /// The reverse of what this test used to assert, deliberately.
+    ///
+    /// It pinned that a fork trigger is marked *seen* so a replay is deduped.
+    /// That protection was real but the mechanism was wrong: a block marked seen
+    /// is never reconsidered, so once an escalation failed, the same trigger
+    /// could never escalate again — which is how a node forked deeper than
+    /// `MAX_REORG_DEPTH` ended up silent instead of reporting `stranded`
+    /// (production, 2026-09-25). The dedup above the check even says it is only
+    /// for blocks that were *applied*, and this one was not.
+    ///
+    /// The replay protection now lives in `begin_branch_collection`, gated on the
+    /// peer's advertised height — see
+    /// `a_replayed_trigger_does_not_start_the_same_collection_twice`.
     #[test]
-    fn fork_trigger_block_is_marked_seen_to_stop_replay() {
+    fn a_fork_trigger_is_not_marked_seen_so_escalation_can_retry() {
         use noct_core::block::{Block, BlockHeader, Coinbase};
 
         let miner = wallet();
@@ -1808,9 +1855,11 @@ mod tests {
         assert!(!node.seen_blocks.contains(&fork.id()));
         let mut out = Reaction::default();
         node.react_block(&mut OsRng, 0, fork.clone(), vec![], &mut out);
-        // The trigger is remembered, so a replay of the same block is deduped
-        // instead of re-collecting the whole branch again.
-        assert!(node.seen_blocks.contains(&fork.id()));
+        assert!(
+            !node.seen_blocks.contains(&fork.id()),
+            "an unapplied trigger must stay re-triggerable, or escalation dies after one attempt"
+        );
+        assert!(node.sync.contains_key(&0), "it should have started collecting the branch");
     }
 
     #[test]
@@ -2264,6 +2313,146 @@ mod tests {
         // And it gets mined into the next block.
         let (_, txs) = node.mine_block(&mut OsRng).unwrap();
         assert!(txs.iter().any(|t| t.hash() == tx.hash()));
+    }
+
+    /// Run one full escalation round against a peer that is on a different chain:
+    /// hand over the peer's tip, then serve every block the collector asks for
+    /// out of the peer's chain, until the collection completes and is judged.
+    ///
+    /// Returns the number of blocks the collector pulled, which is 0 when no
+    /// collection was started at all.
+    fn escalation_round(ours: &mut NodeState, theirs: &NodeState, peer: usize) -> usize {
+        let tip = theirs.chain.block_at(theirs.chain.height() - 1).expect("their tip");
+        let mut pending =
+            ours.react(&mut OsRng, peer, Wire::Block(tip.block.clone(), tip.txs.clone()), false);
+        let mut served = 0;
+        // Follow the request/response chain the transport would carry.
+        while let Some(Wire::GetBlock(h)) = pending.reply.into_iter().find(|m| matches!(m, Wire::GetBlock(_)))
+        {
+            let Some(stored) = theirs.chain.block_at(h) else { break };
+            served += 1;
+            pending = ours.react(
+                &mut OsRng,
+                peer,
+                Wire::Block(stored.block.clone(), stored.txs.clone()),
+                false,
+            );
+            if served > 4 * MAX_COLLECT_SPAN as usize {
+                panic!("collector never finished");
+            }
+        }
+        served
+    }
+
+    /// Two chains that diverged deeper than `MAX_REORG_DEPTH` cannot be joined by
+    /// reorganising, and the node is supposed to say so: after enough failed
+    /// attempts it warns and `/info` reports `"stranded":true`, which is the only
+    /// symptom monitoring can see.
+    ///
+    /// It never got there. Escalation marked the trigger block *seen* before
+    /// attempting the collection, so the next copy of that block was deduped and
+    /// escalation never ran again — one attempt, counter stuck at 1, flag never
+    /// raised, nothing logged. Observed in production 2026-09-25 on the node that
+    /// missed a testnet reset: height 234 against peers at 680, three healthy
+    /// peers, `"stranded":false`, and a single `collecting branch` line in a
+    /// fifteen-minute log.
+    #[test]
+    fn a_node_forked_deeper_than_the_cap_keeps_trying_until_it_reports_stranded() {
+        let threshold = 8; // the count /info turns into "stranded"
+        // Two chains that share only genesis: each mines its own blocks, so they
+        // disagree from height 1. They must also both be taller than
+        // MAX_REORG_DEPTH, or the collection window reaches back to genesis and
+        // the fork is legitimately reorg-able — which is what happens on a
+        // shallow fork, and is not the condition under test.
+        let deep = MAX_REORG_DEPTH as usize + 10;
+        let mut ours_w = wallet();
+        let mut ours = test_node(ours_w.address());
+        mine_n(&mut ours, &mut ours_w, deep);
+
+        let mut theirs_w = wallet();
+        let mut theirs = test_node(theirs_w.address());
+        mine_n(&mut theirs, &mut theirs_w, deep + 1);
+
+        assert_ne!(
+            ours.chain.block_id_at(1),
+            theirs.chain.block_id_at(1),
+            "test needs chains that disagree from height 1"
+        );
+
+        // Each round the peer is one block taller, exactly as a live network that
+        // keeps mining looks to a node stuck on a dead fork.
+        for round in 1..=threshold {
+            mine_n(&mut theirs, &mut theirs_w, 1);
+            let served = escalation_round(&mut ours, &theirs, 0);
+            assert!(
+                served > 0,
+                "round {round}: no collection was attempted — escalation is dead again"
+            );
+            assert_eq!(
+                ours.reorgs_without_ancestor(), round as u32,
+                "round {round}: every failed attempt must be counted"
+            );
+        }
+
+        assert!(
+            ours.reorgs_without_ancestor() >= threshold as u32,
+            "a permanently forked node must reach the count that raises \"stranded\""
+        );
+    }
+
+    /// The bandwidth protection that marking-seen used to provide has to survive:
+    /// a peer replaying the same block must not make us download the window
+    /// again. Nothing it sends raises its advertised height, so nothing licenses
+    /// a second attempt.
+    #[test]
+    fn a_replayed_trigger_does_not_start_the_same_collection_twice() {
+        // Deeper than the reorg cap, so the attempt fails and the gate is what
+        // decides whether a replay gets to try again (on a shallow fork the reorg
+        // succeeds and there is nothing to replay).
+        let deep = MAX_REORG_DEPTH as usize + 10;
+        let mut ours_w = wallet();
+        let mut ours = test_node(ours_w.address());
+        mine_n(&mut ours, &mut ours_w, deep);
+
+        let mut theirs_w = wallet();
+        let mut theirs = test_node(theirs_w.address());
+        mine_n(&mut theirs, &mut theirs_w, deep + 1);
+
+        let first = escalation_round(&mut ours, &theirs, 0);
+        assert!(first > 0, "the first attempt should collect");
+        let after_first = ours.reorgs_without_ancestor();
+
+        // Same peer, same tip, nothing new advertised: replay it several times.
+        for _ in 0..5 {
+            assert_eq!(
+                escalation_round(&mut ours, &theirs, 0),
+                0,
+                "a replay must not re-open the collection"
+            );
+        }
+        assert_eq!(
+            ours.reorgs_without_ancestor(), after_first,
+            "a replay must not even count as an attempt"
+        );
+    }
+
+    /// A peer that leaves takes its gate with it, so a reconnecting peer is
+    /// judged on its own merits rather than inheriting the last session's.
+    #[test]
+    fn a_peer_that_leaves_does_not_leave_its_collection_gate_behind() {
+        let mut w = wallet();
+        let mut node = test_node(w.address());
+        mine_n(&mut node, &mut w, 3);
+        node.peer_best_height = 10_000;
+
+        node.begin_branch_collection(5, &mut Reaction::default());
+        assert!(node.collect_attempt_best.contains_key(&5));
+
+        node.forget_peer(5);
+        assert!(
+            !node.collect_attempt_best.contains_key(&5),
+            "the gate must not outlive the peer's session"
+        );
     }
 }
 
