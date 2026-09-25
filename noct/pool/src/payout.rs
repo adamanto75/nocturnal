@@ -599,6 +599,26 @@ impl PayoutLedger {
 /// Returns `(miner, owed, net)`. A miner whose share of the fee would swallow
 /// the whole payment is dropped — paying them nothing while marking them settled
 /// would quietly confiscate their work.
+/// Cap what a single transaction pays one miner, so the payout can actually be
+/// built.
+///
+/// A pool's income arrives as one coinbase output per block it finds, so a
+/// balance of a few thousand NOCT *is* a few thousand outputs. Paying it in one
+/// transaction needs a ring input for each: ~5,500 inputs for 5,000 NOCT, tens
+/// of megabytes against a node body limit of 8 MiB, and minutes of signing for
+/// something that is then refused. Paying in instalments keeps every payout
+/// small enough to build, send and verify, and the rest follows on the next
+/// cycles — the ledger already tracks partial payments, because `begin_payment`
+/// takes any amount up to what is owed.
+///
+/// `max == 0` means no cap.
+pub fn cap_payments(batch: Vec<(MinerId, u64)>, max: u64) -> Vec<(MinerId, u64)> {
+    if max == 0 {
+        return batch;
+    }
+    batch.into_iter().map(|(miner, amount)| (miner, amount.min(max))).collect()
+}
+
 pub fn deduct_fee(payees: &[(MinerId, u64)], fee: u64) -> Vec<(MinerId, u64, u64)> {
     let total: u128 = payees.iter().map(|(_, a)| *a as u128).sum();
     if total == 0 {
@@ -1090,5 +1110,18 @@ mod tests {
         assert_eq!(again.payments()[0].txid.as_deref(), Some("deadbeef"));
         assert_eq!(again.payments()[0].submitted_height, None);
         assert_eq!(again.pending_rounds()[0].splits.len(), 2);
+    }
+
+    /// A balance far larger than one transaction can carry is paid in
+    /// instalments, not attempted whole.
+    #[test]
+    fn a_payment_is_capped_so_the_transaction_can_be_built() {
+        let batch = vec![("alice".to_string(), 5_000), ("bob".to_string(), 10)];
+        assert_eq!(
+            cap_payments(batch.clone(), 100),
+            vec![("alice".to_string(), 100), ("bob".to_string(), 10)],
+            "over the cap is trimmed, under it is untouched"
+        );
+        assert_eq!(cap_payments(batch.clone(), 0), batch, "0 means no cap");
     }
 }

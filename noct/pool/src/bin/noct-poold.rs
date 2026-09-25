@@ -128,6 +128,12 @@ const PAYOUT_INTERVAL: Duration = Duration::from_secs(30);
 /// proof, and one slot must be left for change.
 const MAX_PAYOUTS_PER_TX: usize = 8;
 
+/// The most one transaction pays a single miner. See `payout::cap_payments`:
+/// pool income is one coinbase output per block found, so paying thousands of
+/// NOCT at once would need thousands of ring inputs and could never be built.
+/// About fifty block rewards' worth, which is a comfortable transaction.
+const MAX_PAYMENT_PER_TX: u64 = 50 * noct_core::emission::ATOMIC_UNITS;
+
 /// A payout not mined within this many blocks of being sent never will be: the
 /// chain that accepted it is not the chain that survived. Same depth the chain
 /// itself treats as settled.
@@ -1268,7 +1274,11 @@ fn run_payouts(
                 eprintln!("WARNING: could not persist the payout ledger: {e}");
             }
         }
-        s.ledger.payable(threshold).into_iter().take(MAX_PAYOUTS_PER_TX).collect::<Vec<_>>()
+        let payable =
+            s.ledger.payable(threshold).into_iter().take(MAX_PAYOUTS_PER_TX).collect::<Vec<_>>();
+        // In instalments: a whole balance can be more outputs than one
+        // transaction can spend.
+        payout::cap_payments(payable, MAX_PAYMENT_PER_TX)
     };
     if batch.is_empty() {
         return;
