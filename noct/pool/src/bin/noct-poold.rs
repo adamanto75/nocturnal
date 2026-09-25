@@ -128,6 +128,16 @@ const PAYOUT_INTERVAL: Duration = Duration::from_secs(30);
 /// proof, and one slot must be left for change.
 const MAX_PAYOUTS_PER_TX: usize = 8;
 
+/// A payout not mined within this many blocks of being sent never will be: the
+/// chain that accepted it is not the chain that survived. Same depth the chain
+/// itself treats as settled.
+const PAYMENT_DEADLINE: u64 = COINBASE_MATURITY;
+
+/// How far back a confirmation pass looks for payout transactions. Comfortably
+/// more than the deadline, so a payment is always judged on blocks actually
+/// read rather than on silence.
+const PAYMENT_SCAN_WINDOW: u64 = 4 * PAYMENT_DEADLINE;
+
 /// The node this pool mines against, and how it verifies it.
 #[derive(Clone)]
 struct NodeLink {
@@ -1095,7 +1105,7 @@ fn submit_share(
                 // the part never credited to a miner.
                 let (_operator, to_miners) = payout::apply_fee(reward, fee_bps);
                 let splits = s.pool.split_reward(to_miners);
-                s.ledger.record_block(height, reward, splits);
+                s.ledger.record_block(height, &id, reward, splits);
                 if let Err(e) = s.ledger.save() {
                     eprintln!("WARNING: could not persist the payout ledger: {e}");
                 }
@@ -1179,12 +1189,81 @@ fn run_payouts(
     let client = NodeClient::with_token(node.endpoint.clone(), token.clone()).with_pin(node.pin);
     let Ok(height) = client.height() else { return };
 
-    // Credit rounds the chain has now buried, then see who is payable.
+    // Settle what earlier cycles sent. Done before crediting, so a payment
+    // that never landed is back in its miner's balance in time to go out again
+    // in this same cycle.
+    let sent_at: Vec<u64> = {
+        let s = shared.lock().unwrap();
+        s.ledger
+            .payments()
+            .iter()
+            .filter(|p| p.state == payout::PaymentState::Sent)
+            .filter_map(|p| p.submitted_height)
+            .collect()
+    };
+    if let Some(oldest) = sent_at.iter().copied().min() {
+        let from = oldest.max(height.saturating_sub(PAYMENT_SCAN_WINDOW));
+        let mut seen: HashSet<String> = HashSet::new();
+        // Only what was actually read may be judged, so track how far we got:
+        // a gap in reading is a gap in knowledge, not evidence of absence.
+        let mut scanned_to = from;
+        for h in from..height {
+            let Ok((_, txs)) = client.block(h) else { break };
+            for tx in &txs {
+                seen.insert(hex::encode(tx.hash()));
+            }
+            scanned_to = h + 1;
+        }
+        let mut s = shared.lock().unwrap();
+        match s.ledger.confirm_payments(scanned_to, PAYMENT_DEADLINE, from, |txid| {
+            seen.contains(txid)
+        }) {
+            Ok(c) if c.confirmed + c.reopened > 0 => eprintln!(
+                "payments settled at height {scanned_to}: {} confirmed on chain, {} never arrived and went back to their miners",
+                c.confirmed, c.reopened
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("WARNING: could not persist the payout ledger: {e}"),
+        }
+    }
+
+    // Credit rounds the chain has buried AND still agrees with. Ids are
+    // resolved without the lock held: an RPC per maturing round while holding
+    // it would stall every share submission behind the network.
+    let ready: Vec<u64> = {
+        let s = shared.lock().unwrap();
+        s.ledger
+            .pending_rounds()
+            .iter()
+            .filter(|r| height >= r.height.saturating_add(COINBASE_MATURITY))
+            .map(|r| r.height)
+            .collect()
+    };
+    let mut canonical: HashMap<u64, String> = HashMap::new();
+    for h in ready {
+        if let Ok((block, _)) = client.block(h) {
+            canonical.insert(h, hex::encode(block.id()));
+        }
+    }
     let batch = {
         let mut s = shared.lock().unwrap();
-        let matured = s.ledger.mature(height, COINBASE_MATURITY);
-        if matured > 0 {
-            eprintln!("credited {matured} matured round(s) at height {height}");
+        let matured =
+            s.ledger.mature_verified(height, COINBASE_MATURITY, |h| canonical.get(&h).cloned());
+        if matured.credited > 0 || matured.orphaned > 0 {
+            eprintln!(
+                "credited {} matured round(s) at height {height}{}{}",
+                matured.credited,
+                if matured.orphaned > 0 {
+                    format!("; dropped {} whose block is no longer on the chain", matured.orphaned)
+                } else {
+                    String::new()
+                },
+                if matured.unverified > 0 {
+                    format!("; holding {} the chain could not confirm", matured.unverified)
+                } else {
+                    String::new()
+                }
+            );
             if let Err(e) = s.ledger.save() {
                 eprintln!("WARNING: could not persist the payout ledger: {e}");
             }
@@ -1302,7 +1381,7 @@ fn run_payouts(
         Ok(reply) if reply.contains("\"accepted\":true") => {
             let mut s = shared.lock().unwrap();
             for id in ids {
-                let _ = s.ledger.complete_payment(id, &txid);
+                let _ = s.ledger.complete_payment(id, &txid, height);
             }
             eprintln!(
                 "paid {} miner(s) {} NOCT after a shared {} NOCT fee — {txid}",

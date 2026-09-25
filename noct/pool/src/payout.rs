@@ -67,6 +67,31 @@ pub struct Round {
     pub reward: u64,
     /// How that reward divides between miners, from the share window.
     pub splits: Vec<(MinerId, u64)>,
+    /// The id of the block this round is for, so maturity can check the chain
+    /// still holds *that* block at that height. `None` only for rounds read
+    /// from a ledger written before ids were kept; those are held, never
+    /// credited on trust.
+    pub block_id: Option<String>,
+}
+
+/// What one pass of [`PayoutLedger::mature_verified`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Matured {
+    /// Rounds whose block is still the block at its height: credited.
+    pub credited: usize,
+    /// Rounds whose block was replaced by another: dropped, nobody paid.
+    pub orphaned: usize,
+    /// Rounds the chain could not be consulted about, or with no id: held.
+    pub unverified: usize,
+}
+
+/// What one pass of [`PayoutLedger::confirm_payments`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Confirmations {
+    /// Payments now seen in a block.
+    pub confirmed: usize,
+    /// Payments that never arrived, returned to the miner's balance.
+    pub reopened: usize,
 }
 
 /// Where a payment got to. The unhappy state is deliberately sticky.
@@ -74,8 +99,16 @@ pub struct Round {
 pub enum PaymentState {
     /// Recorded, and being sent right now. Only ever seen within one run.
     InFlight,
-    /// Confirmed away: we have a transaction id.
+    /// Sent to a node, which accepted it. That is not the same as mined:
+    /// see [`PayoutLedger::confirm_payments`].
     Sent,
+    /// Seen in a block on the chain. Settled, and the only state that means
+    /// the miner actually has the money.
+    Confirmed,
+    /// Sent but never mined, and past the deadline — the chain that accepted
+    /// it is not the chain that survived. The balance went back to the miner;
+    /// the record stays, so the history is not silently rewritten.
+    Lost,
     /// The process stopped while a payment was in flight, so we cannot tell
     /// whether it reached the network. Held for a human to reconcile — never
     /// re-sent automatically, because a duplicate payment cannot be undone.
@@ -87,6 +120,8 @@ impl PaymentState {
         match self {
             PaymentState::InFlight => "inflight",
             PaymentState::Sent => "sent",
+            PaymentState::Confirmed => "confirmed",
+            PaymentState::Lost => "lost",
             PaymentState::Unresolved => "unresolved",
         }
     }
@@ -95,6 +130,8 @@ impl PaymentState {
         match s {
             "inflight" => Some(PaymentState::InFlight),
             "sent" => Some(PaymentState::Sent),
+            "confirmed" => Some(PaymentState::Confirmed),
+            "lost" => Some(PaymentState::Lost),
             "unresolved" => Some(PaymentState::Unresolved),
             _ => None,
         }
@@ -110,6 +147,9 @@ pub struct Payment {
     pub state: PaymentState,
     /// Transaction id, once known.
     pub txid: Option<String>,
+    /// Chain height when it was sent, so "not mined yet" can be told from
+    /// "never mined". `None` for records written before this was kept.
+    pub submitted_height: Option<u64>,
 }
 
 /// The pool's books.
@@ -161,8 +201,19 @@ impl PayoutLedger {
     /// from it; the difference is the operator's fee, which is recorded so the
     /// ledger accounts for every atomic unit of every block rather than leaving
     /// an unexplained gap for whoever reads it later.
-    pub fn record_block(&mut self, height: u64, reward: u64, splits: Vec<(MinerId, u64)>) {
-        self.rounds.push(Round { height, reward, splits });
+    pub fn record_block(
+        &mut self,
+        height: u64,
+        block_id: &str,
+        reward: u64,
+        splits: Vec<(MinerId, u64)>,
+    ) {
+        self.rounds.push(Round {
+            height,
+            reward,
+            splits,
+            block_id: Some(block_id.to_string()),
+        });
     }
 
     /// What the operator has kept from rounds the chain has buried — money it
@@ -188,24 +239,56 @@ impl PayoutLedger {
         (r.reward as u128).saturating_sub(to_miners)
     }
 
-    /// Credit every round the chain has now buried by `maturity` blocks,
-    /// returning how many were credited.
-    pub fn mature(&mut self, chain_height: u64, maturity: u64) -> usize {
+    /// Credit the rounds the chain has buried by `maturity` blocks **and still
+    /// agrees with**: `canonical_id(height)` must return this round's own block
+    /// id.
+    ///
+    /// Waiting out the maturity window was never enough, and the pool paid for
+    /// assuming it was. A block accepted by one node and then replaced by a
+    /// reorg is gone, and no amount of elapsed time brings it back; crediting
+    /// it anyway invented money the pool never had — 1,861 rounds of it, found
+    /// by the 2026-09-12 audit. A round whose block is no longer at its height
+    /// is dropped, and nobody is paid for it.
+    ///
+    /// A round that cannot be checked — the chain did not answer, or the
+    /// record predates ids — is **held**, not credited. Crediting on an
+    /// unverified guess is precisely the defect this exists to stop.
+    pub fn mature_verified(
+        &mut self,
+        chain_height: u64,
+        maturity: u64,
+        canonical_id: impl Fn(u64) -> Option<String>,
+    ) -> Matured {
         let (ready, waiting): (Vec<Round>, Vec<Round>) = std::mem::take(&mut self.rounds)
             .into_iter()
             .partition(|r| chain_height >= r.height.saturating_add(maturity));
         self.rounds = waiting;
-        for round in &ready {
+
+        let mut out = Matured::default();
+        for round in ready {
+            let still_ours = match (&round.block_id, canonical_id(round.height)) {
+                (Some(ours), Some(chain)) => *ours == chain,
+                // No id to compare, or no answer from the chain: hold it.
+                _ => {
+                    out.unverified += 1;
+                    self.rounds.push(round);
+                    continue;
+                }
+            };
+            if !still_ours {
+                out.orphaned += 1;
+                continue;
+            }
             for (miner, amount) in &round.splits {
                 *self.owed.entry(miner.clone()).or_insert(0) += *amount;
                 self.credited_total += *amount as u128;
             }
             // The operator's cut is realised at exactly the same moment the
-            // miners' is, and for the same reason: before maturity a reorg can
-            // still erase the block.
-            self.operator_total += Self::round_fee(round);
+            // miners' is, and for the same reason.
+            self.operator_total += Self::round_fee(&round);
+            out.credited += 1;
         }
-        ready.len()
+        out
     }
 
     /// Miners owed at least `threshold`, largest first.
@@ -263,18 +346,80 @@ impl PayoutLedger {
             amount,
             state: PaymentState::InFlight,
             txid: None,
+            submitted_height: None,
         });
         self.save()?;
         Ok(id)
     }
 
-    /// The payment reached the network.
-    pub fn complete_payment(&mut self, id: u64, txid: &str) -> std::io::Result<()> {
+    /// A node accepted the payment. `chain_height` is recorded so
+    /// [`Self::confirm_payments`] can later tell "not mined yet" from "never
+    /// mined": accepted is not the same as settled.
+    pub fn complete_payment(
+        &mut self,
+        id: u64,
+        txid: &str,
+        chain_height: u64,
+    ) -> std::io::Result<()> {
         if let Some(p) = self.payments.iter_mut().find(|p| p.id == id) {
             p.state = PaymentState::Sent;
             p.txid = Some(txid.to_string());
+            p.submitted_height = Some(chain_height);
         }
         self.save()
+    }
+
+    /// Settle sent payments against the chain.
+    ///
+    /// `on_chain(txid)` says whether that transaction is in a block. One that
+    /// is has really been paid. One that has not appeared within `deadline`
+    /// blocks was accepted onto a chain that did not survive, so the balance
+    /// goes back to the miner and the record is kept as `Lost` rather than
+    /// quietly rewritten. Without this the pool recorded 626 payouts as sent
+    /// that never existed on the chain (2026-09-12 audit).
+    ///
+    /// A `Sent` record with no submitted height (written before heights were
+    /// kept) is never given up on automatically: it is left for a human, the
+    /// same care `Unresolved` gets, because paying twice cannot be undone.
+    pub fn confirm_payments(
+        &mut self,
+        chain_height: u64,
+        deadline: u64,
+        scanned_from: u64,
+        on_chain: impl Fn(&str) -> bool,
+    ) -> std::io::Result<Confirmations> {
+        let mut out = Confirmations::default();
+        let mut give_back: Vec<(MinerId, u64)> = Vec::new();
+        for p in self.payments.iter_mut() {
+            if p.state != PaymentState::Sent {
+                continue;
+            }
+            let Some(txid) = p.txid.as_deref() else { continue };
+            if on_chain(txid) {
+                p.state = PaymentState::Confirmed;
+                out.confirmed += 1;
+                continue;
+            }
+            let Some(sent_at) = p.submitted_height else { continue };
+            // `on_chain` only knows about the range that was scanned. Judging a
+            // payment older than that would mean calling it lost on the
+            // strength of not having looked — and paying the miner twice.
+            if sent_at < scanned_from {
+                continue;
+            }
+            if chain_height > sent_at.saturating_add(deadline) {
+                p.state = PaymentState::Lost;
+                give_back.push((p.miner.clone(), p.amount));
+                out.reopened += 1;
+            }
+        }
+        for (miner, amount) in give_back {
+            *self.owed.entry(miner).or_insert(0) += amount;
+        }
+        if out.confirmed + out.reopened > 0 {
+            self.save()?;
+        }
+        Ok(out)
     }
 
     /// The send failed *before* reaching the network, so the money is still
@@ -318,7 +463,14 @@ impl PayoutLedger {
     /// "paid", but none may appear or vanish.
     pub fn audit(&self) -> bool {
         let owed: u128 = self.owed.values().map(|&v| v as u128).sum();
-        let recorded: u128 = self.payments.iter().map(|p| p.amount as u128).sum();
+        // A `Lost` payment's amount went back to `owed`; counting it here
+        // as well would make the books balance only by double-counting it.
+        let recorded: u128 = self
+            .payments
+            .iter()
+            .filter(|p| p.state != PaymentState::Lost)
+            .map(|p| p.amount as u128)
+            .sum();
         owed + recorded == self.credited_total
     }
 
@@ -345,19 +497,26 @@ impl PayoutLedger {
         for r in &self.rounds {
             let splits: Vec<String> =
                 r.splits.iter().map(|(m, a)| format!("{m}={a}")).collect();
-            out.push_str(&format!("round {} {} {}\n", r.height, r.reward, splits.join(",")));
+            out.push_str(&format!(
+                "round {} {} {} {}\n",
+                r.height,
+                r.reward,
+                splits.join(","),
+                r.block_id.as_deref().unwrap_or("-")
+            ));
         }
         for (miner, amount) in &self.owed {
             out.push_str(&format!("owed {miner} {amount}\n"));
         }
         for p in &self.payments {
             out.push_str(&format!(
-                "payment {} {} {} {} {}\n",
+                "payment {} {} {} {} {} {}\n",
                 p.id,
                 p.miner,
                 p.amount,
                 p.state.as_str(),
-                p.txid.as_deref().unwrap_or("-")
+                p.txid.as_deref().unwrap_or("-"),
+                p.submitted_height.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string())
             ));
         }
         out
@@ -385,7 +544,10 @@ impl PayoutLedger {
                             Some((m.to_string(), a.parse().ok()?))
                         })
                         .collect();
-                    l.rounds.push(Round { height, reward, splits });
+                    // Absent in ledgers written before ids were kept: such
+                    // a round is held at maturity, never credited unchecked.
+                    let block_id = f.next().filter(|t| *t != "-").map(|t| t.to_string());
+                    l.rounds.push(Round { height, reward, splits, block_id });
                 }
                 Some("owed") => {
                     let (Some(m), Some(a)) = (f.next(), f.next()) else { continue };
@@ -402,7 +564,15 @@ impl PayoutLedger {
                     let (Ok(id), Ok(amount)) = (id.parse(), a.parse()) else { continue };
                     let Some(state) = PaymentState::parse(st) else { continue };
                     let txid = f.next().filter(|t| *t != "-").map(|t| t.to_string());
-                    l.payments.push(Payment { id, miner: m.to_string(), amount, state, txid });
+                    let submitted_height = f.next().and_then(|v| v.parse().ok());
+                    l.payments.push(Payment {
+                        id,
+                        miner: m.to_string(),
+                        amount,
+                        state,
+                        txid,
+                        submitted_height,
+                    });
                 }
                 _ => {}
             }
@@ -555,16 +725,16 @@ mod fee_tests {
     fn the_operator_earns_only_once_the_block_matures() {
         let mut l = PayoutLedger::new();
         let (fee, to_miners) = apply_fee(1_000_000, 100);
-        l.record_block(10, 1_000_000, vec![("alice".to_string(), to_miners)]);
+        l.record_block(10, "b10", 1_000_000, vec![("alice".to_string(), to_miners)]);
 
         assert_eq!(l.operator_total(), 0, "nothing is earned before maturity");
         assert_eq!(l.operator_pending(), fee as u128, "but it is visible as pending");
 
         // Not yet buried.
-        assert_eq!(l.mature(60, 60), 0);
+        assert_eq!(l.mature_verified(60, 60, |h| Some(format!("b{h}"))).credited, 0);
         assert_eq!(l.operator_total(), 0);
 
-        assert_eq!(l.mature(70, 60), 1);
+        assert_eq!(l.mature_verified(70, 60, |h| Some(format!("b{h}"))).credited, 1);
         assert_eq!(l.operator_total(), fee as u128);
         assert_eq!(l.operator_pending(), 0);
         assert_eq!(l.owed("alice"), to_miners);
@@ -583,8 +753,8 @@ mod fee_tests {
 
         // And a ledger with fees round-trips.
         let mut fresh = PayoutLedger::new();
-        fresh.record_block(1, 1_000, vec![("bob".to_string(), 990)]);
-        fresh.mature(100, 60);
+        fresh.record_block(1, "b1", 1_000, vec![("bob".to_string(), 990)]);
+        fresh.mature_verified(100, 60, |h| Some(format!("b{h}"))).credited;
         let round_tripped = PayoutLedger::parse(&fresh.serialize());
         assert_eq!(round_tripped.operator_total(), 10);
     }
@@ -609,13 +779,13 @@ mod tests {
         // Pool income is a coinbase output: it cannot be spent for `maturity`
         // blocks, and until then a reorg could erase it entirely.
         let mut l = PayoutLedger::new();
-        l.record_block(100, 1_000, splits());
+        l.record_block(100, "b100", 1_000, splits());
         assert_eq!(l.owed("alice"), 0, "nothing is owed the moment a block is found");
 
-        assert_eq!(l.mature(159, 60), 0, "one block short of maturity");
+        assert_eq!(l.mature_verified(159, 60, |h| Some(format!("b{h}"))).credited, 0, "one block short of maturity");
         assert_eq!(l.owed("alice"), 0);
 
-        assert_eq!(l.mature(160, 60), 1, "buried deep enough");
+        assert_eq!(l.mature_verified(160, 60, |h| Some(format!("b{h}"))).credited, 1, "buried deep enough");
         assert_eq!(l.owed("alice"), 700);
         assert_eq!(l.owed("bob"), 300);
         assert!(l.pending_rounds().is_empty());
@@ -625,8 +795,8 @@ mod tests {
     #[test]
     fn dust_is_held_back_until_it_is_worth_a_fee() {
         let mut l = PayoutLedger::new();
-        l.record_block(1, 1_000, splits());
-        l.mature(1_000, 60);
+        l.record_block(1, "b1", 1_000, splits());
+        l.mature_verified(1_000, 60, |h| Some(format!("b{h}"))).credited;
 
         let payable = l.payable(500);
         assert_eq!(payable, vec![("alice".to_string(), 700)], "only alice clears the threshold");
@@ -637,14 +807,14 @@ mod tests {
     #[test]
     fn a_completed_payment_moves_the_balance_and_conserves_value() {
         let mut l = PayoutLedger::new();
-        l.record_block(1, 1_000, splits());
-        l.mature(1_000, 60);
+        l.record_block(1, "b1", 1_000, splits());
+        l.mature_verified(1_000, 60, |h| Some(format!("b{h}"))).credited;
 
         let id = l.begin_payment("alice", 700).unwrap();
         assert_eq!(l.owed("alice"), 0, "reserved out of the balance before sending");
         assert!(l.audit(), "value is conserved while in flight");
 
-        l.complete_payment(id, "deadbeef").unwrap();
+        l.complete_payment(id, "deadbeef", 100).unwrap();
         let p = &l.payments()[0];
         assert_eq!(p.state, PaymentState::Sent);
         assert_eq!(p.txid.as_deref(), Some("deadbeef"));
@@ -654,8 +824,8 @@ mod tests {
     #[test]
     fn a_send_that_never_left_is_refunded() {
         let mut l = PayoutLedger::new();
-        l.record_block(1, 1_000, splits());
-        l.mature(1_000, 60);
+        l.record_block(1, "b1", 1_000, splits());
+        l.mature_verified(1_000, 60, |h| Some(format!("b{h}"))).credited;
 
         let id = l.begin_payment("alice", 700).unwrap();
         l.fail_payment(id).unwrap();
@@ -673,8 +843,8 @@ mod tests {
         let id;
         {
             let mut l = PayoutLedger::open(&path).unwrap();
-            l.record_block(1, 1_000, splits());
-            l.mature(1_000, 60);
+            l.record_block(1, "b1", 1_000, splits());
+            l.mature_verified(1_000, 60, |h| Some(format!("b{h}"))).credited;
             l.save().unwrap();
             id = l.begin_payment("alice", 700).unwrap();
             // …process dies here, after `begin_payment` persisted, before we
@@ -703,11 +873,11 @@ mod tests {
         let path = tmp("roundtrip");
         {
             let mut l = PayoutLedger::open(&path).unwrap();
-            l.record_block(10, 1_000, splits());
-            l.record_block(500, 2_000, vec![("carol".into(), 2_000)]);
-            l.mature(100, 60); // only the first round matures
+            l.record_block(10, "b10", 1_000, splits());
+            l.record_block(500, "b500", 2_000, vec![("carol".into(), 2_000)]);
+            l.mature_verified(100, 60, |h| Some(format!("b{h}"))).credited; // only the first round matures
             let id = l.begin_payment("alice", 700).unwrap();
-            l.complete_payment(id, "abc123").unwrap();
+            l.complete_payment(id, "abc123", 100).unwrap();
         }
 
         let l = PayoutLedger::open(&path).unwrap();
@@ -781,12 +951,144 @@ mod tests {
     #[test]
     fn paying_more_than_is_owed_is_clamped() {
         let mut l = PayoutLedger::new();
-        l.record_block(1, 1_000, splits());
-        l.mature(1_000, 60);
+        l.record_block(1, "b1", 1_000, splits());
+        l.mature_verified(1_000, 60, |h| Some(format!("b{h}"))).credited;
         let id = l.begin_payment("alice", 999_999).unwrap();
         assert_eq!(l.payments()[0].amount, 700, "a payment can never exceed the balance");
         assert_eq!(l.owed("alice"), 0);
-        l.complete_payment(id, "x").unwrap();
+        l.complete_payment(id, "x", 100).unwrap();
         assert!(l.audit());
+    }
+
+    /// **The defect that cost the pool 1,861 rounds.** A block that was
+    /// accepted and then replaced is gone; waiting out maturity does not bring
+    /// it back, and crediting it invents money the pool never received.
+    #[test]
+    fn a_round_whose_block_was_replaced_is_never_credited() {
+        let mut l = PayoutLedger::default();
+        l.record_block(10, "ours", 1_000, vec![("alice".to_string(), 1_000)]);
+        l.record_block(11, "ours-too", 1_000, vec![("alice".to_string(), 1_000)]);
+
+        // The chain kept our block at 10, but someone else's at 11.
+        let out = l.mature_verified(100, 60, |h| {
+            Some(if h == 10 { "ours".to_string() } else { "someone-elses".to_string() })
+        });
+
+        assert_eq!((out.credited, out.orphaned, out.unverified), (1, 1, 0));
+        assert_eq!(l.owed("alice"), 1_000, "paid for the block that survived, and only that one");
+        assert_eq!(l.credited_total, 1_000);
+        assert!(l.pending_rounds().is_empty(), "both rounds are resolved");
+        assert!(l.audit(), "books balance");
+    }
+
+    /// Unverifiable is not the same as good. A chain that will not answer must
+    /// leave the round waiting, not credited on trust.
+    #[test]
+    fn a_round_the_chain_cannot_confirm_waits() {
+        let mut l = PayoutLedger::default();
+        l.record_block(10, "ours", 1_000, vec![("alice".to_string(), 1_000)]);
+
+        let out = l.mature_verified(100, 60, |_| None);
+        assert_eq!((out.credited, out.orphaned, out.unverified), (0, 0, 1));
+        assert_eq!(l.owed("alice"), 0, "nothing credited on a guess");
+        assert_eq!(l.pending_rounds().len(), 1, "still waiting, not discarded");
+
+        // And once the chain does answer, it is credited normally.
+        let out = l.mature_verified(100, 60, |_| Some("ours".to_string()));
+        assert_eq!(out.credited, 1);
+        assert_eq!(l.owed("alice"), 1_000);
+    }
+
+    /// Rounds written before ids were kept cannot be checked, so they are held
+    /// for reconciliation rather than credited the old, wrong way.
+    #[test]
+    fn a_legacy_round_without_an_id_is_held() {
+        let l = PayoutLedger::parse("credited 0\nround 10 1000 alice=1000\n");
+        let mut l = l;
+        assert_eq!(l.pending_rounds().len(), 1);
+        assert_eq!(l.pending_rounds()[0].block_id, None, "old format has no id");
+
+        let out = l.mature_verified(100, 60, |_| Some("anything".to_string()));
+        assert_eq!((out.credited, out.orphaned, out.unverified), (0, 0, 1));
+        assert_eq!(l.owed("alice"), 0);
+    }
+
+    /// A payout is not a payment until it is in a block.
+    #[test]
+    fn a_payment_is_settled_only_once_it_is_on_the_chain() {
+        let mut l = PayoutLedger::default();
+        l.record_block(1, "b1", 1_000, vec![("alice".to_string(), 1_000)]);
+        l.mature_verified(1_000, 60, |_| Some("b1".to_string()));
+        let id = l.begin_payment("alice", 1_000).unwrap();
+        l.complete_payment(id, "tx-abc", 900).unwrap();
+
+        // Not mined yet, and not past the deadline: nothing changes.
+        let out = l.confirm_payments(920, 60, 800, |_| false).unwrap();
+        assert_eq!((out.confirmed, out.reopened), (0, 0));
+        assert_eq!(l.payments()[0].state, PaymentState::Sent);
+
+        let out = l.confirm_payments(930, 60, 800, |tx| tx == "tx-abc").unwrap();
+        assert_eq!((out.confirmed, out.reopened), (1, 0));
+        assert_eq!(l.payments()[0].state, PaymentState::Confirmed);
+        assert_eq!(l.owed("alice"), 0, "settled, so nothing is owed again");
+        assert!(l.audit());
+    }
+
+    /// **The other half of the 2026-09-12 audit: 626 payouts recorded as sent
+    /// that were never on the chain.** Past the deadline the money goes back to
+    /// the miner, and the books still balance.
+    #[test]
+    fn a_payment_that_never_lands_returns_to_the_miner() {
+        let mut l = PayoutLedger::default();
+        l.record_block(1, "b1", 1_000, vec![("alice".to_string(), 1_000)]);
+        l.mature_verified(1_000, 60, |_| Some("b1".to_string()));
+        let id = l.begin_payment("alice", 1_000).unwrap();
+        l.complete_payment(id, "tx-ghost", 900).unwrap();
+        assert_eq!(l.owed("alice"), 0, "reserved while in flight");
+
+        let out = l.confirm_payments(961, 60, 800, |_| false).unwrap();
+        assert_eq!((out.confirmed, out.reopened), (0, 1));
+        assert_eq!(l.payments()[0].state, PaymentState::Lost);
+        assert_eq!(l.owed("alice"), 1_000, "payable again");
+        assert!(l.audit(), "a returned balance must not be counted twice");
+    }
+
+    /// Never give up on a payment we did not actually look for: that is how a
+    /// miner gets paid twice, which cannot be undone.
+    #[test]
+    fn a_payment_outside_the_scanned_range_is_left_alone() {
+        let mut l = PayoutLedger::default();
+        l.record_block(1, "b1", 1_000, vec![("alice".to_string(), 1_000)]);
+        l.mature_verified(1_000, 60, |_| Some("b1".to_string()));
+        let id = l.begin_payment("alice", 1_000).unwrap();
+        l.complete_payment(id, "tx-old", 100).unwrap();
+
+        // Scanned only the recent range; this payment predates it.
+        let out = l.confirm_payments(5_000, 60, 4_000, |_| false).unwrap();
+        assert_eq!((out.confirmed, out.reopened), (0, 0));
+        assert_eq!(l.payments()[0].state, PaymentState::Sent, "left for a human");
+        assert_eq!(l.owed("alice"), 0);
+    }
+
+    /// A ledger written by the old build must still load, and its records must
+    /// survive a round trip through the new format.
+    #[test]
+    fn an_old_ledger_still_parses_and_round_trips() {
+        let old = "credited 5000\noperator 0\nnext_payment 7\n\
+                   round 10 1000 alice=600,bob=400\n\
+                   owed alice 2000\n\
+                   payment 6 bob 3000 sent deadbeef\n";
+        let l = PayoutLedger::parse(old);
+        assert_eq!(l.pending_rounds().len(), 1);
+        assert_eq!(l.pending_rounds()[0].block_id, None);
+        assert_eq!(l.owed("alice"), 2_000);
+        assert_eq!(l.payments()[0].state, PaymentState::Sent);
+        assert_eq!(l.payments()[0].submitted_height, None, "unknown, not invented");
+
+        let again = PayoutLedger::parse(&l.serialize());
+        assert_eq!(again.owed("alice"), 2_000);
+        assert_eq!(again.payments()[0].txid.as_deref(), Some("deadbeef"));
+        assert_eq!(again.payments()[0].submitted_height, None);
+        assert_eq!(again.pending_rounds()[0].splits.len(), 2);
     }
 }
