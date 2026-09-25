@@ -385,6 +385,11 @@ pub struct Discovery {
     /// Observed on the testnet: eight dials, eight slots, six of them dead
     /// GitHub Actions runners learned by gossip from the daily join test. The
     /// one peer that worked never got a slot.
+    /// Addresses this node has itself connected to. Only these (and the
+    /// operator's own seeds) are gossiped: an address learned from someone
+    /// else's handshake is hearsay until we reach it, and passing hearsay on is
+    /// how every newcomer inherited a list of dead CI runners.
+    reached: Arc<Mutex<HashSet<SocketAddr>>>,
     dial_backoff: Arc<Mutex<HashMap<SocketAddr, (u32, Instant)>>>,
 }
 
@@ -479,6 +484,7 @@ impl Discovery {
             banned: Arc::new(Mutex::new(HashMap::new())),
             self_nonce: OsRng.next_u64(),
             peer_nonces: Arc::new(Mutex::new(HashSet::new())),
+            reached: Arc::new(Mutex::new(HashSet::new())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             ephemeral: false,
             gossip_quota: Arc::new(Mutex::new(HashMap::new())),
@@ -552,9 +558,12 @@ impl Discovery {
         entry.1 = Instant::now() + Duration::from_secs(secs.min(DIAL_BACKOFF_CAP_SECS));
     }
 
-    /// A dial succeeded: forget its failure history entirely.
+    /// A dial succeeded: forget its failure history entirely, and remember
+    /// that we have reached this address — the only evidence that makes it
+    /// worth passing on to anyone else.
     pub fn note_dial_success(&self, addr: SocketAddr) {
         self.dial_backoff.lock().unwrap().remove(&addr);
+        self.reached.lock().unwrap().insert(addr);
     }
 
     /// Is this address currently being held back after repeated failures?
@@ -886,12 +895,26 @@ impl Discovery {
     }
 
     /// A sample of known addresses to share, excluding the requester's own.
+    /// A sample of addresses worth handing to a peer: ones we have connected
+    /// to ourselves, plus the seeds the operator configured.
+    ///
+    /// Sharing the whole book was an easy way to spread rot. A node learns an
+    /// address from every inbound handshake, including ephemeral CI runners
+    /// that vanish minutes later; it then told every newcomer about them. The
+    /// seeds were still offering a list of Azure addresses dead since August,
+    /// and a fresh node — which has no failure history of its own — can spend
+    /// all eight outbound slots on them before it ever reaches a real peer.
+    /// Backoff protects US from a dead address; only this protects everyone we
+    /// talk to.
     fn share(&self, exclude: Option<SocketAddr>) -> Vec<SocketAddr> {
+        let reached = self.reached.lock().unwrap();
+        let seeds = self.seeds.lock().unwrap();
         self.book
             .lock()
             .unwrap()
             .iter()
             .filter(|a| Some(**a) != exclude)
+            .filter(|a| reached.contains(*a) || seeds.contains(*a))
             .take(MAX_SHARE)
             .copied()
             .collect()
@@ -1039,6 +1062,16 @@ fn spawn_peer_reader(
                         break;
                     }
                     if !disc.claim_nonce(nonce) {
+                        // We already have this peer on another address. Hold
+                        // this one back, or the manager re-dials it on every
+                        // 15 s cycle for as long as both nodes are up: seed1
+                        // did exactly that to seed2 and wrote 351,917 log
+                        // lines, with an outbound slot tied up in the loop.
+                        // Not a failure — the host is plainly reachable — but
+                        // the same "not now", and a later real link clears it.
+                        if let Some(a) = dialed {
+                            disc.note_dial_failure(a);
+                        }
                         end_reason = "duplicate link to a peer we already have";
                         break;
                     }
@@ -1812,6 +1845,54 @@ mod dial_backoff_tests {
         format!("10.0.0.{n}:19333").parse().unwrap()
     }
 
+    /// Hearsay is not evidence. An address we merely heard about must not be
+    /// passed on as though we had reached it: that is how the testnet's seeds
+    /// handed every newcomer a list of CI runners dead since August.
+    #[test]
+    fn we_only_gossip_addresses_we_have_reached() {
+        let d = disc();
+        let reached = a(1);
+        let hearsay = a(2);
+        d.learn([reached, hearsay]);
+
+        assert!(d.share(None).is_empty(), "nothing is worth sharing before we reach anything");
+
+        d.note_dial_success(reached);
+        assert_eq!(d.share(None), vec![reached], "only the one we actually reached");
+        assert!(!d.share(None).contains(&hearsay));
+    }
+
+    /// Configured seeds are the operator's own statement, not gossip, so they
+    /// are still worth handing out — otherwise a node that has reached nobody
+    /// yet could not help anyone bootstrap.
+    #[test]
+    fn configured_seeds_are_still_shared() {
+        let d = disc();
+        let seed = a(3);
+        d.learn_seeds([seed]);
+        d.learn([seed]);
+        assert_eq!(d.share(None), vec![seed]);
+    }
+
+    /// A second link to a peer we already have must not be retried every cycle.
+    #[test]
+    fn a_duplicate_link_is_held_back_not_redialled() {
+        let d = disc();
+        let peer = a(1);
+        let other = a(2);
+        d.learn([peer, other]);
+        assert!(d.dial_candidates().contains(&peer));
+
+        // What the duplicate-link path does now.
+        d.note_dial_failure(peer);
+        let c = d.dial_candidates();
+        assert!(
+            !c.contains(&peer),
+            "a peer we are already linked to must step out of the dial queue"
+        );
+        assert!(c.contains(&other), "and the slot goes to an address worth trying");
+    }
+
     /// The core property: a failing address steps aside so a working one can be
     /// tried. Slots are the scarce resource, not book entries.
     #[test]
@@ -2346,4 +2427,5 @@ mod book_flooding_tests {
             "a seed in backoff must not jump the queue for a node that has peers"
         );
     }
+
 }
