@@ -68,7 +68,7 @@ use noct_node::{new_pow, pow_name, NodePow};
 use noct_tls::{Acceptor, Endpoint, Stream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use noct_pool::auth::{self, MinerAuth};
-use noct_pool::payout::{self, PayoutLedger, FeeBps, FEE_BPS_MAX};
+use noct_pool::payout::{self, FeeBps, PaymentState, PayoutLedger, FEE_BPS_MAX};
 use noct_pool::vardiff::{self, VardiffParams};
 use noct_pool::window_log::WindowLog;
 use noct_pool::{JobId, Pool, ShareOutcome, DEFAULT_WINDOW};
@@ -84,6 +84,24 @@ const TEMPLATE_REFRESH: Duration = Duration::from_secs(5);
 const DEFAULT_SHARE_DIFFICULTY: Difficulty = 1_000;
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
+
+/// The pool's own page, served at `/`.
+///
+/// Inlined into the binary so the pool is one file with no asset directory to
+/// deploy beside it, and self-contained for the same reason as the rest of this
+/// project's pages: it fetches nothing from anywhere, so visiting it does not
+/// report a miner to a third party. It reads only `/stats`, so it can never show
+/// more than the pool already publishes.
+const POOL_HTML: &str = include_str!("../ui/pool.html");
+
+/// A session counts as connected if it has had an accepted share this recently.
+/// Miners do not disconnect politely, so presence has to be inferred from work;
+/// short enough that a rig that stopped drops off the page in minutes, long
+/// enough that a slow rig on a high target is not flickering in and out.
+const WORKER_ACTIVE: Duration = Duration::from_secs(600);
+
+/// How many payouts the page shows. Newest first; the ledger keeps the rest.
+const RECENT_PAYMENTS: usize = 12;
 
 // --- facing the internet ----------------------------------------------------
 //
@@ -177,6 +195,22 @@ struct Assignment {
     last_rejection: &'static str,
 }
 
+/// Facts about how this pool is configured, for reporting only.
+///
+/// Nothing here is consulted to decide a payment — it is what `/stats` and the
+/// page say about the pool, taken from the same values the daemon itself runs
+/// on so the two cannot drift apart.
+struct PoolInfo {
+    /// The address every block reward is paid to first. Public by nature: it is
+    /// the coinbase recipient, visible on-chain to anyone.
+    address: String,
+    network: &'static str,
+    /// Balance a miner must reach before a payout is sent.
+    threshold: u64,
+    /// Transaction fee a payout carries, shared across its recipients.
+    tx_fee: u64,
+}
+
 struct Shared {
     pool: Pool<NodePow>,
     /// Per-miner share targets ("vardiff"). A single fixed target either floods
@@ -192,6 +226,9 @@ struct Shared {
     current_job: Option<JobId>,
     /// Height the current job builds on, for reporting.
     height: u64,
+    /// The chain's difficulty for the current job — the real target a share has
+    /// to meet to also be a block. Reporting only.
+    network_difficulty: Difficulty,
     /// Who is owed what, and what has already been sent.
     ledger: PayoutLedger,
     /// Durable record of the PPLNS window, so a restart does not forfeit
@@ -494,10 +531,25 @@ fn main() {
         blocks_found: 0,
         current_job: None,
         height: 0,
+        network_difficulty: 0,
         ledger,
         window_log,
         worker_work: HashMap::new(),
     }));
+
+    // What the pool's own page reports about itself. Collected once, here,
+    // because these values are spread across flags and defaults — a page that
+    // re-derived or guessed them could disagree with the running pool, and a
+    // miner reading the wrong payout threshold off it would be misled.
+    let info = Arc::new(PoolInfo {
+        address: pool_address_str.clone(),
+        network: match pool_network {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet",
+        },
+        threshold,
+        tx_fee: fee,
+    });
 
     // Keep a current job available at all times.
     {
@@ -564,8 +616,9 @@ fn main() {
         let live_guard = Arc::clone(&live);
         let proxies = Arc::clone(&trusted_proxies);
         let miner_auth = Arc::clone(&miner_auth);
+        let info = Arc::clone(&info);
         thread::spawn(move || {
-            let _ = handle(stream, shared, &node, &token, &limiter, &vardiff_params, &proxies, (*miner_auth).as_ref(), fee_bps);
+            let _ = handle(stream, shared, &node, &token, &limiter, &vardiff_params, &proxies, (*miner_auth).as_ref(), fee_bps, &info);
             // Always released, including on an error path — a leak here would
             // wedge the pool shut after MAX_CONNECTIONS failures.
             live_guard.fetch_sub(1, Ordering::Relaxed);
@@ -807,6 +860,7 @@ fn refresh_template(shared: &Arc<Mutex<Shared>>, node: &NodeLink, token: &Option
     let id = s.pool.add_job(block, txs, difficulty, seed);
     s.current_job = Some(id);
     s.height = height;
+    s.network_difficulty = difficulty;
     eprintln!("new job {id} at height {height} (network difficulty {difficulty})");
 }
 
@@ -820,6 +874,7 @@ fn handle(
     trusted_proxies: &HashSet<IpAddr>,
     miner_auth: Option<&MinerAuth>,
     fee_bps: FeeBps,
+    info: &PoolInfo,
 ) -> std::io::Result<()> {
     // One object for both directions now: a TLS session cannot be `try_clone`d
     // the way a socket can, since the two halves share the connection's
@@ -1001,8 +1056,16 @@ fn handle(
                     );
                 }
             }
-            let json = stats(&shared, fee_bps);
+            let json = stats(&shared, fee_bps, info);
             respond(&mut writer, "200 OK", &json)
+        }
+        // The pool's own page. Static, and deliberately readable without a token
+        // even on a pool that gates `/stats`: it contains no pool data at all,
+        // only the code that asks for it, and refusing it would leave a miner
+        // staring at a bare error with no idea where it had connected. What it
+        // can then display is still whatever `/stats` will hand that visitor.
+        ("GET", "/") | ("GET", "") | ("GET", "/index.html") => {
+            respond_typed(&mut writer, "200 OK", "text/html; charset=utf-8", POOL_HTML)
         }
         _ => respond(&mut writer, "404 Not Found", "{\"error\":\"not found\"}"),
     }
@@ -1424,7 +1487,36 @@ fn run_payouts(
 }
 
 /// Pool status, including what each miner is owed from the current window.
-fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps) -> String {
+/// The pool's hashrate, and how many sessions it comes from.
+///
+/// Inferred from the work the pool is already measuring for vardiff: a session
+/// issued target `d` that finds a share every `t` seconds is doing about `d/t`
+/// hashes a second. Sessions that have gone quiet are excluded, because a rig
+/// that stopped an hour ago would otherwise keep contributing its last rate
+/// forever and the figure would only ever rise.
+///
+/// It is an estimate and reported as one — share arrival is a Poisson process,
+/// so it wanders on small numbers of miners. Nothing is paid from it.
+fn hashrate(
+    assignments: &HashMap<String, Assignment>,
+    now: std::time::Instant,
+) -> (f64, usize) {
+    let mut total = 0.0;
+    let mut active = 0usize;
+    for a in assignments.values() {
+        let Some(last) = a.last_share else { continue };
+        if now.duration_since(last) > WORKER_ACTIVE {
+            continue;
+        }
+        active += 1;
+        if a.ewma_secs > 0.0 {
+            total += a.current as f64 / a.ewma_secs;
+        }
+    }
+    (total, active)
+}
+
+fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps, info: &PoolInfo) -> String {
     let s = shared.lock().unwrap();
     let weights = s.pool.weights();
     let total: u128 = weights.values().sum();
@@ -1458,9 +1550,48 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps) -> String {
         .iter()
         .map(|(m, a)| format!("{{\"miner\":\"{}\",\"owed\":\"{}\"}}", escape(m), format_noct(*a)))
         .collect();
+    // Newest first, and capped: the ledger is append-only and grows without
+    // bound, so publishing all of it would make this response grow forever.
+    let recent: Vec<String> = s
+        .ledger
+        .payments()
+        .iter()
+        .rev()
+        .take(RECENT_PAYMENTS)
+        .map(|p| {
+            format!(
+                "{{\"miner\":\"{}\",\"amount\":\"{}\",\"state\":\"{}\",\"txid\":{}}}",
+                escape(&p.miner),
+                format_noct(p.amount),
+                p.state.as_str(),
+                match &p.txid {
+                    Some(t) => format!("\"{}\"", escape(t)),
+                    None => "null".to_string(),
+                }
+            )
+        })
+        .collect();
+    // What miners have actually been paid: a lost payment was returned to its
+    // miner's balance, so counting it here would report money twice.
+    let paid: u128 = s
+        .ledger
+        .payments()
+        .iter()
+        .filter(|p| !matches!(p.state, PaymentState::Lost))
+        .map(|p| p.amount as u128)
+        .sum();
+    let (rate, active) = hashrate(&s.assignments, std::time::Instant::now());
     format!(
-        "{{\"height\":{},\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}]}}",
+        "{{\"height\":{},\"network_difficulty\":{},\"network\":\"{}\",\"pool_address\":\"{}\",\"pool_hashrate\":{:.1},\"connected_workers\":{},\"payout_threshold\":\"{}\",\"payout_tx_fee\":\"{}\",\"total_paid\":\"{}\",\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}],\"recent_payments\":[{}]}}",
         s.height,
+        s.network_difficulty,
+        info.network,
+        escape(&info.address),
+        rate,
+        active,
+        format_noct(info.threshold),
+        format_noct(info.tx_fee),
+        format_noct(paid.min(u64::MAX as u128) as u64),
         s.pool.share_difficulty(),
         s.pool.window().len(),
         s.blocks_found,
@@ -1474,15 +1605,25 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps) -> String {
         format_noct(s.ledger.operator_pending().min(u64::MAX as u128) as u64),
         entries.join(","),
         worker_entries.join(","),
-        owed.join(",")
+        owed.join(","),
+        recent.join(",")
     )
 }
 
 // --- helpers ----------------------------------------------------------------
 
 fn respond(writer: &mut Stream, status: &str, body: &str) -> std::io::Result<()> {
+    respond_typed(writer, status, "application/json", body)
+}
+
+fn respond_typed(
+    writer: &mut Stream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     writer.write_all(response.as_bytes())?;
@@ -2301,5 +2442,143 @@ mod vardiff_recovery_tests {
             10_000,
             "a rig hitting the target interval must be left where it is"
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_page_tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::net::TcpStream;
+
+    /// The page must fetch nothing from anywhere. The rest of this project's
+    /// pages are built that way on purpose — a privacy coin's pool that pulls a
+    /// webfont or a script from a CDN reports every visitor, and every miner
+    /// checking its balance, to whoever serves it.
+    #[test]
+    fn the_page_is_self_contained() {
+        for needle in ["src=\"http", "href=\"http", "src='http", "@import", "//cdn.", "googleapis"] {
+            assert!(
+                !POOL_HTML.contains(needle),
+                "the page references something external ({needle}) — it must be self-contained"
+            );
+        }
+    }
+
+    /// And it must only ever talk to the pool it was served by, over a relative
+    /// path. An absolute URL here would send a visitor's interest in a payout
+    /// address to some other host.
+    #[test]
+    fn the_page_only_asks_its_own_pool() {
+        assert!(POOL_HTML.contains("fetch('stats'"), "the page should read its own /stats");
+        let fetches = POOL_HTML.matches("fetch(").count();
+        assert_eq!(fetches, 1, "exactly one request, to its own pool — found {fetches}");
+    }
+
+    /// It is a static asset compiled into the binary, so nothing about this pool
+    /// or its miners can be baked into it: everything shown is fetched at view
+    /// time from the same endpoint anyone may read.
+    #[test]
+    fn the_page_itself_carries_no_pool_data() {
+        for leak in ["pool.key", "--wallet", "rpc.token", "Bearer "] {
+            assert!(!POOL_HTML.contains(leak), "the page must not mention {leak}");
+        }
+    }
+
+    /// Served as HTML, not as the JSON every other route returns. With the
+    /// wrong content type a browser offers the page as a download instead of
+    /// rendering it, which looks exactly like a broken pool.
+    #[test]
+    fn the_page_is_served_as_html() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let mut stream = Stream::Plain(sock);
+            respond_typed(&mut stream, "200 OK", "text/html; charset=utf-8", POOL_HTML)
+                .expect("respond");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let mut got = String::new();
+        client.read_to_string(&mut got).expect("read");
+        server.join().expect("server thread");
+
+        assert!(got.starts_with("HTTP/1.1 200 OK"), "unexpected status line");
+        assert!(
+            got.contains("Content-Type: text/html; charset=utf-8"),
+            "the page must be typed as HTML"
+        );
+        assert!(!got.contains("Content-Type: application/json"), "typed as JSON");
+        assert!(got.contains("<title>Nocturnal Mining Pool</title>"), "body was not the page");
+        // The length header has to describe the body, or a browser hangs waiting
+        // for bytes that never come.
+        let declared: usize = got
+            .split("Content-Length: ")
+            .nth(1)
+            .and_then(|s| s.split("\r\n").next())
+            .and_then(|s| s.parse().ok())
+            .expect("a Content-Length");
+        assert_eq!(declared, POOL_HTML.len(), "declared length must match the page");
+    }
+}
+
+#[cfg(test)]
+mod hashrate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn assignment(current: Difficulty, ewma: f64, last: Option<Instant>) -> Assignment {
+        Assignment {
+            current,
+            previous: current,
+            last_share: last,
+            ewma_secs: ewma,
+            rejected_streak: 0,
+            last_rejection: "",
+        }
+    }
+
+    /// A share of difficulty `d` every `t` seconds is about `d/t` hashes a
+    /// second, and two rigs add up.
+    #[test]
+    fn the_rate_is_issued_difficulty_over_the_share_interval() {
+        let now = Instant::now();
+        let mut a = HashMap::new();
+        a.insert("one".to_string(), assignment(10_000, 10.0, Some(now)));
+        a.insert("two".to_string(), assignment(3_000, 15.0, Some(now)));
+
+        let (rate, active) = hashrate(&a, now);
+        assert_eq!(active, 2);
+        assert!((rate - 1_200.0).abs() < 1.0, "expected ~1200 H/s, got {rate}");
+    }
+
+    /// A rig that stopped must drop out. Left in, its last measured rate would
+    /// be counted forever and the pool's hashrate could only ever climb — the
+    /// one direction that makes the number useless.
+    #[test]
+    fn a_rig_that_went_quiet_stops_counting() {
+        let now = Instant::now();
+        let mut a = HashMap::new();
+        a.insert("here".to_string(), assignment(10_000, 10.0, Some(now)));
+        a.insert(
+            "gone".to_string(),
+            assignment(10_000, 10.0, Some(now - WORKER_ACTIVE - Duration::from_secs(1))),
+        );
+
+        let (rate, active) = hashrate(&a, now);
+        assert_eq!(active, 1, "only the live rig counts");
+        assert!((rate - 1_000.0).abs() < 1.0, "expected ~1000 H/s, got {rate}");
+    }
+
+    /// A session that has never landed a share has no measurement, and guessing
+    /// one would inflate the figure the moment anything connects.
+    #[test]
+    fn a_rig_with_no_accepted_share_yet_contributes_nothing() {
+        let now = Instant::now();
+        let mut a = HashMap::new();
+        a.insert("fresh".to_string(), assignment(1_000, 0.0, None));
+
+        assert_eq!(hashrate(&a, now), (0.0, 0));
     }
 }

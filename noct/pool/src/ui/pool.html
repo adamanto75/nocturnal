@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<!-- The pool's own page. Everything is inline: no fonts, no images, no CDN, for
+     the same reason the rest of this project's pages are built that way — a
+     privacy coin's pool that fetches a webfont reports every visitor, including
+     every miner, to whoever serves it. It reads the same /stats endpoint anyone
+     can read, so the page can never show more than the pool already publishes. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Nocturnal Mining Pool</title>
+<style>
+:root{
+  --bg:#08090d; --bg-2:#0d0f16; --panel:rgba(22,26,37,.72); --panel-solid:#151a25;
+  --line:rgba(120,134,168,.16); --line-bright:rgba(139,124,246,.34);
+  --ink:#eef1f7; --dim:#98a2b8; --accent:#8b7cf6; --accent-lift:#b5a6ff;
+  --warn:#e8b339; --good:#4ade80; --bad:#f87171;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; --wrap:1060px;
+}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);background:var(--bg);
+  font:16px/1.7 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
+  background:
+    radial-gradient(900px 620px at 78% -8%,rgba(139,124,246,.20),transparent 62%),
+    radial-gradient(760px 520px at 12% 4%,rgba(91,69,214,.16),transparent 60%),
+    linear-gradient(180deg,var(--bg-2),var(--bg) 46%)}
+.wrap{max-width:var(--wrap);margin:0 auto;padding:0 16px}
+header{padding:38px 0 6px}
+h1{margin:0;font-size:clamp(26px,4vw,38px);letter-spacing:-.02em}
+h1 .moon{color:var(--accent-lift)}
+.sub{color:var(--dim);margin:6px 0 0}
+.badge{display:inline-block;margin-left:10px;padding:3px 9px;border-radius:999px;
+  font-size:12px;letter-spacing:.08em;text-transform:uppercase;
+  border:1px solid var(--line-bright);color:var(--accent-lift);vertical-align:middle}
+h2{font-size:15px;letter-spacing:.10em;text-transform:uppercase;color:var(--dim);
+  margin:34px 0 12px;font-weight:600}
+.cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(196px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
+  backdrop-filter:blur(6px)}
+.card .k{font-size:11px;letter-spacing:.11em;text-transform:uppercase;color:var(--dim)}
+.card .v{font-size:23px;margin-top:4px;letter-spacing:-.01em}
+.card .v.small{font-size:15px;font-family:var(--mono);word-break:break-all;line-height:1.45}
+.card.free .v{color:var(--good)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+.mono{font-family:var(--mono)}
+pre{margin:10px 0 0;padding:13px 14px;background:#0b0d13;border:1px solid var(--line);
+  border-radius:10px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;color:#dfe4f0}
+table{width:100%;border-collapse:collapse;font-size:14.5px}
+th{text-align:left;font-size:11px;letter-spacing:.10em;text-transform:uppercase;color:var(--dim);
+  font-weight:600;padding:0 10px 8px;border-bottom:1px solid var(--line)}
+td{padding:9px 10px;border-bottom:1px solid rgba(120,134,168,.08);vertical-align:top}
+td.num,th.num{text-align:right;font-family:var(--mono)}
+tr:last-child td{border-bottom:none}
+.addr{font-family:var(--mono);font-size:13px}
+.bar{height:5px;border-radius:3px;background:rgba(139,124,246,.16);margin-top:5px;overflow:hidden}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-lift))}
+input[type=search]{width:100%;max-width:420px;padding:9px 12px;border-radius:10px;
+  background:#0b0d13;border:1px solid var(--line);color:var(--ink);font-size:14.5px}
+input[type=search]::placeholder{color:#66708a}
+button{font:inherit;font-size:13px;padding:5px 11px;border-radius:9px;cursor:pointer;
+  background:rgba(139,124,246,.14);border:1px solid var(--line-bright);color:var(--accent-lift)}
+button:hover{background:rgba(139,124,246,.24)}
+.note{color:var(--dim);font-size:13.5px}
+.warn{color:var(--warn)}
+.bad{color:var(--bad)}
+.good{color:var(--good)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.foot{color:var(--dim);font-size:13px;padding:26px 0 40px;border-top:1px solid var(--line);margin-top:34px}
+.empty{color:var(--dim);font-style:italic;padding:10px}
+#err{display:none;margin:16px 0;padding:12px 14px;border-radius:12px;
+  border:1px solid rgba(248,113,113,.4);background:rgba(248,113,113,.08);color:#fecaca;font-size:14px}
+@media(max-width:560px){.hide-sm{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Nocturnal <span class="moon">Mining Pool</span><span class="badge" id="net">testnet</span></h1>
+    <p class="sub">PPLNS · no pool fee · payouts settle automatically once a block is buried
+      <span id="age" class="note"></span></p>
+  </header>
+
+  <div id="err"></div>
+
+  <h2>Pool</h2>
+  <div class="cards">
+    <div class="card"><div class="k">Pool hashrate</div><div class="v" id="hashrate">—</div></div>
+    <div class="card"><div class="k">Connected miners</div><div class="v" id="workers">—</div></div>
+    <div class="card free"><div class="k">Pool fee</div><div class="v" id="fee">—</div></div>
+    <div class="card"><div class="k">Minimum payout</div><div class="v" id="threshold">—</div></div>
+    <div class="card"><div class="k">Blocks found</div><div class="v" id="blocks">—</div></div>
+    <div class="card"><div class="k">Maturing</div><div class="v" id="maturing">—</div></div>
+    <div class="card"><div class="k">Height</div><div class="v" id="height">—</div></div>
+    <div class="card"><div class="k">Network difficulty</div><div class="v" id="netdiff">—</div></div>
+  </div>
+
+  <h2>Connect a miner</h2>
+  <div class="panel">
+    <div class="row">
+      <div style="flex:1 1 320px">
+        <div class="k" style="font-size:11px;letter-spacing:.11em;text-transform:uppercase;color:var(--dim)">Pool URL</div>
+        <div class="mono" id="url" style="font-size:15px;word-break:break-all">—</div>
+      </div>
+      <button id="copy">Copy</button>
+    </div>
+    <pre id="cmd">noct-miner --address &lt;your testnet address&gt; --pool &lt;url&gt; --worker rig1</pre>
+    <p class="note" id="plain" style="margin:12px 0 0"></p>
+    <p class="note" style="margin:8px 0 0">Your address is where the pool pays you, so it must be one
+      you can spend from. Shares are weighted over a PPLNS window: mine longer, earn a steadier share.
+      Rewards are coinbase outputs, so a block is only credited once the chain has buried it —
+      that wait is the <em>maturing</em> figure above.</p>
+  </div>
+
+  <h2>Pool mining address</h2>
+  <div class="panel"><div class="addr" id="pooladdr">—</div>
+    <p class="note" style="margin:10px 0 0">Every block this pool finds pays here first, then the
+      whole reward is split out to miners. With a 0% fee nothing is kept.</p></div>
+
+  <h2>Miners <span class="note" id="minercount"></span></h2>
+  <div class="panel">
+    <input type="search" id="lookup" placeholder="Look up an address…" autocomplete="off">
+    <table style="margin-top:12px">
+      <thead><tr><th>Address</th><th class="num">Window share</th><th class="num">Owed</th></tr></thead>
+      <tbody id="miners"></tbody>
+    </table>
+  </div>
+
+  <h2>Workers</h2>
+  <div class="panel">
+    <table>
+      <thead><tr><th>Session</th><th class="num">Work</th><th class="num hide-sm">Rejected in a row</th></tr></thead>
+      <tbody id="rigs"></tbody>
+    </table>
+  </div>
+
+  <h2>Recent payouts</h2>
+  <div class="panel">
+    <table>
+      <thead><tr><th>Miner</th><th class="num">Amount</th><th>State</th><th class="hide-sm">Transaction</th></tr></thead>
+      <tbody id="pays"></tbody>
+    </table>
+    <p class="note" id="paidtotal" style="margin:12px 0 0"></p>
+  </div>
+
+  <p class="foot">Testnet only — these coins are worthless on purpose, and this software has not been
+    audited. This page reads the same <span class="mono">/stats</span> endpoint the pool publishes to
+    everyone; it shows nothing that is not already public.</p>
+</div>
+
+<script>
+// Truncate a long address the way an explorer does, keeping both ends so it can
+// still be recognised, with the full value on hover.
+function short(s, head = 12, tail = 8) {
+  if (!s || s.length <= head + tail + 1) return s || '';
+  return s.slice(0, head) + '…' + s.slice(-tail);
+}
+function cell(text, title) {
+  const td = document.createElement('td');
+  td.textContent = text;
+  if (title) td.title = title;
+  return td;
+}
+function rate(hs) {
+  if (!hs || hs <= 0) return '0 H/s';
+  const u = ['H/s', 'kH/s', 'MH/s', 'GH/s', 'TH/s'];
+  let i = 0;
+  while (hs >= 1000 && i < u.length - 1) { hs /= 1000; i++; }
+  return (hs >= 100 ? hs.toFixed(0) : hs.toFixed(2)) + ' ' + u[i];
+}
+function num(n) { return (n === null || n === undefined) ? '—' : Number(n).toLocaleString(); }
+
+let miners = [], lastOk = 0;
+
+function renderMiners() {
+  const q = document.getElementById('lookup').value.trim().toLowerCase();
+  const rows = q ? miners.filter(m => m.miner.toLowerCase().includes(q)) : miners;
+  const body = document.getElementById('miners');
+  body.textContent = '';
+  document.getElementById('minercount').textContent =
+    miners.length ? '(' + miners.length + ' in the window)' : '';
+  if (!rows.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 3; td.className = 'empty';
+    td.textContent = q ? 'No miner matches that.' : 'No shares in the window yet.';
+    tr.appendChild(td); body.appendChild(tr); return;
+  }
+  for (const m of rows) {
+    const tr = document.createElement('tr');
+    const a = cell(short(m.miner), m.miner); a.className = 'addr';
+    const pct = document.createElement('td');
+    pct.className = 'num';
+    pct.textContent = Number(m.percent).toFixed(2) + '%';
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fill = document.createElement('i');
+    fill.style.width = Math.max(1, Math.min(100, Number(m.percent))) + '%';
+    bar.appendChild(fill); pct.appendChild(bar);
+    tr.append(a, pct, cell(m.owed ? m.owed + ' NOCT' : '—'));
+    tr.lastChild.className = 'num';
+    body.appendChild(tr);
+  }
+}
+
+function paint(s) {
+  document.getElementById('hashrate').textContent = rate(s.pool_hashrate);
+  document.getElementById('workers').textContent = num(s.connected_workers);
+  document.getElementById('fee').textContent =
+    (Number(s.fee_percent) === 0 ? '0%' : Number(s.fee_percent).toFixed(2) + '%');
+  document.getElementById('threshold').textContent = s.payout_threshold + ' NOCT';
+  document.getElementById('blocks').textContent = num(s.blocks_found);
+  document.getElementById('maturing').textContent = num(s.pending_rounds);
+  document.getElementById('height').textContent = num(s.height);
+  document.getElementById('netdiff').textContent = num(s.network_difficulty);
+  document.getElementById('pooladdr').textContent = s.pool_address || 'not published';
+  if (s.network) document.getElementById('net').textContent = s.network;
+
+  const owed = {};
+  for (const o of (s.owed || [])) owed[o.miner] = o.owed;
+  miners = (s.miners || []).map(m => ({ ...m, owed: owed[m.miner] }));
+  renderMiners();
+
+  const rigs = document.getElementById('rigs');
+  rigs.textContent = '';
+  if (!(s.workers || []).length) {
+    const tr = document.createElement('tr'), td = document.createElement('td');
+    td.colSpan = 3; td.className = 'empty'; td.textContent = 'No rigs have submitted work yet.';
+    tr.appendChild(td); rigs.appendChild(tr);
+  }
+  for (const w of (s.workers || [])) {
+    const tr = document.createElement('tr');
+    const who = cell(short(w.session, 14, 10), w.session); who.className = 'addr';
+    const work = cell(num(w.work)); work.className = 'num';
+    const streak = cell(w.rejected_streak ? String(w.rejected_streak) : '0');
+    streak.className = 'num hide-sm' + (w.rejected_streak ? ' warn' : '');
+    if (w.rejected_streak) streak.title = 'This rig is doing work the pool is refusing — check its build and address.';
+    tr.append(who, work, streak);
+    rigs.appendChild(tr);
+  }
+
+  const pays = document.getElementById('pays');
+  pays.textContent = '';
+  if (!(s.recent_payments || []).length) {
+    const tr = document.createElement('tr'), td = document.createElement('td');
+    td.colSpan = 4; td.className = 'empty'; td.textContent = 'No payouts yet.';
+    tr.appendChild(td); pays.appendChild(tr);
+  }
+  for (const p of (s.recent_payments || [])) {
+    const tr = document.createElement('tr');
+    const who = cell(short(p.miner), p.miner); who.className = 'addr';
+    const amt = cell(p.amount + ' NOCT'); amt.className = 'num';
+    const st = cell(p.state);
+    st.className = p.state === 'confirmed' ? 'good' : (p.state === 'lost' ? 'bad' : 'warn');
+    if (p.state !== 'confirmed') st.title = 'Sent, not yet seen on the chain. The pool re-opens it if it never lands.';
+    const tx = cell(p.txid ? short(p.txid, 10, 6) : '—', p.txid || '');
+    tx.className = 'addr hide-sm';
+    tr.append(who, amt, st, tx);
+    pays.appendChild(tr);
+  }
+  document.getElementById('paidtotal').textContent =
+    s.total_paid ? 'Paid out so far: ' + s.total_paid + ' NOCT' : '';
+}
+
+async function tick() {
+  const box = document.getElementById('err');
+  try {
+    const r = await fetch('stats', { cache: 'no-store' });
+    if (r.status === 401) throw new Error('This pool requires a miner token to read its stats.');
+    if (!r.ok) throw new Error('The pool answered ' + r.status + '.');
+    paint(await r.json());
+    box.style.display = 'none';
+    lastOk = Date.now();
+  } catch (e) {
+    box.textContent = e.message + ' Retrying…';
+    box.style.display = 'block';
+  }
+  const secs = lastOk ? Math.round((Date.now() - lastOk) / 1000) : null;
+  document.getElementById('age').textContent =
+    secs === null ? '' : (secs < 15 ? '· live' : '· last updated ' + secs + 's ago');
+}
+
+// Only a real http(s) address is worth printing. Opened any other way — from a
+// file, from a data: URL, inside a preview — location is not something a miner
+// could ever connect to, and pasting it into the box would hand them nonsense
+// and wreck the layout with it.
+const servedOverHttp = location.protocol === 'http:' || location.protocol === 'https:';
+const url = servedOverHttp
+  ? location.origin + location.pathname.replace(/\/$/, '')
+  : 'http://<the pool’s address>:9500';
+document.getElementById('url').textContent = url;
+document.getElementById('cmd').textContent =
+  'noct-miner --address <your testnet address> --pool ' + url + ' --worker rig1';
+document.getElementById('copy').addEventListener('click', async (e) => {
+  try { await navigator.clipboard.writeText(url); e.target.textContent = 'Copied'; }
+  catch { e.target.textContent = 'Copy failed'; }
+  setTimeout(() => { e.target.textContent = 'Copy'; }, 1400);
+});
+// Said plainly rather than hidden: over plain HTTP a miner's payout address
+// travels in the clear, and whoever runs the pool cannot fix that from the page.
+document.getElementById('plain').innerHTML = location.protocol === 'https:'
+  ? 'This connection is encrypted.'
+  : (servedOverHttp
+      ? '<span class="warn">This connection is not encrypted</span> — your payout address travels in the clear. Fine on a home network; ask the operator for an https endpoint over the internet.'
+      : '');
+
+document.getElementById('lookup').addEventListener('input', renderMiners);
+tick();
+setInterval(tick, 10000);
+</script>
+</body>
+</html>
