@@ -2,6 +2,7 @@
 name = "noct-swap"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 # ETH<->NOCT atomic-swap crypto: cross-group DLEQ (ed25519<->secp256k1) plus the
 # EVM-side checks the NoctSwap contract performs.
@@ -37,8 +38,5 @@ ff = "0.13"
 group = "0.13"
 hex-literal = "0.4"
 
-# Noct toolchain pins (Rust 1.82, no edition2024). Newer patch releases of these
-# transitive deps switched to edition2024 and won't parse on Cargo 1.82.
-zeroize = "=1.8.1"
-zeroize_derive = "=1.4.2"
-base64ct = "=1.6.0"
+# Used directly, for `Zeroizing` around swap secrets.
+zeroize = "1.8"

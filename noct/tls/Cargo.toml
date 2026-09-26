@@ -2,6 +2,7 @@
 name = "noct-tls"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 # TLS itself. rustls rather than OpenSSL: a memory-safe implementation with a
@@ -22,10 +23,3 @@ sha2 = "0.10"
 # still turn TLS on. See `selfsigned`.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 hex = "0.4"
-
-# --- pins, not preferences --------------------------------------------------
-# Both of these publish releases requiring Cargo's `edition2024` feature, which
-# does not exist in the pinned 1.82 toolchain. Pinned to the last version that
-# builds; see docs/DEPENDENCIES.md.
-zeroize = "=1.8.1"
-time = "=0.3.36"

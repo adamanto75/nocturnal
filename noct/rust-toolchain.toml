@@ -1,0 +1,22 @@
+# The toolchain this workspace is built and released with.
+#
+# Pinned, not `stable`: release binaries are reproducible, and a toolchain that
+# moves on its own changes every hash without anyone deciding to. Whoever builds
+# a release must be on this exact version or the published hashes will not
+# match — the release checklist compares them.
+#
+# 1.85.1 is a floor, not a preference: the `orchard` crate (the shielded pool)
+# requires it, and every orchard release before 0.14.0 is YANKED for an unsound
+# Action circuit, so there is no version of that dependency that builds on the
+# 1.82 this project used before.
+#
+# It also ends the edition2024 trap that kept recurring here: 1.85 is the first
+# toolchain that understands edition 2024, so dependencies no longer have to be
+# pinned back to their last edition-2021 release.
+#
+# On a machine with the standalone MSI toolchain still installed, this file is
+# only honoured when cargo is invoked through rustup's shims (~/.cargo/bin).
+# Calling the MSI cargo directly silently ignores it and builds with 1.82.
+[toolchain]
+channel = "1.85.1"
+profile = "minimal"

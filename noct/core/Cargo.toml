@@ -2,6 +2,7 @@
 name = "noct-core"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 curve25519-dalek = { version = "4", features = ["rand_core"] }
@@ -34,9 +35,8 @@ monero-clsag = "0.1"
 # `Commitment`. This replaces the old `monero-generators`, which upstream split
 # into `monero-ed25519` + `monero-bulletproofs-generators`.
 monero-ed25519 = "0.1"
-# Pin below versions that require edition2024 (cargo >= 1.85); toolchain is 1.82.
-zeroize = "=1.8.1"
-zeroize_derive = "=1.4.2"
+# Used directly, for `Zeroizing` around secret scalars in ring.rs.
+zeroize = "1.8"
 
 [dev-dependencies]
 hex = "0.4"

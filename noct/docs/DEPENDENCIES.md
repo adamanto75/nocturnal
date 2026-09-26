@@ -20,7 +20,7 @@ crates:
 | `monero-generators`   | `monero-generators-mirror`    | 0.4.0   | 2021    | —    | `b651dda8…` |
 
 They are renamed via `package = "…-mirror"` so the code imports clean
-`monero_*` paths. All build on the pinned Rust 1.82 toolchain (edition 2021,
+`monero_*` paths. All build on the pinned Rust 1.85.1 toolchain (edition 2021,
 MSRV ≤ 1.80).
 
 ## 2. Why the `-mirror` crates
@@ -59,12 +59,16 @@ The obvious fix — depend on serai directly, `git = "…serai", rev = "<pinned>
 is blocked by the toolchain:
 
 - **Current upstream serai pins Rust 1.89** (`rust-toolchain.toml` channel
-  `1.89`). Nocturnal is deliberately pinned to **Rust 1.82** (no `rustup`, no
-  edition 2024), a constraint that has shaped many dependency pins across the
-  workspace (`zeroize = "=1.8.1"`, `base64ct = "=1.6.0"`, etc.).
-- Repinning to current upstream serai therefore forces a toolchain bump to 1.89,
-  which is a project-wide decision with its own cascade (edition-2024 transitive
-  requirements elsewhere), **not** a mechanical dependency swap.
+  `1.89`). Nocturnal is on **Rust 1.85.1** since 2026-09-26 (`rust-toolchain.toml`,
+  installed via rustup alongside the old 1.82 MSI), moved because the `orchard`
+  crate requires it — see [[noct-orchard-pool]] and `docs/orchard-pool.md`.
+- That closed the edition2024 problem: 1.85 is the first toolchain that
+  understands edition 2024, so the `=`-pins it forced (`zeroize`, `zeroize_derive`,
+  `base64ct`, `time`) are **gone**. `zeroize` remains a normal dependency of
+  `core` and `swap` because both use `Zeroizing` directly.
+- Repinning to current upstream serai still means 1.89, so it remains a
+  project-wide decision rather than a mechanical dependency swap — but the gap
+  is now four minor versions, not seven.
 
 So the repin is a *decision gated on the toolchain*, best made deliberately —
 ideally in coordination with the audit — rather than forced now.
@@ -114,10 +118,11 @@ they are vendored too. Vendor with that in mind (or scope the source replacement
 
 - [ ] Confirm each mirror's `src/` equals the named serai path at a pinned rev
       (provenance).
-- [ ] Ratify the toolchain decision (stay 1.82 + vendor, or bump to serai's).
+- [x] Ratify the toolchain decision — moved to **1.85.1** on 2026-09-26 for
+      `orchard`; still below serai's 1.89, so the mirrors stay.
 - [ ] Execute Option A/B/C and re-verify the full test suite.
-- [ ] Re-review any `=`-pinned transitive crates (`zeroize`, `base64ct`, …) after
-      a toolchain change.
+- [x] Re-review the `=`-pinned transitive crates after the toolchain change —
+      all removed; the lockfile was left untouched, so no version actually moved.
 - [ ] Keep offline `.crate` backups until the repin lands (availability).
 
 ---
@@ -137,14 +142,14 @@ the canonical crates on crates.io are no longer placeholders:
 (The old stubs were `0.0.1` at ~818 B. The `-mirror` crates we depend on today
 were last touched **2024-09-22**.)
 
-Every MSRV is **below our pinned 1.82**, so this does *not* force the toolchain
+Every MSRV is **below our pinned 1.85.1**, so this does *not* force the toolchain
 bump that blocked the 2026-08-05 attempt.
 
 ### Measured, not estimated
 
 A spike in a throwaway copy of the tree:
 
-* **Resolves** on Rust 1.82 — no edition2024 wall, no MSRV conflict.
+* **Resolves** on Rust 1.85.1 — no edition2024 wall, no MSRV conflict.
 * **8 compile errors, in 2 files** (`core/src/amounts.rs`, `core/src/ring.rs`).
   Import moves and small signature changes; no restructuring.
 * Symbol map:
@@ -253,12 +258,14 @@ excuse. It is used only by that one subcommand.
 
 ### New pins
 
-Two crates in this tree publish releases requiring Cargo's `edition2024`
-feature, which does not exist in the pinned 1.82 toolchain. Both are pinned to
-the last version that builds:
+Two crates in this tree once published releases requiring Cargo's `edition2024`
+feature, which the old 1.82 toolchain did not have, so both were pinned to the
+last version that built (`zeroize = "=1.8.1"`, `time = "=0.3.36"`).
 
-* `zeroize = "=1.8.1"`
-* `time = "=0.3.36"`
+**Both pins were removed on 2026-09-26** with the move to Rust 1.85.1, which
+understands edition 2024. Removing a pin does not move anything on its own — the
+lockfile still resolves `zeroize` 1.8.1 and `time` 0.3.36 — it only stops the
+block on future updates.
 
 These are the same class of pin as §1: not a preference, a hard toolchain
 constraint. They should be revisited whenever the toolchain moves.

@@ -2448,7 +2448,6 @@ mod vardiff_recovery_tests {
 #[cfg(test)]
 mod pool_page_tests {
     use super::*;
-    use std::io::Read as _;
     use std::net::TcpStream;
 
     /// The page must fetch nothing from anywhere. The rest of this project's

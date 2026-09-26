@@ -1,6 +1,17 @@
 [workspace]
 resolver = "2"
 members = ["core", "tls", "wallet", "node", "pool", "swap", "web"]
+
+# The oldest toolchain this workspace builds on, which is also the one it is
+# released with (see rust-toolchain.toml). Declared so Cargo's MSRV-aware
+# resolver refuses dependency versions that need a newer rustc, instead of
+# locking them in and failing at compile time.
+#
+# This is not theoretical: a plain `cargo update` here selected `time` 0.3.55
+# and `time-core` 0.1.9, both of which require Rust 1.88, and bumped
+# `randomx-rs` — the proof-of-work — in the same sweep.
+[workspace.package]
+rust-version = "1.85.1"
 # `randomx` builds the RandomX C++ library (needs cmake + a C++ toolchain), so it
 # is excluded from the default workspace: `cargo test` and the three binaries all
 # build in a plain shell. Build it explicitly from an MSVC/cmake environment.
