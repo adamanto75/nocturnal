@@ -408,6 +408,12 @@ fn shell(active: Page) -> String {
         let current = if page == active { " aria-current=\"page\"" } else { "" };
         nav.push_str(&format!("<a class=\"link\" href=\"{href}\"{current}>{label}</a>"));
     }
+    // External, so they are not `Page` variants: both live somewhere this binary
+    // does not serve. The pool is a separate daemon on its own host, reached
+    // through its own tunnel hostname.
+    nav.push_str(
+        "<a class=\"link ext\" href=\"https://pool.nocturnalcoin.com\"          rel=\"noopener noreferrer\">Pool</a>",
+    );
     nav.push_str(
         "<a class=\"link ext\" href=\"https://github.com/adamanto75/nocturnal\"          rel=\"noopener noreferrer\">GitHub</a>",
     );

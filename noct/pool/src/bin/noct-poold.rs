@@ -2456,7 +2456,11 @@ mod pool_page_tests {
     /// checking its balance, to whoever serves it.
     #[test]
     fn the_page_is_self_contained() {
-        for needle in ["src=\"http", "href=\"http", "src='http", "@import", "//cdn.", "googleapis"] {
+        // A `data:` URI is fine — it is the page carrying its own bytes, which is
+        // how the tab icon is done. What is forbidden is reaching out to a host.
+        for needle in
+            ["src=\"http", "href=\"http", "src='http", "href='http", "@import", "//cdn.", "googleapis"]
+        {
             assert!(
                 !POOL_HTML.contains(needle),
                 "the page references something external ({needle}) — it must be self-contained"
