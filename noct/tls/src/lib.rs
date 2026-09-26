@@ -86,13 +86,35 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Parse an address, applying `default_port` when none is given.
+    ///
+    /// A **scheme changes what "none given" means**. `https://pool.example.com`
+    /// is the ordinary way to write a service on the standard HTTPS port, and
+    /// every other tool reads it that way, so it resolves to 443 (and `http://`
+    /// to 80) rather than to this caller's private default. A bare
+    /// `host` or `host:port` still gets `default_port`, because there it is the
+    /// caller's own service being named, not a web address.
+    ///
+    /// Found the hard way: a pool published at `https://pool.nocturnalcoin.com`
+    /// sent every miner to port 9334 on that name, which nothing was listening
+    /// on. The pool was reachable, the URL was right, and the only symptom was
+    /// "Network is unreachable" — with `:443` appended it worked immediately.
     pub fn parse(s: &str, default_port: u16) -> Result<Endpoint, String> {
         let s = s.trim();
-        let (tls, rest) = match s.split_once("://") {
-            Some(("https", rest)) => (true, rest),
-            Some(("http", rest)) => (false, rest),
+        let (tls, rest, scheme_given) = match s.split_once("://") {
+            Some(("https", rest)) => (true, rest, true),
+            Some(("http", rest)) => (false, rest, true),
             Some((other, _)) => return Err(format!("unsupported scheme `{other}://`")),
-            None => (false, s),
+            None => (false, s, false),
+        };
+        // What an omitted port means here.
+        let default_port = if scheme_given {
+            if tls {
+                443
+            } else {
+                80
+            }
+        } else {
+            default_port
         };
         // A trailing path is meaningless for us and is almost always a paste
         // accident; saying so beats connecting somewhere and failing obscurely.
@@ -558,6 +580,39 @@ pub fn selfsigned(names: &[String]) -> Result<SelfSigned, String> {
 mod tests {
     use super::*;
 
+    /// A scheme with no port means the web's port, not ours.
+    ///
+    /// This is how a public endpoint is published — `https://pool.example.com`
+    /// behind a tunnel or a load balancer, on 443 like everything else. A miner
+    /// handed that URL and sent to the caller's default port instead fails with
+    /// nothing but "Network is unreachable", while the pool is up and the URL
+    /// is correct. It happened to this project's own pool the day it was
+    /// published.
+    #[test]
+    fn a_scheme_without_a_port_means_the_standard_web_port() {
+        let e = Endpoint::parse("https://pool.example.com", 9500).unwrap();
+        assert_eq!((e.port, e.tls), (443, true));
+
+        let e = Endpoint::parse("http://pool.example.com", 9500).unwrap();
+        assert_eq!((e.port, e.tls), (80, false));
+
+        // An explicit port always wins, whatever the scheme implies.
+        let e = Endpoint::parse("https://pool.example.com:9500", 1).unwrap();
+        assert_eq!(e.port, 9500);
+
+        // And with no scheme at all it is the caller's own service being named,
+        // so the caller's default still applies — `--node 127.0.0.1` must keep
+        // reaching the node's RPC port, not port 80.
+        let e = Endpoint::parse("127.0.0.1", 19334).unwrap();
+        assert_eq!((e.port, e.tls), (19334, false));
+
+        // Bracketed IPv6 follows the same rule.
+        let e = Endpoint::parse("https://[::1]", 9500).unwrap();
+        assert_eq!((e.host.as_str(), e.port, e.tls), ("::1", 443, true));
+        let e = Endpoint::parse("[::1]", 9500).unwrap();
+        assert_eq!(e.port, 9500);
+    }
+
     /// The scheme decides encryption, and the port has a sensible default —
     /// these are the strings an operator will actually type.
     #[test]
@@ -565,9 +620,13 @@ mod tests {
         let e = Endpoint::parse("pool.example.com", 9500).unwrap();
         assert_eq!(e, Endpoint { host: "pool.example.com".into(), port: 9500, tls: false });
 
+        // Was pinned at 9500 here, which is what broke a real pool: written
+        // with a scheme and no port, this is the standard HTTPS endpoint, and
+        // sending a miner to the caller's private default instead left it
+        // dialling a port nothing listens on.
         let e = Endpoint::parse("https://pool.example.com", 9500).unwrap();
         assert!(e.tls, "https:// must mean encrypted");
-        assert_eq!(e.port, 9500);
+        assert_eq!(e.port, 443, "https:// with no port is port 443");
 
         let e = Endpoint::parse("https://pool.example.com:8443/", 9500).unwrap();
         assert_eq!((e.port, e.tls), (8443, true));
