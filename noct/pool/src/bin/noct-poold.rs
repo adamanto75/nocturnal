@@ -947,6 +947,28 @@ fn handle(
         }
     }
 
+    // HEAD is how uptime monitors ask "is it up". Routing it into the table
+    // below would fall through to the catch-all and answer 404 on a pool that is
+    // perfectly healthy — a monitor cannot tell that from an outage. Answer the
+    // headers a GET would produce, with no body, and never a body on a HEAD.
+    if method == "HEAD" {
+        let gated = miner_auth
+            .is_some_and(|auth| auth.lookup(bearer.as_deref().unwrap_or("").trim()).is_none());
+        let (status, content_type, body) = head_route(&path, gated);
+        let len = match body {
+            HeadBody::Page => POOL_HTML.len(),
+            HeadBody::Stats => stats(&shared, fee_bps, info).len(),
+            HeadBody::Empty => 0,
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+        );
+        writer.write_all(response.as_bytes())?;
+        writer.flush()?;
+        writer.close();
+        return Ok(());
+    }
+
     match (method.as_str(), path.as_str()) {
         // Same shape as the node's, but `difficulty` is the *share* target. The
         // `address` a miner supplies is where it wants to be paid.
@@ -1594,7 +1616,10 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps, info: &PoolInfo) -> Strin
         format_noct(paid.min(u64::MAX as u128) as u64),
         s.pool.share_difficulty(),
         s.pool.window().len(),
-        s.blocks_found,
+        // From the ledger, not the in-process counter: the counter restarts at
+        // zero with the daemon, and the page then tells miners the pool has
+        // found nothing while it is paying them.
+        s.ledger.blocks_found(),
         s.ledger.pending_rounds().len(),
         s.ledger.unresolved().len(),
         // Published, not buried: a miner should be able to read the rate it is
@@ -1611,6 +1636,28 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps, info: &PoolInfo) -> Strin
 }
 
 // --- helpers ----------------------------------------------------------------
+
+/// Which body a HEAD would have described, so the caller can measure it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadBody {
+    Page,
+    Stats,
+    Empty,
+}
+
+/// What a HEAD should answer, without touching the pool's state.
+///
+/// Split out from `handle` so it can be tested: the bug this exists to prevent
+/// is a monitor reading 404 from a healthy pool, and that is a routing decision,
+/// not an I/O one.
+fn head_route(path: &str, stats_gated: bool) -> (&'static str, &'static str, HeadBody) {
+    match path {
+        "/" | "" | "/index.html" => ("200 OK", "text/html; charset=utf-8", HeadBody::Page),
+        "/stats" if stats_gated => ("401 Unauthorized", "application/json", HeadBody::Empty),
+        "/stats" => ("200 OK", "application/json", HeadBody::Stats),
+        _ => ("404 Not Found", "application/json", HeadBody::Empty),
+    }
+}
 
 fn respond(writer: &mut Stream, status: &str, body: &str) -> std::io::Result<()> {
     respond_typed(writer, status, "application/json", body)
@@ -2583,5 +2630,95 @@ mod hashrate_tests {
         a.insert("fresh".to_string(), assignment(1_000, 0.0, None));
 
         assert_eq!(hashrate(&a, now), (0.0, 0));
+    }
+}
+
+#[cfg(test)]
+mod head_tests {
+    use super::*;
+
+    /// A monitor that asks with HEAD must not be told the pool is missing.
+    ///
+    /// The routing table matches on `(method, path)`, so before this existed a
+    /// `HEAD /stats` fell through to the catch-all and answered 404 — from a
+    /// pool that was up, mining and paying. An uptime check cannot tell that
+    /// apart from an outage.
+    #[test]
+    fn head_answers_the_same_routes_a_get_does() {
+        assert_eq!(head_route("/stats", false), ("200 OK", "application/json", HeadBody::Stats));
+        for p in ["/", "", "/index.html"] {
+            assert_eq!(
+                head_route(p, false),
+                ("200 OK", "text/html; charset=utf-8", HeadBody::Page),
+                "HEAD {p} should describe the page"
+            );
+        }
+    }
+
+    /// And it must not become a way around the token a GET needs, nor a way to
+    /// learn the stats' size on a pool that gates them.
+    #[test]
+    fn head_respects_the_stats_gate() {
+        assert_eq!(
+            head_route("/stats", true),
+            ("401 Unauthorized", "application/json", HeadBody::Empty)
+        );
+    }
+
+    /// Anything else is still a 404 — with no body, because a HEAD never has one.
+    #[test]
+    fn head_on_an_unknown_path_is_a_bodyless_404() {
+        let (status, _, body) = head_route("/nope", false);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body, HeadBody::Empty);
+    }
+}
+
+#[cfg(test)]
+mod blocks_found_tests {
+    use noct_pool::payout::PayoutLedger;
+
+    /// The count has to survive a restart. It used to live in the daemon, so it
+    /// read 0 every time the process came back while the ledger beside it held
+    /// hundreds of rounds — and the pool's own page then told miners it had
+    /// found nothing, minutes after paying them.
+    #[test]
+    fn the_block_count_survives_a_reload() {
+        let dir = std::env::temp_dir().join(format!("noct-blocks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ledger.txt");
+
+        let mut ledger = PayoutLedger::open(&path).expect("open");
+        for h in 1..=3u64 {
+            ledger.record_block(h, &format!("block{h}"), 100, vec![("miner".to_string(), 100)]);
+        }
+        assert_eq!(ledger.blocks_found(), 3);
+        ledger.save().expect("save");
+
+        let reloaded = PayoutLedger::open(&path).expect("reopen");
+        assert_eq!(reloaded.blocks_found(), 3, "a restart must not reset the count");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ledger written before the count existed has no line for it. Reading 0
+    /// there would be a visible lie on a pool with rounds on file, so the count
+    /// is recovered from those rounds — a floor, since matured ones are gone.
+    #[test]
+    fn an_older_ledger_recovers_its_count_from_its_rounds() {
+        let dir = std::env::temp_dir().join(format!("noct-oldledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ledger.txt");
+        std::fs::write(
+            &path,
+            "credited 0\noperator 0\nnext_payment 0\n\
+             round 10 100 miner=100 aaa\nround 11 100 miner=100 bbb\n",
+        )
+        .expect("write");
+
+        let ledger = PayoutLedger::open(&path).expect("open");
+        assert_eq!(ledger.blocks_found(), 2, "recovered from the rounds on file");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

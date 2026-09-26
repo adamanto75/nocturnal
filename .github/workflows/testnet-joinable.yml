@@ -30,7 +30,7 @@ jobs:
       # chain", not "the chain is exactly this tall today". It must stay ABOVE
       # CHECK_HEIGHT, or the chain check below asks for a block the joiner has
       # not reached yet and fails for the wrong reason.
-      MIN_HEIGHT: 600
+      MIN_HEIGHT: 1100
       # A block on the canonical chain, and its hash as served by /block/.
       #
       # Height and peer count alone only prove the joiner reached *a* chain. On
@@ -43,12 +43,12 @@ jobs:
       # settled beyond reorg. If the testnet is ever reset this must be
       # updated, and the failure says so.
       #
-      # Updated 2026-09-25 for the chain that replaced the maturity-60 testnet
-      # (v0.2.0-testnet). Height 500 of the new chain, settled far beyond
-      # MAX_REORG_DEPTH. The heights came down from 1100/1000 because the new
-      # chain is young; raise them again once it is comfortably taller.
-      CHECK_HEIGHT: 500
-      CHECK_SHA256: 5389384d7d8f0a81334df7b4f96e8da902efb453f9826b89c80cb6efab34d04b
+      # Pinned to the chain that replaced the maturity-60 testnet (v0.2.0-testnet).
+      # These were temporarily 600/500 while that chain was hours old; restored
+      # to 1100/1000 on 2026-09-26 once block 1000 was ~350 deep, far beyond
+      # MAX_REORG_DEPTH and agreed by all three running nodes.
+      CHECK_HEIGHT: 1000
+      CHECK_SHA256: 3db8731e9d4a811ccb6b7a5716abca1591f8fcb1e19416c3343c2f82dda44835
 
     steps:
       - name: Download the newest published release, as a stranger would

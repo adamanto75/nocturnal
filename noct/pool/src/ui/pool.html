@@ -174,6 +174,20 @@ function rate(hs) {
 }
 function num(n) { return (n === null || n === undefined) ? '—' : Number(n).toLocaleString(); }
 
+// NOCT amounts arrive as exact decimal strings and are shown rounded, because
+// "0.440482539762 NOCT" is unreadable in a table and nobody is counting the
+// twelfth decimal by eye. The full value stays in the cell's tooltip, and
+// /stats is never rounded — a miner checking what it is owed gets the exact
+// number from the API.
+function noct(s) {
+  if (s === null || s === undefined || s === '') return '—';
+  const n = Number(s);
+  if (!isFinite(n)) return String(s);
+  // Small amounts keep more places, or a dust payout reads as 0.
+  const places = n !== 0 && Math.abs(n) < 0.01 ? 8 : 4;
+  return n.toFixed(places).replace(/\.?0+$/, '') + ' NOCT';
+}
+
 let miners = [], lastOk = 0;
 
 function renderMiners() {
@@ -201,7 +215,7 @@ function renderMiners() {
     const fill = document.createElement('i');
     fill.style.width = Math.max(1, Math.min(100, Number(m.percent))) + '%';
     bar.appendChild(fill); pct.appendChild(bar);
-    tr.append(a, pct, cell(m.owed ? m.owed + ' NOCT' : '—'));
+    tr.append(a, pct, cell(noct(m.owed), m.owed ? m.owed + ' NOCT exactly' : ''));
     tr.lastChild.className = 'num';
     body.appendChild(tr);
   }
@@ -212,7 +226,7 @@ function paint(s) {
   document.getElementById('workers').textContent = num(s.connected_workers);
   document.getElementById('fee').textContent =
     (Number(s.fee_percent) === 0 ? '0%' : Number(s.fee_percent).toFixed(2) + '%');
-  document.getElementById('threshold').textContent = s.payout_threshold + ' NOCT';
+  document.getElementById('threshold').textContent = noct(s.payout_threshold);
   document.getElementById('blocks').textContent = num(s.blocks_found);
   document.getElementById('maturing').textContent = num(s.pending_rounds);
   document.getElementById('height').textContent = num(s.height);
@@ -253,7 +267,7 @@ function paint(s) {
   for (const p of (s.recent_payments || [])) {
     const tr = document.createElement('tr');
     const who = cell(short(p.miner), p.miner); who.className = 'addr';
-    const amt = cell(p.amount + ' NOCT'); amt.className = 'num';
+    const amt = cell(noct(p.amount), p.amount + ' NOCT exactly'); amt.className = 'num';
     const st = cell(p.state);
     st.className = p.state === 'confirmed' ? 'good' : (p.state === 'lost' ? 'bad' : 'warn');
     if (p.state !== 'confirmed') st.title = 'Sent, not yet seen on the chain. The pool re-opens it if it never lands.';
@@ -263,7 +277,7 @@ function paint(s) {
     pays.appendChild(tr);
   }
   document.getElementById('paidtotal').textContent =
-    s.total_paid ? 'Paid out so far: ' + s.total_paid + ' NOCT' : '';
+    s.total_paid && Number(s.total_paid) > 0 ? 'Paid out so far: ' + noct(s.total_paid) : '';
 }
 
 async function tick() {

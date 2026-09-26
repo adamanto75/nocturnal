@@ -163,6 +163,9 @@ pub struct PayoutLedger {
     next_payment_id: u64,
     /// Running total ever credited, so [`Self::audit`] can prove nothing leaked.
     credited_total: u128,
+    /// Blocks this pool has ever found. Persisted, so a restart does not reset
+    /// it — see [`Self::blocks_found`].
+    blocks_found: u64,
     /// Running total the operator has kept from matured rounds.
     operator_total: u128,
     path: Option<PathBuf>,
@@ -214,6 +217,18 @@ impl PayoutLedger {
             splits,
             block_id: Some(block_id.to_string()),
         });
+        self.blocks_found += 1;
+    }
+
+    /// Every block this pool has ever found, across restarts.
+    ///
+    /// Counted here rather than in the daemon because the daemon's copy is a
+    /// process counter: it read zero after every restart while the ledger beside
+    /// it still held hundreds of rounds. A pool page reporting "blocks found: 0"
+    /// minutes after a payout is not a cosmetic problem — that number is what a
+    /// miner uses to decide whether the pool works.
+    pub fn blocks_found(&self) -> u64 {
+        self.blocks_found
     }
 
     /// What the operator has kept from rounds the chain has buried — money it
@@ -494,6 +509,7 @@ impl PayoutLedger {
         out.push_str(&format!("credited {}\n", self.credited_total));
         out.push_str(&format!("operator {}\n", self.operator_total));
         out.push_str(&format!("next_payment {}\n", self.next_payment_id));
+        out.push_str(&format!("blocks_found {}\n", self.blocks_found));
         for r in &self.rounds {
             let splits: Vec<String> =
                 r.splits.iter().map(|(m, a)| format!("{m}={a}")).collect();
@@ -533,6 +549,12 @@ impl PayoutLedger {
                 Some("operator") => l.operator_total = f.next().and_then(|v| v.parse().ok()).unwrap_or(0),
                 Some("next_payment") => {
                     l.next_payment_id = f.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+                }
+                // Absent from ledgers written before this was counted; such a
+                // ledger is not a pool that found no blocks, so the count is
+                // repaired after parsing from the rounds still on file.
+                Some("blocks_found") => {
+                    l.blocks_found = f.next().and_then(|v| v.parse().ok()).unwrap_or(0)
                 }
                 Some("round") => {
                     let (Some(h), Some(r), Some(s)) = (f.next(), f.next(), f.next()) else { continue };
@@ -576,6 +598,13 @@ impl PayoutLedger {
                 }
                 _ => {}
             }
+        }
+        // A ledger written before `blocks_found` existed has none, and reporting
+        // zero for a pool with rounds on file would be a visible lie. The rounds
+        // still held are a floor — matured ones are gone — so this recovers the
+        // best number the file can support rather than the worst.
+        if l.blocks_found == 0 {
+            l.blocks_found = l.rounds.len() as u64;
         }
         l
     }
