@@ -29,6 +29,7 @@ pub mod hash;
 pub mod keys;
 pub mod mempool;
 pub mod params;
+pub mod pools;
 pub mod p2p;
 pub mod pow;
 pub mod ring;

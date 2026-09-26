@@ -50,6 +50,8 @@ pub const TX_VERSION: u8 = 1;
 pub enum TxError {
     /// Inputs and outputs (plus fee) do not have equal total value.
     Unbalanced,
+    /// The declared cross-pool movement is not a representable amount.
+    BadCross,
     /// A transaction with no inputs.
     NoInputs,
     /// A transaction with no outputs.
@@ -470,9 +472,17 @@ impl Transaction {
         }
 
         // Balance: Σ pseudo-outs == Σ output commitments + fee·H.
-        let sum_pseudo = Commitment::sum(self.inputs.iter().map(|i| &i.signature.pseudo_out));
-        let sum_outputs = Commitment::sum(&commitments) + Commitment::fee(self.fee);
-        if sum_pseudo != sum_outputs {
+        //
+        // `cross` is 0 for every transaction this version can express; it
+        // becomes non-zero when a transaction may also move value to or from the
+        // shielded pool. The rule is written once, here, so the two cases cannot
+        // drift apart.
+        if !balances(
+            self.inputs.iter().map(|i| &i.signature.pseudo_out),
+            &commitments,
+            self.fee,
+            0,
+        )? {
             return Err(TxError::Unbalanced);
         }
 
@@ -798,5 +808,136 @@ mod tests {
         let bob_got = tx2.scan(&bob);
         assert_eq!(bob_got.len(), 1);
         assert_eq!(bob_got[0].amount, 90);
+    }
+}
+
+/// Does a transaction's ring side balance, including anything crossing to or
+/// from the shielded pool?
+///
+/// The rule the chain has always enforced is
+///
+/// ```text
+/// Σ pseudo-outs == Σ output commitments + fee·H
+/// ```
+///
+/// and a cross-pool amount is a second public term in it. Which side it lands on
+/// is the whole of the arithmetic, and getting it backwards would let a
+/// shielding transaction mint ring coins, so the decision lives in one place —
+/// [`crate::pools::cross_terms`] — and is pinned by its own tests.
+///
+/// `cross` is stated from the ring pool's point of view: **positive means value
+/// left the ring pool** for the shielded pool, negative means it arrived from
+/// there. It is 0 for every transaction the current format can express.
+///
+/// Returns `Err` only when `cross` is not an amount at all; a transaction that
+/// simply does not balance returns `Ok(false)`.
+pub fn balances<'a, I>(
+    pseudo_outs: I,
+    output_commitments: &[Commitment],
+    fee: u64,
+    cross: i64,
+) -> Result<bool, TxError>
+where
+    I: IntoIterator<Item = &'a Commitment>,
+{
+    let (to_inputs, to_outputs) =
+        crate::pools::cross_terms(cross).map_err(|_| TxError::BadCross)?;
+
+    // `fee + to_outputs` is deliberately not pre-added: both are public amounts
+    // and summing them in u64 could wrap, which would make an unbalanced
+    // transaction look balanced. Commitments add over the group instead, where
+    // there is nothing to overflow.
+    let left = Commitment::sum(pseudo_outs) + Commitment::fee(to_inputs);
+    let right =
+        Commitment::sum(output_commitments) + Commitment::fee(fee) + Commitment::fee(to_outputs);
+    Ok(left == right)
+}
+
+#[cfg(test)]
+mod cross_balance_tests {
+    use super::*;
+    use crate::amounts::Opening;
+    use curve25519_dalek::scalar::Scalar;
+
+    /// Commitments for a transaction whose masks cancel, so only the amounts
+    /// decide whether it balances — which is what these tests are about.
+    fn sides(input: u64, outputs: &[u64]) -> (Vec<Commitment>, Vec<Commitment>) {
+        let mask = Scalar::from(7u64);
+        let pseudo = vec![Opening::new(input, mask).commit()];
+        // One output carries the whole mask; any split works, since the sum is
+        // what balance is checked over.
+        let outs: Vec<Commitment> = outputs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let m = if i == 0 { mask } else { Scalar::ZERO };
+                Opening::new(*a, m).commit()
+            })
+            .collect();
+        (pseudo, outs)
+    }
+
+    /// Shielding: 100 in, 30 stays in the ring pool, 1 is the fee, and 69 leaves
+    /// for the shielded pool. The 69 is spent exactly as the fee is spent.
+    #[test]
+    fn value_leaving_the_ring_pool_balances_like_a_fee() {
+        let (pseudo, outs) = sides(100, &[30]);
+        assert_eq!(balances(&pseudo, &outs, 1, 69), Ok(true));
+    }
+
+    /// The same numbers with the sign flipped must NOT balance. If it did, a
+    /// shielding transaction could mint ring coins — which is the single worst
+    /// thing this arithmetic could get wrong, so it is pinned explicitly.
+    #[test]
+    fn the_sign_of_a_crossing_is_not_interchangeable() {
+        let (pseudo, outs) = sides(100, &[30]);
+        assert_eq!(balances(&pseudo, &outs, 1, -69), Ok(false));
+    }
+
+    /// Unshielding: 30 in from the ring side, 70 arrives from the shielded pool,
+    /// 99 goes out and 1 is the fee. The arriving value was never consumed from
+    /// a ring output, so it joins the inputs side.
+    #[test]
+    fn value_arriving_from_the_shielded_pool_balances_like_a_subsidy() {
+        let (pseudo, outs) = sides(30, &[99]);
+        assert_eq!(balances(&pseudo, &outs, 1, -70), Ok(true));
+    }
+
+    /// A transaction that does not balance is still refused with a crossing in
+    /// play — the crossing must not become a way to absorb a discrepancy.
+    #[test]
+    fn a_crossing_does_not_paper_over_an_imbalance() {
+        let (pseudo, outs) = sides(100, &[30]);
+        assert_eq!(balances(&pseudo, &outs, 1, 68), Ok(false));
+        assert_eq!(balances(&pseudo, &outs, 1, 70), Ok(false));
+        assert_eq!(balances(&pseudo, &outs, 0, 69), Ok(false));
+    }
+
+    /// Zero crossing is exactly the rule the chain has always enforced, so every
+    /// existing transaction must behave identically.
+    #[test]
+    fn no_crossing_is_the_original_rule() {
+        let (pseudo, outs) = sides(100, &[99]);
+        assert_eq!(balances(&pseudo, &outs, 1, 0), Ok(true));
+        assert_eq!(balances(&pseudo, &outs, 2, 0), Ok(false));
+    }
+
+    /// `i64::MIN` cannot be negated, so it is not an amount. Refusing it here
+    /// means the wrap that would read as "no crossing at all" cannot happen.
+    #[test]
+    fn an_unrepresentable_crossing_is_an_error_not_a_verdict() {
+        let (pseudo, outs) = sides(100, &[99]);
+        assert_eq!(balances(&pseudo, &outs, 1, i64::MIN), Err(TxError::BadCross));
+    }
+
+    /// The two public numbers are added over the group, not in `u64`. Summing
+    /// them first would wrap and could make an unbalanced transaction look
+    /// balanced; at these magnitudes the group arithmetic simply does not.
+    #[test]
+    fn a_huge_fee_and_crossing_do_not_wrap_into_agreement() {
+        let (pseudo, outs) = sides(0, &[0]);
+        let half = u64::MAX / 2;
+        // fee + cross would overflow u64 if they were added there first.
+        assert_eq!(balances(&pseudo, &outs, half, half as i64), Ok(false));
     }
 }
