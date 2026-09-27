@@ -1,9 +1,24 @@
-# One pool: Nocturnal becomes shielded-only
+# One pool: the shielded-only alternative, considered and rejected
 
-Status: **design, decided 2026-09-27**. This supersedes the two-pool design in
-[`orchard-pool.md`](orchard-pool.md), which is kept for the reasoning that led
-here and for the parts still in force (bundle handling, the commitment tree,
-coinbase maturity).
+Status: **rejected 2026-09-27**. Kept as a record of a road not taken. The
+design in force is the two-pool one in [`orchard-pool.md`](orchard-pool.md).
+
+> **Why it was rejected.** It was adopted briefly on the belief that offering a
+> choice of pool was "optional privacy" in Zcash's sense. It is not, and the
+> difference matters: Zcash's choice is between private and **public**, where
+> picking public publishes a transaction's sender, recipient and amount for
+> ever. The two-pool choice is between **two private protocols** — ring
+> signatures or zk proofs — and neither publishes a transaction's contents.
+> Nobody can opt out of privacy and nobody can leak by accident.
+>
+> What remains public in the two-pool design is the **amount** moved when value
+> crosses between pools, and only for those who cross. That is a far smaller
+> leak than a transparent pool, and it does not justify giving up a choice of
+> mechanism, one anonymity model as a fallback for the other, or the
+> containment the turnstile provides.
+>
+> Everything below is still accurate about what a single pool would mean, and
+> §4 (coinbase maturity by delayed insertion) is what the chain does either way.
 
 Nocturnal holds all value in **one** pool, built on the Orchard protocol
 (Halo 2, no trusted setup). The RingCT/CLSAG pool is removed from consensus.

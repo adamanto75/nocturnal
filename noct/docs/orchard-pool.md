@@ -1,12 +1,17 @@
 # A second value pool: Orchard (Halo 2) beside the ring pool
 
-> **SUPERSEDED 2026-09-27 by [`shielded-only.md`](shielded-only.md).** The
-> two-pool design made the amount crossing between pools public, and it could
-> not be made private without bespoke cross-curve cryptography in the consensus
-> path. Nocturnal is shielded-only instead: one pool, mandatory, in the style of
-> Pirate Chain rather than Zcash. This document is kept because the reasoning
-> that led there is worth reading, and because its treatment of bundles, the
-> commitment tree and coinbase maturity is still what the chain does.
+> **THIS IS THE DESIGN.** A shielded-only alternative was considered on
+> 2026-09-27 and rejected; see [`shielded-only.md`](shielded-only.md) for what it
+> would have meant and why it was not taken.
+>
+> The decision turns on a distinction worth stating plainly. Zcash lets a user
+> choose between **private and public**, and anyone choosing public publishes
+> everything about that transaction for ever. This design lets a user choose
+> between **two private protocols** — ring signatures or zk proofs. Neither
+> option publishes a transaction's contents, so nobody can opt out of privacy
+> and nobody can leak by accident. The only thing that is public is the
+> **amount** moved when value crosses between the pools, for the people who
+> choose to cross.
 
 Status: **design, no code** (2026-09-26). The dependency spike is done and its
 numbers are in §2; nothing has been written in `core/`, `node/`, `wallet/` or
@@ -202,6 +207,34 @@ project three stacked bugs to learn.
 is 100 and `COINBASE_MATURITY` is 100. An anchor older than the deepest reorg the
 chain will accept can never be invalidated by one, so **accepting anchors from
 the last 100 blocks costs nothing and is the natural choice**.
+
+---
+
+## 6a. Which pool a block reward lands in — the miner decides
+
+If every reward were minted into one pool, that pool would be where all new
+value enters, and anyone who preferred the other one would have to cross to get
+there — publishing an amount purely for choosing a mechanism. A choice that is
+free in one direction and costs privacy in the other is not much of a choice.
+
+So **the miner nominates the pool its coinbase pays into**, per block, the same
+way it already nominates an address. Both pools receive fresh value, and a user
+can live entirely inside either one without ever crossing.
+
+Consequences, each of which has to be handled rather than assumed:
+
+* Block validation must accept a coinbase in either shape — a ring output, or an
+  Orchard bundle with spends disabled — and check the reward against the same
+  subsidy either way.
+* The supply invariant becomes `ring + shielded == emitted` with the coinbase
+  crediting whichever pool the block named. That is already how the turnstile
+  is written; it takes the pool as an argument.
+* A shielded coinbase matures by delayed insertion (§7); a ring coinbase matures
+  as it always has. They must mature on the same block, and there is a test that
+  says so rather than restating the arithmetic.
+* Mining a shielded coinbase costs a proof (~500 ms) on the block-production
+  path. A miner that would rather not pay it can nominate the ring pool, which
+  is another reason not to force the choice.
 
 ---
 
