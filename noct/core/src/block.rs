@@ -29,8 +29,31 @@ use crate::hash::keccak256;
 use crate::keys::{Account, PrivateKey, PublicKey};
 use crate::pow::{check_hash, Difficulty, ProofOfWork};
 use crate::ring::{KeyImage, RingMember};
+use crate::shielded::ShieldedBundle;
 use crate::stealth::{self, TxKeypair};
 use crate::tx::ReceivedOutput;
+
+/// What a shielded coinbase's bundle signs over.
+///
+/// A coinbase bundle has nothing around it to bind to — no ring inputs, no fee
+/// to cover, no other transaction — so without a sighash of its own an
+/// authorized one could be **lifted out of the block that made it and replayed**
+/// in another block claiming the same reward. The stolen reward would still be
+/// spendable only by the miner that built it, so this is not theft; it is worse
+/// in a duller way, because the same note commitment would then be appended to
+/// the commitment tree twice, giving two leaves one nullifier, and a wallet
+/// holding the note could spend only one of them.
+///
+/// Height and the parent's id are enough to make it unique and cheap to check:
+/// they are both fixed before mining starts, so a miner can build and prove its
+/// bundle once per template and then search nonces freely.
+pub fn coinbase_sighash(height: u64, prev_id: &[u8; 32]) -> [u8; 32] {
+    let mut b = Vec::with_capacity(23 + 8 + 32);
+    b.extend_from_slice(b"noct.coinbase.bundle.v1");
+    b.extend_from_slice(&height.to_le_bytes());
+    b.extend_from_slice(prev_id);
+    keccak256(&b)
+}
 
 /// One coinbase output: a stealth key, its (public) amount, and the commitment.
 #[derive(Clone, Debug)]
@@ -49,7 +72,17 @@ pub struct Coinbase {
     pub height: u64,
     /// Transaction public key `R` for the miner's stealth output.
     pub tx_public: PublicKey,
+    /// Ring-pool outputs. Empty when the miner nominated the shielded pool.
     pub outputs: Vec<CoinbaseOutput>,
+    /// The reward as an Orchard note, when the miner nominated the shielded
+    /// pool. `None` for a ring-pool reward.
+    ///
+    /// **The miner chooses**, per block, which pool its reward is paid into —
+    /// the same way it already chooses an address. If every reward entered one
+    /// pool, anyone who preferred the other would have to cross to reach it,
+    /// publishing an amount purely for choosing a mechanism. A choice that is
+    /// free one way and costs privacy the other is not much of a choice.
+    pub shielded: Option<ShieldedBundle>,
 }
 
 impl Coinbase {
@@ -75,6 +108,7 @@ impl Coinbase {
                 amount: reward,
                 commitment: Self::commit(reward),
             }],
+            shielded: None,
         }
     }
 
@@ -85,6 +119,12 @@ impl Coinbase {
     /// (a peer supplies the block), and an unchecked sum that wrapped could match
     /// the allowed reward while actually minting far more — an inflation bug.
     pub fn total(&self) -> Option<u64> {
+        // A shielded reward states its value once, as the bundle's balance.
+        // Callers that add up supply must see it, or emission accounting would
+        // ignore every block a miner chose to mine shielded.
+        if let Some(bundle) = &self.shielded {
+            return bundle.cross().ok().and_then(|v| u64::try_from(v).ok());
+        }
         self.outputs.iter().try_fold(0u64, |acc, o| acc.checked_add(o.amount))
     }
 
@@ -100,12 +140,69 @@ impl Coinbase {
     /// Validate coinbase structure against the reward the block is allowed to
     /// mint: the total must match, and every commitment must be the canonical
     /// `1·G + amount·H` for its stated amount.
-    pub fn is_valid(&self, allowed_reward: u64) -> bool {
-        self.total() == Some(allowed_reward)
-            && self.outputs.iter().all(|o| o.commitment == Self::commit(o.amount))
+    ///
+    /// `prev_id` is the block's parent, needed only for a shielded reward — see
+    /// [`coinbase_sighash`]. It is a parameter rather than something a caller
+    /// checks separately on purpose: a shielded reward's binding signature *is*
+    /// the check that it mints what it claims, and a rule that can be forgotten
+    /// at one call site is a rule that will be.
+    pub fn is_valid(&self, allowed_reward: u64, prev_id: &[u8; 32]) -> bool {
+        match &self.shielded {
+            // A shielded reward: exactly one shape, so no ring outputs beside
+            // it. Spends must be disabled — there is nothing to spend, and a
+            // coinbase that could spend would be a coinbase that could take
+            // somebody else's note.
+            Some(bundle) => {
+                self.outputs.is_empty()
+                    && !bundle.spends_enabled()
+                    && bundle.outputs_enabled()
+                    && bundle.cross() == Ok(allowed_reward as i64)
+                    // And the bundle must actually be worth what it says. The
+                    // claim above is a number beside the proof, not inside it;
+                    // only the binding signature ties it to the notes created.
+                    && bundle.verify(&coinbase_sighash(self.height, prev_id)).is_ok()
+            }
+            None => {
+                self.total() == Some(allowed_reward)
+                    && self.outputs.iter().all(|o| o.commitment == Self::commit(o.amount))
+            }
+        }
+    }
+
+    /// Which pool this reward feeds, and what it credits.
+    ///
+    /// `fees` ride along with the subsidy: they are not new coins, so when the
+    /// reward is shielded they *cross* from the ring pool, and the turnstile is
+    /// told so the two pools stay in step with the emitted supply.
+    pub fn credit(&self, subsidy: u64, fees: u64) -> crate::shielded_state::CoinbaseCredit {
+        use crate::shielded_state::CoinbaseCredit;
+        match &self.shielded {
+            Some(bundle) => match bundle.commitments().next() {
+                Some(cmx) => CoinbaseCredit::shielded(subsidy, fees, cmx.to_bytes()),
+                // A bundle always has at least one action, so this cannot
+                // happen; crediting the ring pool is the safe reading if it
+                // ever did, because it queues no note that could be spent.
+                None => CoinbaseCredit::ring(subsidy, fees),
+            },
+            None => CoinbaseCredit::ring(subsidy, fees),
+        }
+    }
+
+    /// Whether this reward is paid into the shielded pool.
+    pub fn is_shielded(&self) -> bool {
+        self.shielded.is_some()
     }
 
     /// Canonical bytes of the coinbase (for hashing / the Merkle tree / wire).
+    ///
+    /// **The output count is the discriminant.** A ring reward has at least one
+    /// output — it has to pay a reward, and [`TAIL_EMISSION`] is a floor, so the
+    /// allowed reward is never zero — while a shielded reward has none. So an
+    /// empty output vector, and only an empty one, is followed by a bundle tag.
+    /// A ring coinbase's bytes are therefore exactly what they have always been,
+    /// which is what keeps its hash, and every block id built on it, unchanged.
+    ///
+    /// [`TAIL_EMISSION`]: crate::emission::TAIL_EMISSION
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&self.height.to_le_bytes());
@@ -115,6 +212,17 @@ impl Coinbase {
             b.extend_from_slice(&o.one_time_key.to_bytes());
             b.extend_from_slice(&o.amount.to_le_bytes());
             b.extend_from_slice(&o.commitment.to_bytes());
+        }
+        if self.outputs.is_empty() {
+            match &self.shielded {
+                Some(bundle) => {
+                    b.push(1);
+                    let encoded = bundle.to_bytes();
+                    b.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    b.extend_from_slice(&encoded);
+                }
+                None => b.push(0),
+            }
         }
         b
     }
@@ -280,6 +388,9 @@ impl Block {
                 amount: p.premine_amount,
                 commitment: Coinbase::commit(p.premine_amount),
             }],
+            // The premine is a ring output, as it has been since genesis was
+            // fixed. Changing it would change the chain id.
+            shielded: None,
         }
     }
 
@@ -399,9 +510,9 @@ mod tests {
         let reward = base_reward(0);
         let cb = Coinbase::create(&mut OsRng, 0, &address(&miner), reward);
         assert_eq!(cb.total(), Some(reward));
-        assert!(cb.is_valid(reward));
+        assert!(cb.is_valid(reward, &[0u8; 32]));
         // Wrong allowed reward is rejected.
-        assert!(!cb.is_valid(reward - 1));
+        assert!(!cb.is_valid(reward - 1, &[0u8; 32]));
     }
 
     #[test]
@@ -425,11 +536,12 @@ mod tests {
                     commitment: Coinbase::commit((1u64 << 63).wrapping_add(allowed)),
                 },
             ],
+            shielded: None,
         };
         // The two amounts sum to 2^64 + allowed, which wraps to `allowed` under
         // unchecked arithmetic — the overflow-checked total must return None.
         assert_eq!(cb.total(), None);
-        assert!(!cb.is_valid(allowed));
+        assert!(!cb.is_valid(allowed, &[0u8; 32]));
     }
 
     #[test]

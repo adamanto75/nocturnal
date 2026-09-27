@@ -236,6 +236,70 @@ Consequences, each of which has to be handled rather than assumed:
   path. A miner that would rather not pay it can nominate the ring pool, which
   is another reason not to force the choice.
 
+**Built, in `core/src/block.rs` and `core/src/shielded_state.rs`.** Three things
+about it were not obvious and are worth recording.
+
+*The output count is the discriminant.* A shielded coinbase carries no ring
+outputs, and a ring coinbase always carries at least one, because it has to pay a
+reward and `TAIL_EMISSION` is a floor. So an empty output vector — and only an
+empty one — is followed by a bundle tag. A ring coinbase's bytes are therefore
+unchanged, which is what keeps its hash, every block id built on it, and the
+chain id itself unchanged.
+
+*Fees cross when the reward is shielded.* The subsidy is new coins and mints into
+whichever pool the miner named. Fees are **not** new coins: the transactions that
+paid them did so on the ring side. Paying them into the shielded pool moves them,
+so the turnstile is told, or the two pools would drift apart by one block's fees
+every time a miner chose the other one. Emitted supply is identical either way,
+and there is a test that compares the two paths rather than restating the sum.
+
+*A coinbase bundle needs a sighash of its own.* It has nothing around it to bind
+to — no ring inputs, no fee to cover, no other transaction — so an authorized one
+could otherwise be lifted out of its block and replayed in another claiming the
+same reward. It is bound to `height ‖ prev_id`, both fixed before mining starts,
+so a miner proves its bundle once per template and then searches nonces freely.
+
+---
+
+## 6b. What the bundle's signatures cover, and why the proof is not enough
+
+Found while wiring the coinbase up, and it applied to the v2 transaction as
+written too: **`Bundle::verify_proof` does not check the value balance.**
+
+`value_balance` is a public input carried *beside* the proof. What ties it to the
+actions' value commitments is the **binding signature**, whose validating key is
+derived as `Σ cv_net − value_balance·R` — a key that can be signed under only if
+the two agree. Verify the proof and not the binding signature and a bundle may
+claim any balance it likes: on the way into the pool that mints coins from
+nothing, and on the way out it mints them in the ring pool. It is the whole of
+the turnstile's arithmetic, resting on one signature. The **spend authorization**
+signatures are the other half: the proof shows a note exists and that `rk` is its
+correct randomized key, but only a signature under `rk` shows the owner agreed.
+
+So consensus calls `ShieldedBundle::verify(sighash)`, never `verify_proof` alone,
+and the two sighashes are:
+
+| Bundle | Signed over |
+|---|---|
+| In a transaction | `"noct.tx.bundle.v1" ‖ signed core` |
+| In a coinbase | `"noct.coinbase.bundle.v1" ‖ height ‖ prev_id` |
+
+The **signed core** is everything a transaction commits to except its
+signatures: version, transaction keys, fee, key images and rings, outputs, range
+proof, and `cross`. Both signature systems sign it, and that is what stops them
+chasing each other — the ring signatures sign the core *plus* the authorized
+bundle, while the bundle signs the core *alone*. If the bundle's signatures also
+covered the ring signatures, each side would have to be made after the other.
+
+The consequence for the API: a wallet cannot hand a finished bundle to
+`Transaction::build_with_shielded`, because the sighash covers a ring side that
+does not exist until part-way through building. It passes a callback that is
+handed the sighash and returns the authorized bundle.
+
+A test rewrites `value_balance` in an encoded bundle and asserts that the proof
+still verifies while the binding signature does not — the inflation bug stated as
+an executable claim rather than a paragraph.
+
 ---
 
 ## 7. Coinbase, the premine, and a maturity problem Zcash does not have

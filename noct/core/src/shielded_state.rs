@@ -101,6 +101,47 @@ pub struct ShieldedUndo {
     coinbase_matured: Vec<(u64, [u8; 32])>,
 }
 
+/// What a block's coinbase credits, and to which pool.
+///
+/// The miner nominates the pool, so both pools receive fresh value and nobody
+/// has to cross merely to use the mechanism they prefer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoinbaseCredit {
+    /// The pool the miner nominated.
+    pub pool: Pool,
+    /// New coins: the emission subsidy.
+    pub subsidy: u64,
+    /// Fees the block collected. **Not new coins** — they were already in the
+    /// ring pool, paid by the transactions that carry them.
+    ///
+    /// If the coinbase is paid into the shielded pool, those fees therefore
+    /// *cross*: the ring pool loses them and the shielded pool gains them. That
+    /// movement is real and has to be accounted for, or the two pools would
+    /// drift apart by one block's fees every time a miner chose the other pool.
+    /// It leaks nothing new, because a fee is public either way.
+    pub fees: u64,
+    /// The commitment of the coinbase note, when the reward is shielded. Queued
+    /// rather than appended — see [`ShieldedState::apply_block`].
+    pub note: Option<[u8; 32]>,
+}
+
+impl CoinbaseCredit {
+    /// A block that mints nothing: genesis before the premine, and tests.
+    pub fn none() -> Self {
+        CoinbaseCredit { pool: Pool::Ring, subsidy: 0, fees: 0, note: None }
+    }
+
+    /// A reward paid into the ring pool, as every block's has been so far.
+    pub fn ring(subsidy: u64, fees: u64) -> Self {
+        CoinbaseCredit { pool: Pool::Ring, subsidy, fees, note: None }
+    }
+
+    /// A reward paid into the shielded pool as a note.
+    pub fn shielded(subsidy: u64, fees: u64, note: [u8; 32]) -> Self {
+        CoinbaseCredit { pool: Pool::Shielded, subsidy, fees, note: Some(note) }
+    }
+}
+
 /// The shielded pool as the chain sees it.
 #[derive(Clone, Debug)]
 pub struct ShieldedState {
@@ -171,8 +212,8 @@ impl ShieldedState {
     /// Apply one block's worth of shielded activity.
     ///
     /// `bundles` are every bundle in the block, in the order the block commits
-    /// to them; `minted` is the block reward and `minted_into` the pool it is
-    /// created in.
+    /// to them; `coinbase` is what the block mints, and which pool the miner
+    /// nominated for it.
     ///
     /// Either the whole block applies or nothing does: the state is only
     /// modified after every check has passed, so a block refused halfway leaves
@@ -194,9 +235,7 @@ impl ShieldedState {
     pub fn apply_block<'a, I>(
         &mut self,
         bundles: I,
-        minted_into: Pool,
-        minted: u64,
-        coinbase_note: Option<[u8; 32]>,
+        coinbase: CoinbaseCredit,
         height: u64,
         maturity: u64,
     ) -> Result<ShieldedUndo, ShieldedStateError>
@@ -222,8 +261,22 @@ impl ShieldedState {
         let mut seen_here: HashSet<[u8; 32]> = HashSet::new();
 
         // The block reward, into whichever pool it is created in.
-        if minted > 0 {
-            totals.mint(minted_into, minted).map_err(ShieldedStateError::Turnstile)?;
+        // New coins, into whichever pool the miner nominated.
+        if coinbase.subsidy > 0 {
+            totals
+                .mint(coinbase.pool, coinbase.subsidy)
+                .map_err(ShieldedStateError::Turnstile)?;
+        }
+        // Fees are not new coins: the transactions that paid them did so on the
+        // ring side. Paying them into the shielded pool therefore *moves* them
+        // across, and the turnstile has to be told — otherwise the two pools
+        // drift apart by one block's fees every time a miner nominates the
+        // other pool. It leaks nothing new: a fee is public either way.
+        if coinbase.pool == Pool::Shielded && coinbase.fees > 0 {
+            let crossing = i64::try_from(coinbase.fees).map_err(|_| {
+                ShieldedStateError::Turnstile(TurnstileError::NotRepresentable)
+            })?;
+            totals.apply_cross(crossing).map_err(ShieldedStateError::Turnstile)?;
         }
 
         // A coinbase note that has now been buried deep enough enters the tree
@@ -292,7 +345,7 @@ impl ShieldedState {
         for _ in 0..matured.len() {
             self.pending_coinbase.pop_front();
         }
-        if let Some(note) = coinbase_note {
+        if let Some(note) = coinbase.note {
             self.pending_coinbase.push_back((height, note));
         }
         self.anchors.push(self.root());
@@ -303,7 +356,7 @@ impl ShieldedState {
 
         Ok(ShieldedUndo {
             nullifiers_added: added,
-            coinbase_queued: coinbase_note.is_some(),
+            coinbase_queued: coinbase.note.is_some(),
             coinbase_matured: matured,
             ..undo
         })
@@ -543,7 +596,7 @@ mod tests {
         s.totals.mint(Pool::Ring, 10_000).unwrap();
 
         let nullifiers: Vec<_> = b.nullifiers().collect();
-        s.apply_block([&b], Pool::Ring, 0, None, 0, 1).expect("applies");
+        s.apply_block([&b], CoinbaseCredit::ring(0, 0), 0, 1).expect("applies");
 
         assert_ne!(s.root(), before, "appending a note must change the root");
         assert!(s.accepts_anchor(&s.root()), "the new root is an anchor");
@@ -571,7 +624,7 @@ mod tests {
         let blocks = [bundle(1_000), bundle(2_000), bundle(3_000)];
         let mut undos = Vec::new();
         for b in &blocks {
-            undos.push(lived_through_it.apply_block([b], Pool::Ring, 0, None, 0, 1).expect("applies"));
+            undos.push(lived_through_it.apply_block([b], CoinbaseCredit::ring(0, 0), 0, 1).expect("applies"));
         }
         assert_ne!(lived_through_it.root(), untouched.root(), "the branch did change things");
 
@@ -606,9 +659,9 @@ mod tests {
         let repeat = b.clone();
         let n = b.nullifiers().next().unwrap();
 
-        s.apply_block([&b], Pool::Ring, 0, None, 0, 1).expect("first spend applies");
+        s.apply_block([&b], CoinbaseCredit::ring(0, 0), 0, 1).expect("first spend applies");
         assert_eq!(
-            s.apply_block([&repeat], Pool::Ring, 0, None, 0, 1).unwrap_err(),
+            s.apply_block([&repeat], CoinbaseCredit::ring(0, 0), 0, 1).unwrap_err(),
             ShieldedStateError::DuplicateNullifier(n),
             "across blocks"
         );
@@ -619,7 +672,7 @@ mod tests {
         let twin = b2.clone();
         assert!(
             matches!(
-                fresh.apply_block([&b2, &twin], Pool::Ring, 0, None, 0, 1),
+                fresh.apply_block([&b2, &twin], CoinbaseCredit::ring(0, 0), 0, 1),
                 Err(ShieldedStateError::DuplicateNullifier(_))
             ),
             "and within one block"
@@ -634,7 +687,7 @@ mod tests {
         let mut s = ShieldedState::new();
         s.totals.mint(Pool::Ring, 100_000).unwrap();
         let good = bundle(1_000);
-        s.apply_block([&good], Pool::Ring, 0, None, 0, 1).expect("applies");
+        s.apply_block([&good], CoinbaseCredit::ring(0, 0), 0, 1).expect("applies");
 
         let before_root = s.root();
         let before_notes = s.notes();
@@ -643,7 +696,7 @@ mod tests {
         // A block whose second bundle double-spends the first's note.
         let a = bundle(500);
         let twin = a.clone();
-        assert!(s.apply_block([&a, &twin], Pool::Ring, 0, None, 0, 1).is_err());
+        assert!(s.apply_block([&a, &twin], CoinbaseCredit::ring(0, 0), 0, 1).is_err());
 
         assert_eq!(s.root(), before_root, "the tree must not have moved");
         assert_eq!(s.notes(), before_notes);
@@ -664,22 +717,22 @@ mod tests {
         // A recent root is still good: the tree moves on, and a bundle built
         // against the root from before still applies.
         let first = bundle(1_000);
-        s.apply_block([&first], Pool::Ring, 0, None, 0, 1).expect("applies");
+        s.apply_block([&first], CoinbaseCredit::ring(0, 0), 0, 1).expect("applies");
         let later = bundle(1_000);
         assert!(s.accepts_anchor(&later.anchor()), "a recent root is still good");
-        s.apply_block([&later], Pool::Ring, 0, None, 0, 1).expect("a bundle on a recent anchor applies");
+        s.apply_block([&later], CoinbaseCredit::ring(0, 0), 0, 1).expect("a bundle on a recent anchor applies");
 
         // Now push the history past its depth, so the empty-tree root the test
         // bundles carry falls out of it. A bundle proving against it must be
         // refused — this is the real path, not just the predicate.
         for _ in 0..(ANCHOR_DEPTH + 5) {
-            s.apply_block(std::iter::empty(), Pool::Ring, 0, None, 0, 1).expect("an empty block applies");
+            s.apply_block(std::iter::empty(), CoinbaseCredit::ring(0, 0), 0, 1).expect("an empty block applies");
         }
         let stale = bundle(1_000);
         let anchor = stale.anchor();
         assert!(!s.accepts_anchor(&anchor), "the empty-tree root has aged out");
         assert_eq!(
-            s.apply_block([&stale], Pool::Ring, 0, None, 0, 1).unwrap_err(),
+            s.apply_block([&stale], CoinbaseCredit::ring(0, 0), 0, 1).unwrap_err(),
             ShieldedStateError::UnknownAnchor(anchor),
             "a spend against an aged-out root must be refused by apply_block itself"
         );
@@ -691,7 +744,7 @@ mod tests {
     fn the_anchor_history_is_bounded() {
         let mut s = ShieldedState::new();
         for _ in 0..(ANCHOR_DEPTH + 25) {
-            s.apply_block(std::iter::empty(), Pool::Ring, 0, None, 0, 1).expect("an empty block applies");
+            s.apply_block(std::iter::empty(), CoinbaseCredit::ring(0, 0), 0, 1).expect("an empty block applies");
         }
         assert_eq!(s.anchors.len(), ANCHOR_DEPTH);
         assert!(s.accepts_anchor(&s.root()));
@@ -703,13 +756,86 @@ mod tests {
     fn a_shielded_coinbase_mints_into_the_pool() {
         let mut s = ShieldedState::new();
         let reward = coinbase(9_000_000_000);
-        assert!(!reward.spends_enabled());
+        assert!(!reward.spends_enabled(), "a reward has nothing to spend");
+        let note = reward.commitments().next().expect("a bundle has an action").to_bytes();
+        let empty_root = s.root();
 
-        // The reward mints, and the bundle's own crossing moves it on from
-        // there; both are the same value, so the pool nets the reward.
-        s.apply_block(std::iter::empty(), Pool::Shielded, 9_000_000_000, None, 0, 1).expect("mint applies");
+        s.apply_block(std::iter::empty(), CoinbaseCredit::shielded(9_000_000_000, 0, note), 0, 1)
+            .expect("mint applies");
         assert_eq!(s.totals().shielded(), 9_000_000_000);
         assert_eq!(s.totals().ring(), 0, "nothing was created in the ring pool");
+        // Minted but withheld: the supply moved, the tree did not, so no anchor
+        // this block publishes can reach the note.
+        assert_eq!(s.root(), empty_root, "the coinbase note is withheld from the tree");
+
+        s.apply_block(std::iter::empty(), CoinbaseCredit::none(), 1, 1).expect("applies");
+        assert_ne!(s.root(), empty_root, "and enters it once it is due");
+    }
+
+    /// The whole point of the miner's choice: the supply is the same either way.
+    /// A reward is new coins in exactly one pool, and fees — which are not new
+    /// coins — end up in the same pool as the reward that collected them.
+    #[test]
+    fn either_pool_emits_the_same_supply() {
+        let fees = 1_234u64;
+        let subsidy = 9_000_000_000u64;
+
+        // Ring: the fees were already there, so nothing crosses.
+        let mut ring = ShieldedState::new();
+        ring.totals.mint(Pool::Ring, fees).expect("the fees exist");
+        ring.apply_block(std::iter::empty(), CoinbaseCredit::ring(subsidy, fees), 0, 1)
+            .expect("applies");
+        assert_eq!(ring.totals().ring(), subsidy + fees);
+        assert_eq!(ring.totals().shielded(), 0);
+
+        // Shielded: the same fees cross out of the ring pool into this one.
+        let mut sh = ShieldedState::new();
+        sh.totals.mint(Pool::Ring, fees).expect("the fees exist");
+        let note = coinbase(subsidy).commitments().next().unwrap().to_bytes();
+        sh.apply_block(std::iter::empty(), CoinbaseCredit::shielded(subsidy, fees, note), 0, 1)
+            .expect("applies");
+        assert_eq!(sh.totals().ring(), 0, "the fees left the ring pool");
+        assert_eq!(sh.totals().shielded(), subsidy + fees);
+
+        // Same emitted supply. That is the invariant the choice must not touch.
+        assert_eq!(
+            ring.totals().ring() + ring.totals().shielded(),
+            sh.totals().ring() + sh.totals().shielded(),
+        );
+    }
+
+    /// A miner cannot pay itself fees the block never collected: crossing more
+    /// than the ring pool holds is refused, and refused leaves nothing behind.
+    #[test]
+    fn fees_cannot_cross_out_of_an_empty_ring_pool() {
+        let mut s = ShieldedState::new();
+        let before = s.totals();
+        let note = coinbase(9_000_000_000).commitments().next().unwrap().to_bytes();
+
+        let err = s
+            .apply_block(std::iter::empty(), CoinbaseCredit::shielded(9_000_000_000, 1, note), 0, 1)
+            .expect_err("there are no fees to cross");
+        assert!(matches!(err, ShieldedStateError::Turnstile(TurnstileError::Underflow { .. })));
+        assert_eq!(s.totals(), before, "a refused block changes nothing");
+        assert!(s.pending_coinbase.is_empty(), "and queues no note");
+    }
+
+    /// Undoing a block that paid a shielded reward must unwind the queue as well
+    /// as the tree: a note left pending would enter the tree on a later block of
+    /// a chain that never paid it.
+    #[test]
+    fn undo_unqueues_a_shielded_coinbase() {
+        let mut s = ShieldedState::new();
+        let note = coinbase(9_000_000_000).commitments().next().unwrap().to_bytes();
+
+        let undo = s
+            .apply_block(std::iter::empty(), CoinbaseCredit::shielded(9_000_000_000, 0, note), 0, 100)
+            .expect("applies");
+        assert_eq!(s.pending_coinbase.len(), 1);
+
+        s.undo_block(undo);
+        assert!(s.pending_coinbase.is_empty(), "the note must not survive the reorg");
+        assert_eq!(s.totals(), PoolTotals::default(), "nor the coins it minted");
     }
 
     /// Undo restores the totals as well as the tree — a reorg that unwound the
@@ -721,7 +847,7 @@ mod tests {
         let before = s.totals();
 
         let b = bundle(4_000);
-        let undo = s.apply_block([&b], Pool::Ring, 0, None, 0, 1).expect("applies");
+        let undo = s.apply_block([&b], CoinbaseCredit::ring(0, 0), 0, 1).expect("applies");
         assert_eq!(s.totals().shielded(), 4_000);
 
         s.undo_block(undo);

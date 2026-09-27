@@ -32,8 +32,7 @@ use crate::emission::base_reward;
 use crate::keys::PublicKey;
 use crate::pow::{check_hash, next_difficulty, Difficulty, ProofOfWork, MIN_DIFFICULTY};
 use crate::ring::{KeyImage, RingMember};
-use crate::pools::Pool;
-use crate::shielded_state::{ShieldedState, ShieldedStateError};
+use crate::shielded_state::{CoinbaseCredit, ShieldedState, ShieldedStateError};
 use crate::tx::{Transaction, TxError};
 
 /// How many recent block timestamps the median-time-past is taken over.
@@ -354,7 +353,7 @@ impl<P: ProofOfWork> Blockchain<P> {
         // what will catch it if only half the change is made.
         let shielded_before = self
             .shielded
-            .apply_block(std::iter::empty(), Pool::Ring, premined, None, 0, self.maturity)
+            .apply_block(std::iter::empty(), CoinbaseCredit::ring(premined, 0), 0, self.maturity)
             .expect("the genesis premine cannot overflow an empty pool");
         self.blocks.push(StoredBlock { block: block.clone(), txs: Vec::new() });
         self.undos.push(Undo { outputs_len_before: 0, emitted_before: 0, shielded_before });
@@ -376,6 +375,12 @@ impl<P: ProofOfWork> Blockchain<P> {
     /// transactions reachable and therefore alive.
     pub fn block_id_at(&self, height: u64) -> Option<[u8; 32]> {
         self.block_ids.get(usize::try_from(height).ok()?).copied()
+    }
+
+    /// The shielded pool as this chain sees it: the tree, the anchors a spend may
+    /// prove against, the nullifier set and each pool's supply.
+    pub fn shielded(&self) -> &ShieldedState {
+        &self.shielded
     }
 
     pub fn genesis_id(&self) -> [u8; 32] {
@@ -572,7 +577,7 @@ impl<P: ProofOfWork> Blockchain<P> {
         // 8. Coinbase claims exactly subsidy + fees.
         let subsidy = base_reward(self.emitted);
         let allowed = subsidy.checked_add(total_fees).ok_or(ChainError::FeeOverflow)?;
-        if !block.coinbase.is_valid(allowed) {
+        if !block.coinbase.is_valid(allowed, &block.header.prev_id) {
             return Err(ChainError::BadCoinbaseReward);
         }
 
@@ -586,12 +591,11 @@ impl<P: ProofOfWork> Blockchain<P> {
             .shielded
             .apply_block(
                 txs.iter().filter_map(|t| t.shielded.as_ref()),
-                Pool::Ring,
-                subsidy,
-                // No shielded coinbase yet: the block reward is still a ring
-                // output. The queue and its maturity rule are in place for when
-                // that changes.
-                None,
+                // The coinbase credits whichever pool the miner nominated, and
+                // carries the fees with it — which is a crossing when the
+                // nominated pool is the shielded one, because the fees were
+                // paid on the ring side.
+                block.coinbase.credit(subsidy, total_fees),
                 self.height(),
                 self.maturity,
             )
@@ -1444,6 +1448,46 @@ pub(crate) mod tests {
         };
         block.mine(&KeccakPow, chain.next_difficulty());
         (block, received)
+    }
+
+    // As `make_block`, but the reward is paid into the shielded pool: no ring
+    // output, an Orchard bundle worth the whole reward with spends disabled.
+    fn make_shielded_block(
+        chain: &Blockchain<KeccakPow>,
+        txs: &[Transaction],
+        timestamp: u64,
+    ) -> Block {
+        let timestamp = crate::block::GENESIS_TIMESTAMP + timestamp;
+        let subsidy = base_reward(chain.emitted());
+        let fees: u64 = txs.iter().map(|t| t.fee).sum();
+        let height = chain.height();
+        let prev_id = chain.tip_id();
+        let sighash = crate::block::coinbase_sighash(height, &prev_id);
+        let bundle = crate::shielded::ShieldedBundle::new(
+            crate::shielded::tests::built_bundle_signed(subsidy + fees, true, sighash),
+        )
+        .expect("fixed circuit");
+        let coinbase = Coinbase {
+            height,
+            // A shielded reward pays nobody on the ring side, but the field is
+            // part of the encoding, so it carries a fresh throwaway key.
+            tx_public: TxKeypair::random(&mut OsRng).public,
+            outputs: Vec::new(),
+            shielded: Some(bundle),
+        };
+        let mut block = Block {
+            header: BlockHeader {
+                major_version: 1,
+                minor_version: 0,
+                timestamp,
+                prev_id,
+                nonce: 0,
+            },
+            coinbase,
+            tx_hashes: txs.iter().map(|t| t.hash()).collect(),
+        };
+        block.mine(&KeccakPow, chain.next_difficulty());
+        block
     }
 
     // Mine a coinbase-only block to `miner` and append it; return the miner's
@@ -2516,6 +2560,61 @@ pub(crate) mod tests {
         warm_up(&mut chain, maturity as usize, ts + 130);
         let tx2 = build_spend(&chain, &target, target_index, pay, 1);
         assert!(chain.validate_tx(&mut OsRng, &tx2).is_ok());
+    }
+
+    /// **The two reward shapes must mature on the same block.** A ring output
+    /// becomes spendable when it is `maturity` blocks deep; a shielded note has no
+    /// spend that names it, so instead it is withheld from the commitment tree
+    /// until it is that deep. Two mechanisms, one rule — and if they disagree by
+    /// even one block, which pool a miner chose would change when it got paid.
+    ///
+    /// This drives both through real blocks and compares the answers, rather than
+    /// asserting the arithmetic twice.
+    #[test]
+    fn both_reward_shapes_mature_on_the_same_block() {
+        let maturity = 5u64;
+
+        // The ring side: the first height at which the coinbase may be spent.
+        let mut ring = Blockchain::with_maturity(KeccakPow, maturity);
+        warm_up(&mut ring, 20, 1_000);
+        let ts = 1_000 + 20 * 130;
+        let (_target, target_index) = mine_coinbase(&mut ring, &Account::random(&mut OsRng), ts);
+        let created_at = ring.height() - 1;
+        let ring_spendable_at = (created_at..created_at + 3 * maturity)
+            .find(|h| ring.output_spendable_at(target_index, *h))
+            .expect("a coinbase matures eventually");
+
+        // The shielded side: the first height at which a spend could prove against
+        // an anchor that contains the note. The note enters the tree during some
+        // block; the anchor that block publishes is what the *next* block's
+        // transactions prove against.
+        let mut sh = Blockchain::with_maturity(KeccakPow, maturity);
+        warm_up(&mut sh, 20, 1_000);
+        assert_eq!(sh.height(), created_at, "both chains reach the same height");
+        let before = sh.shielded().root();
+        let block = make_shielded_block(&sh, &[], ts);
+        sh.add_block(&mut OsRng, &block, &[]).expect("a shielded reward is a valid block");
+        assert_eq!(sh.shielded().root(), before, "and is withheld from the tree at first");
+
+        let mut inserted_during = None;
+        for i in 0..3 * maturity {
+            let height = sh.height();
+            let b = make_shielded_block(&sh, &[], ts + 130 * (i + 1));
+            // Only the first block pays shielded; the rest are filler, but paying
+            // them shielded too keeps every block one shape and is harmless — each
+            // queues its own note behind the one being watched.
+            sh.add_block(&mut OsRng, &b, &[]).expect("valid filler block");
+            if inserted_during.is_none() && sh.shielded().root() != before {
+                inserted_during = Some(height);
+            }
+        }
+        let note_usable_at =
+            inserted_during.expect("the note enters the tree eventually") + 1;
+
+        assert_eq!(
+            note_usable_at, ring_spendable_at,
+            "a shielded reward must become spendable on exactly the block a ring reward would"
+        );
     }
 
     // --- ChainState: validating forward without the block bodies -----------

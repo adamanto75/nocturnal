@@ -351,7 +351,28 @@ fn read_coinbase(cur: &mut &[u8]) -> Result<Coinbase, WireError> {
     let height = read_u64(cur)?;
     let tx_public = read_public_key(cur)?;
     let outputs = read_vec(cur, MAX_COMMITMENTS, read_coinbase_output)?;
-    Ok(Coinbase { height, tx_public, outputs })
+    // Mirrors `Coinbase::to_bytes`: the output count is the discriminant. A ring
+    // reward pays at least one output, so only an empty vector is followed by a
+    // bundle tag, and a ring coinbase parses byte-for-byte as it always did.
+    let shielded = if outputs.is_empty() {
+        match read_u8(cur)? {
+            0 => None,
+            1 => {
+                // Bounded before the slice is taken, as everywhere in this
+                // module; the bundle's own decoder refuses anything left over.
+                let len = read_u32(cur)? as usize;
+                if len > max_bundle_bytes() {
+                    return Err(WireError::TooLarge);
+                }
+                let bytes = take(cur, len)?;
+                Some(ShieldedBundle::from_bytes(bytes).map_err(|_| WireError::BadProof)?)
+            }
+            _ => return Err(WireError::BadTag),
+        }
+    } else {
+        None
+    };
+    Ok(Coinbase { height, tx_public, outputs, shielded })
 }
 
 fn read_block(cur: &mut &[u8]) -> Result<Block, WireError> {
@@ -616,6 +637,97 @@ mod tests {
         let (_, block) = sample_tx();
         let decoded = decode_block(&encode_block(&block)).unwrap();
         assert_eq!(decoded.id(), block.id());
+    }
+
+    /// A ring coinbase must encode to **exactly** the fields it always had, with
+    /// nothing appended for the pool it could have chosen. Anything extra would
+    /// change its hash, and with it every block id and the chain id itself.
+    ///
+    /// The count of outputs is what carries the distinction, so this is asserted
+    /// as an exact length rather than by comparing against a stored blob: the
+    /// length is the property, and a stored blob would only restate it.
+    #[test]
+    fn a_ring_coinbase_gains_no_bytes_from_the_miners_choice() {
+        let (_, block) = sample_tx();
+        let cb = &block.coinbase;
+        assert!(!cb.outputs.is_empty(), "the sample block pays a ring reward");
+        // height(8) + tx key(32) + count(4) + per output: key(32) + amount(8) +
+        // commitment(32).
+        let expected = 8 + 32 + 4 + cb.outputs.len() * (32 + 8 + 32);
+        assert_eq!(cb.to_bytes().len(), expected, "a ring coinbase grew a tag byte");
+    }
+
+    /// A shielded reward survives the block wire format, and the bundle comes
+    /// back able to verify — a coinbase that decoded to an unprovable bundle
+    /// would be a block every node rejected after relaying it.
+    #[test]
+    fn a_shielded_coinbase_survives_the_wire() {
+        let (_, mut block) = sample_tx();
+        let reward = base_reward(0);
+        let sighash = crate::block::coinbase_sighash(block.coinbase.height, &block.header.prev_id);
+        let bundle =
+            ShieldedBundle::new(crate::shielded::tests::built_bundle_signed(reward, true, sighash))
+                .expect("fixed circuit");
+        block.coinbase.outputs.clear();
+        block.coinbase.shielded = Some(bundle);
+
+        let bytes = encode_block(&block);
+        let decoded = decode_block(&bytes).expect("a shielded coinbase decodes");
+        assert_eq!(decoded.id(), block.id(), "the bundle is inside what gets hashed");
+        assert_eq!(encode_block(&decoded), bytes, "and the encoding is canonical");
+
+        let got = decoded.coinbase.shielded.as_ref().expect("the bundle came back");
+        assert!(got.verify_proof().is_ok());
+        assert!(
+            decoded.coinbase.is_valid(reward, &decoded.header.prev_id),
+            "and still validates as the reward"
+        );
+    }
+
+    /// A coinbase bundle is bound to the block that made it. Lifting an
+    /// authorized one onto a different parent must not validate — otherwise the
+    /// same note commitment could be appended to the tree twice, and two leaves
+    /// would share one nullifier.
+    #[test]
+    fn a_shielded_coinbase_cannot_be_lifted_onto_another_block() {
+        let (_, mut block) = sample_tx();
+        let reward = base_reward(0);
+        let sighash = crate::block::coinbase_sighash(block.coinbase.height, &block.header.prev_id);
+        block.coinbase.outputs.clear();
+        block.coinbase.shielded = Some(
+            ShieldedBundle::new(crate::shielded::tests::built_bundle_signed(reward, true, sighash))
+                .expect("fixed circuit"),
+        );
+        assert!(block.coinbase.is_valid(reward, &block.header.prev_id));
+
+        // Same reward, same bundle, a different parent.
+        let mut elsewhere = block.header.prev_id;
+        elsewhere[0] ^= 1;
+        assert!(
+            !block.coinbase.is_valid(reward, &elsewhere),
+            "the signatures must not carry to another block"
+        );
+    }
+
+    /// Truncating the bundle off a shielded coinbase must be refused, not read as
+    /// a reward that pays nothing. The tag says a bundle follows; the bytes must
+    /// deliver one.
+    #[test]
+    fn a_shielded_coinbase_missing_its_bundle_is_refused() {
+        let (_, mut block) = sample_tx();
+        block.coinbase.outputs.clear();
+        block.coinbase.shielded = None;
+        // Tag 0 is representable — it is a coinbase that credits the ring pool
+        // and pays nothing, which `is_valid` refuses — but tag 1 with nothing
+        // after it must not parse at all.
+        let mut bytes = encode_block(&block);
+        // header: version(1+1) + timestamp(8) + prev(32) + nonce(4);
+        // coinbase: height(8) + tx key(32) + an output count of zero(4).
+        let tag = (1 + 1 + 8 + 32 + 4) + (8 + 32 + 4);
+        assert_eq!(bytes[tag], 0, "the tag sits where the outputs would have been");
+        bytes.truncate(tag + 1);
+        bytes[tag] = 1;
+        assert!(matches!(decode_block(&bytes), Err(WireError::Truncated)));
     }
 
     #[test]

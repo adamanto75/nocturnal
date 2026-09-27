@@ -131,6 +131,24 @@ mod tests {
         assert_eq!(TESTNET.network, Network::Testnet);
     }
 
+    /// The chain id, pinned.
+    ///
+    /// Nodes reject each other on sight over this in the p2p handshake, so a
+    /// change here is a new network: every node stops talking to every node
+    /// running anything else. The shielded-coinbase work is exactly the kind of
+    /// change that could do it by accident — the coinbase encoding grew a second
+    /// shape, and a ring coinbase had to keep encoding to the bytes it always did
+    /// (see `wire::tests::a_ring_coinbase_gains_no_bytes_from_the_miners_choice`).
+    ///
+    /// Updating this literal is allowed. Updating it *without meaning to* is what
+    /// this test exists to stop.
+    #[test]
+    fn the_genesis_id_is_the_one_the_network_already_agreed_on() {
+        let hex: String =
+            crate::block::Block::genesis().id().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "346951d48b7fc001a5ce80a18a0263ea46a099697f0b4c9a8a555c4801a1f6dc");
+    }
+
     /// Regenerate the testnet genesis constants from the published seed phrase.
     ///
     ///   cargo test -p noct-core print_testnet_genesis_params -- --ignored --nocapture
