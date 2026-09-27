@@ -5,6 +5,16 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
+# The shielded pool: Zcash's Orchard, Halo 2, no trusted setup.
+#
+# **Not below 0.14.0, ever.** Every release up to and including 0.13.1 is yanked
+# because the original Action circuit was unsound; the fix shipped with the
+# halo2_gadgets 0.5.0 critical fix in NU6.2. The same releases also fixed
+# GHSA-2x4w-pxqw-58v9 (proofs padded with trailing data, and an identity `epk`).
+# Only the fixed circuit is used here — see `shielded::CIRCUIT`.
+#
+# This is the dependency that set the workspace's Rust floor at 1.85.1.
+orchard = "0.15.5"
 curve25519-dalek = { version = "4", features = ["rand_core"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

@@ -1583,7 +1583,13 @@ mod slow_peer_tests {
         // The live peer must still get its messages. Read one full frame; that
         // is enough to prove traffic flowed past the silent peer.
         let mut len_buf = [0u8; 4];
-        live_peer.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        // Same reasoning as the 60s below: a liveness bound, not a performance
+        // one. Raised from 30s after the workspace gained Halo 2 proving tests,
+        // which saturate every core — this test then failed in a full `cargo
+        // test` while passing in 0.03s on its own, which is what a starved
+        // scheduler looks like rather than a stalled sender. The property being
+        // asserted is "traffic flows past a silent peer at all".
+        live_peer.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
         live_peer
             .read_exact(&mut len_buf)
             .expect("live peer received nothing — a silent peer is blocking the flood");
@@ -1596,9 +1602,9 @@ mod slow_peer_tests {
         );
 
         // And the flood itself must have finished rather than parked on the
-        // silent peer. 60s is not a performance bound; it is "not fifteen
+        // silent peer. 180s is not a performance bound; it is "not fifteen
         // minutes", generous enough never to be flaky on a loaded machine.
-        match done_rx.recv_timeout(Duration::from_secs(60)) {
+        match done_rx.recv_timeout(Duration::from_secs(180)) {
             Ok(()) => {}
             Err(RecvTimeoutError::Timeout) => {
                 panic!("flood never finished — a silent peer stalled the sender")

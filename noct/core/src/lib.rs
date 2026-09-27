@@ -33,6 +33,7 @@ pub mod pools;
 pub mod p2p;
 pub mod pow;
 pub mod ring;
+pub mod shielded;
 pub mod stealth;
 pub mod subaddress;
 pub mod tx;
