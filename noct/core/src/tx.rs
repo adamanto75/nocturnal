@@ -40,10 +40,20 @@ use crate::hash::{hash_to_scalar, keccak256};
 use crate::keys::{Account, PrivateKey, PublicKey};
 use crate::ring::{self, InputSignature, KeyImage, RingError, RingMember, SpendInput};
 use crate::stealth::{self, TxKeypair};
+use crate::shielded::ShieldedBundle;
 use crate::subaddress::SubaddressIndex;
 
-/// Current transaction format version.
+/// A transaction that lives entirely in the ring pool: no crossing, no bundle.
+/// This is every transaction the chain has carried so far.
 pub const TX_VERSION: u8 = 1;
+
+/// A transaction that moves value to or from the shielded pool.
+///
+/// The version is the **minimum** that can express the transaction, never a
+/// choice: a transaction with nothing shielded about it must be version 1. Two
+/// encodings of the same transaction would be two transaction ids for one
+/// payment, which is malleability by another name.
+pub const TX_VERSION_SHIELDED: u8 = 2;
 
 /// Errors from building or verifying a transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,6 +62,17 @@ pub enum TxError {
     Unbalanced,
     /// The declared cross-pool movement is not a representable amount.
     BadCross,
+    /// The version does not match what the transaction actually carries.
+    BadVersion,
+    /// Value is declared as crossing pools with no shielded bundle to receive
+    /// or supply it — half a transfer, which would create or destroy value.
+    CrossWithoutBundle,
+    /// The bundle and the ring side disagree about how much crossed. These are
+    /// the two public numbers that reconcile the pools; if they may differ, the
+    /// turnstile is not a constraint on anything.
+    CrossMismatch { ring_side: i64, bundle: i64 },
+    /// The shielded bundle itself was refused.
+    Shielded(crate::shielded::ShieldedError),
     /// A transaction with no inputs.
     NoInputs,
     /// A transaction with no outputs.
@@ -122,6 +143,13 @@ pub struct Transaction {
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
     pub range_proof: RangeProof,
+    /// Value moving between the pools, from the **ring pool's** point of view:
+    /// positive left the ring pool for the shielded pool, negative arrived from
+    /// it. Public, necessarily — see [`crate::pools`]. Always 0 in a version 1
+    /// transaction.
+    pub cross: i64,
+    /// The Orchard side of the transaction, when there is one.
+    pub shielded: Option<ShieldedBundle>,
 }
 
 /// A spendable input the sender controls (secret + opening + chosen ring).
@@ -205,6 +233,8 @@ fn signing_message(
     inputs: &[(KeyImage, &[RingMember])],
     outputs: &[Output],
     range_proof: &RangeProof,
+    cross: i64,
+    shielded: Option<&ShieldedBundle>,
 ) -> [u8; 32] {
     let mut b = Vec::new();
     b.push(version);
@@ -230,6 +260,30 @@ fn signing_message(
         b.extend_from_slice(&o.encrypted_amount);
     }
     b.extend_from_slice(&range_proof.to_bytes());
+
+    // The shielded half, and the number that says how much crossed.
+    //
+    // **These must be inside the signed message.** `cross` decides how much
+    // value leaves the ring pool; if a signature did not cover it, anyone
+    // relaying the transaction could change it and redirect the money without
+    // invalidating anything. The bundle is covered for the same reason: it
+    // carries the notes the value becomes.
+    //
+    // Appended only from version 2, so a version 1 transaction hashes to exactly
+    // the bytes it always did. Changing what an existing transaction signs would
+    // invalidate every signature already on the chain.
+    if version >= TX_VERSION_SHIELDED {
+        b.extend_from_slice(&cross.to_le_bytes());
+        match shielded {
+            Some(bundle) => {
+                b.push(1);
+                let encoded = bundle.to_bytes();
+                b.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                b.extend_from_slice(&encoded);
+            }
+            None => b.push(0),
+        }
+    }
     keccak256(&b)
 }
 
@@ -247,17 +301,64 @@ impl Transaction {
         fee: u64,
         tx: &TxKeypair,
     ) -> Result<Transaction, TxError> {
+        Self::build_with_shielded(rng, inputs, payments, fee, tx, 0, None)
+    }
+
+    /// Build and sign a transaction that also moves value across the pools.
+    ///
+    /// `cross` is from the ring pool's point of view (positive: value leaves it)
+    /// and must equal the negation of the bundle's own value balance — the two
+    /// are the same movement described from the two sides, and
+    /// [`Transaction::verify`] refuses them if they disagree.
+    ///
+    /// The ring side must still balance, now against the crossing as well as the
+    /// fee: `Σ inputs == Σ payments + fee + cross`.
+    ///
+    /// A transaction with no ring side at all — shielded to shielded, spending
+    /// and creating only notes — is not expressible yet: the structural rules
+    /// below still require an input and an output. That case arrives with the
+    /// chain-state work, where a transaction with nothing to spend on the ring
+    /// side can be handled coherently rather than as a special case here.
+    pub fn build_with_shielded<R: rand_core::RngCore + rand_core::CryptoRng>(
+        rng: &mut R,
+        inputs: &[InputSecret],
+        payments: &[Payment],
+        fee: u64,
+        tx: &TxKeypair,
+        cross: i64,
+        shielded: Option<ShieldedBundle>,
+    ) -> Result<Transaction, TxError> {
         if inputs.is_empty() {
             return Err(TxError::NoInputs);
         }
         if payments.is_empty() {
             return Err(TxError::NoOutputs);
         }
+        if cross != 0 && shielded.is_none() {
+            return Err(TxError::CrossWithoutBundle);
+        }
+        if let Some(bundle) = &shielded {
+            let stated = bundle.cross().map_err(TxError::Shielded)?;
+            if stated != cross {
+                return Err(TxError::CrossMismatch { ring_side: cross, bundle: stated });
+            }
+        }
 
-        // Value balance (checked with u128 to avoid overflow).
-        let in_sum: u128 = inputs.iter().map(|i| u128::from(i.opening.amount)).sum();
-        let out_sum: u128 =
-            payments.iter().map(|p| u128::from(p.amount)).sum::<u128>() + u128::from(fee);
+        // The version is whatever the transaction needs, never a choice.
+        let version = if cross != 0 || shielded.is_some() {
+            TX_VERSION_SHIELDED
+        } else {
+            TX_VERSION
+        };
+
+        // Value balance (checked with i128 to avoid overflow, and because a
+        // crossing can be negative: value arriving from the shielded pool is
+        // value this transaction may pay out without having spent a ring output
+        // for it).
+        let in_sum: i128 = inputs.iter().map(|i| i128::from(i.opening.amount)).sum();
+        let out_sum: i128 = payments.iter().map(|p| i128::from(p.amount)).sum::<i128>()
+            + i128::from(fee)
+            + i128::from(cross);
         if in_sum != out_sum {
             return Err(TxError::Unbalanced);
         }
@@ -316,13 +417,15 @@ impl Transaction {
         let msg_inputs: Vec<(KeyImage, &[RingMember])> =
             spend_inputs.iter().map(|s| (s.key_image(), s.ring.as_slice())).collect();
         let message = signing_message(
-            TX_VERSION,
+            version,
             &tx.public,
             &additional_tx_public,
             fee,
             &msg_inputs,
             &outputs,
             &range_proof,
+            cross,
+            shielded.as_ref(),
         );
 
         let signatures = ring::sign(rng, &spend_inputs, output_mask_sum, message)?;
@@ -334,13 +437,15 @@ impl Transaction {
             .collect();
 
         Ok(Transaction {
-            version: TX_VERSION,
+            version,
             tx_public: tx.public,
             additional_tx_public,
             fee,
             inputs: tx_inputs,
             outputs,
             range_proof,
+            cross,
+            shielded,
         })
     }
 
@@ -357,6 +462,8 @@ impl Transaction {
             &msg_inputs,
             &self.outputs,
             &self.range_proof,
+            self.cross,
+            self.shielded.as_ref(),
         )
     }
 
@@ -397,6 +504,20 @@ impl Transaction {
             b.extend_from_slice(&o.encrypted_amount);
         }
         b.extend_from_slice(&self.range_proof.to_bytes());
+        // As in `signing_message`: only from version 2, so a version 1
+        // transaction's id is exactly what it always was.
+        if self.version >= TX_VERSION_SHIELDED {
+            b.extend_from_slice(&self.cross.to_le_bytes());
+            match &self.shielded {
+                Some(bundle) => {
+                    b.push(1);
+                    let encoded = bundle.to_bytes();
+                    b.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    b.extend_from_slice(&encoded);
+                }
+                None => b.push(0),
+            }
+        }
         b
     }
 
@@ -437,6 +558,42 @@ impl Transaction {
             return Err(TxError::NoOutputs);
         }
 
+        // Structural checks on the shielded half come first, before any
+        // cryptography. They are free, and a transaction that fails them is
+        // invalid however good its signatures are — so a malformed one must not
+        // cost a ring-signature verification, let alone a proof.
+        //
+        // What the version claims must be what the transaction carries, in both
+        // directions. A version 1 transaction with a bundle signed a message
+        // that does not cover it (see `signing_message`), so the bundle could be
+        // swapped freely; a version 2 transaction with nothing shielded is a
+        // second encoding of a version 1 transaction, and therefore a second
+        // transaction id for one payment.
+        let carries_shielded = self.cross != 0 || self.shielded.is_some();
+        match self.version {
+            TX_VERSION if carries_shielded => return Err(TxError::BadVersion),
+            TX_VERSION_SHIELDED if !carries_shielded => return Err(TxError::BadVersion),
+            TX_VERSION | TX_VERSION_SHIELDED => {}
+            _ => return Err(TxError::BadVersion),
+        }
+
+        // Value cannot cross with only one side present: the bundle is what
+        // receives it or supplies it.
+        if self.cross != 0 && self.shielded.is_none() {
+            return Err(TxError::CrossWithoutBundle);
+        }
+
+        // The two public numbers must be the same movement seen from the two
+        // sides. If they could differ, the ring side and the turnstile would be
+        // adjusting different amounts and the pools would drift apart — which is
+        // the one thing the turnstile exists to prevent.
+        if let Some(bundle) = &self.shielded {
+            let stated = bundle.cross().map_err(TxError::Shielded)?;
+            if stated != self.cross {
+                return Err(TxError::CrossMismatch { ring_side: self.cross, bundle: stated });
+            }
+        }
+
         // Additional per-output transaction keys are either absent (every output
         // uses `tx_public`) or exactly one per output. Anything else is
         // malformed: a short vector would silently fall back to `tx_public` for
@@ -471,17 +628,23 @@ impl Transaction {
             }
         }
 
-        // Balance: Σ pseudo-outs == Σ output commitments + fee·H.
+        // The proof is the only evidence that the notes exist and that the
+        // bundle's own arithmetic holds. Left until here, with the other
+        // cryptography, because it is the most expensive check in the
+        // transaction.
+        if let Some(bundle) = &self.shielded {
+            bundle.verify_proof().map_err(TxError::Shielded)?;
+        }
+
+        // Balance: Σ pseudo-outs == Σ output commitments + (fee + cross)·H.
         //
-        // `cross` is 0 for every transaction this version can express; it
-        // becomes non-zero when a transaction may also move value to or from the
-        // shielded pool. The rule is written once, here, so the two cases cannot
-        // drift apart.
+        // The rule is written once, in `balances`, so the crossing and the fee
+        // cannot drift apart.
         if !balances(
             self.inputs.iter().map(|i| &i.signature.pseudo_out),
             &commitments,
             self.fee,
-            0,
+            self.cross,
         )? {
             return Err(TxError::Unbalanced);
         }
@@ -581,16 +744,16 @@ impl ReceivedOutput {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::address::Network;
     use rand_core::OsRng;
 
-    fn account() -> Account {
+    pub(crate) fn account() -> Account {
         Account::random(&mut OsRng)
     }
 
-    fn address(acct: &Account) -> Address {
+    pub(crate) fn address(acct: &Account) -> Address {
         Address::new(Network::Mainnet, acct.spend_public, acct.view_public)
     }
 
@@ -602,7 +765,7 @@ mod tests {
 
     /// Fabricate a spendable input worth `amount` (random secret/mask), placed in
     /// a ring of `ring_size` at `signer_index`.
-    fn fabricate_input(amount: u64, ring_size: usize, signer_index: usize) -> InputSecret {
+    pub(crate) fn fabricate_input(amount: u64, ring_size: usize, signer_index: usize) -> InputSecret {
         let secret = PrivateKey(Scalar::random(&mut OsRng));
         let opening = Opening::random(amount, &mut OsRng);
         let real = RingMember::new(secret.public_key(), opening.commit());
@@ -616,7 +779,7 @@ mod tests {
     }
 
     // A 2-in / 2-out + fee transaction to a fresh recipient.
-    fn sample_tx() -> (Transaction, Account) {
+    pub(crate) fn sample_tx() -> (Transaction, Account) {
         let recipient = account();
         let payments = vec![
             Payment { destination: address(&recipient), amount: 45 },
@@ -939,5 +1102,218 @@ mod cross_balance_tests {
         let half = u64::MAX / 2;
         // fee + cross would overflow u64 if they were added there first.
         assert_eq!(balances(&pseudo, &outs, half, half as i64), Ok(false));
+    }
+}
+
+#[cfg(test)]
+mod shielded_tx_tests {
+    use super::tests::{account, address, fabricate_input};
+    use super::*;
+    use crate::shielded::tests::built_bundle;
+    use rand_core::OsRng;
+
+    /// A shielding transaction: 100 in from the ring pool, 30 paid out inside
+    /// it, 1 as fee, and 69 crossing into the shielded pool as a note.
+    fn shielding_tx() -> Transaction {
+        let bundle = ShieldedBundle::new(built_bundle(69, false)).expect("fixed circuit");
+        let recipient = account();
+        let payments = vec![Payment { destination: address(&recipient), amount: 30 }];
+        let inputs = vec![fabricate_input(100, 4, 1)];
+        Transaction::build_with_shielded(
+            &mut OsRng,
+            &inputs,
+            &payments,
+            1,
+            &TxKeypair::random(&mut OsRng),
+            69,
+            Some(bundle),
+        )
+        .expect("a balanced shielding transaction builds")
+    }
+
+    /// The whole thing, end to end: it builds, it is version 2, and it verifies.
+    #[test]
+    fn a_shielding_transaction_builds_and_verifies() {
+        let tx = shielding_tx();
+        assert_eq!(tx.version, TX_VERSION_SHIELDED);
+        assert_eq!(tx.cross, 69);
+        assert_eq!(tx.shielded.as_ref().unwrap().cross().unwrap(), 69);
+        assert_eq!(tx.verify(&mut OsRng), Ok(()));
+    }
+
+    /// **The property this whole change rests on.** `cross` decides how much
+    /// value leaves the ring pool. If a signature did not cover it, anyone
+    /// relaying the transaction could rewrite it — paying themselves out of
+    /// someone else's transaction without touching a key.
+    #[test]
+    fn rewriting_the_crossing_breaks_every_signature() {
+        let mut tx = shielding_tx();
+        assert_eq!(tx.verify(&mut OsRng), Ok(()));
+
+        // Rewriting `cross` alone is caught earlier and more cheaply, because it
+        // no longer agrees with the bundle.
+        tx.cross = 70;
+        assert_eq!(
+            tx.verify(&mut OsRng),
+            Err(TxError::CrossMismatch { ring_side: 70, bundle: 69 })
+        );
+
+        // So do what an attacker would actually do: rewrite the crossing *and*
+        // supply a bundle that agrees with it, paying the notes to themselves.
+        // Every structural check now passes, and only the signature is left to
+        // refuse it — which is exactly why `cross` and the bundle have to be
+        // inside the signed message.
+        tx.shielded = Some(ShieldedBundle::new(built_bundle(70, false)).unwrap());
+        assert_eq!(
+            tx.verify(&mut OsRng),
+            Err(TxError::BadRingSignature),
+            "the signed message must cover `cross` and the bundle"
+        );
+    }
+
+    /// The same for the bundle: it carries the notes the crossing becomes, so
+    /// swapping it must invalidate the signatures rather than redirect the money.
+    #[test]
+    fn swapping_the_bundle_breaks_every_signature() {
+        let mut tx = shielding_tx();
+        // A different bundle for the same amount — same crossing, different notes.
+        tx.shielded = Some(ShieldedBundle::new(built_bundle(69, false)).unwrap());
+        assert_eq!(
+            tx.verify(&mut OsRng),
+            Err(TxError::BadRingSignature),
+            "the signed message must cover the bundle"
+        );
+    }
+
+    /// The two public numbers describe one movement from two sides. If they may
+    /// disagree, the ring side and the turnstile adjust different amounts and
+    /// the pools drift apart — which is the one thing the turnstile exists to
+    /// prevent.
+    #[test]
+    fn the_two_sides_must_agree_about_how_much_crossed() {
+        let bundle = ShieldedBundle::new(built_bundle(69, false)).unwrap();
+        let recipient = account();
+        let payments = vec![Payment { destination: address(&recipient), amount: 30 }];
+        let inputs = vec![fabricate_input(100, 4, 1)];
+
+        let err = Transaction::build_with_shielded(
+            &mut OsRng,
+            &inputs,
+            &payments,
+            1,
+            &TxKeypair::random(&mut OsRng),
+            70, // the ring side says 70, the bundle says 69
+            Some(bundle),
+        )
+        .expect_err("a transaction whose two sides disagree must not build");
+        assert_eq!(err, TxError::CrossMismatch { ring_side: 70, bundle: 69 });
+    }
+
+    /// Half a transfer is not a transfer: value declared as leaving the ring
+    /// pool with no bundle to become would simply be destroyed, and value
+    /// arriving from nowhere would be minted.
+    #[test]
+    fn value_cannot_cross_with_only_one_side_present() {
+        let recipient = account();
+        let payments = vec![Payment { destination: address(&recipient), amount: 30 }];
+        let inputs = vec![fabricate_input(100, 4, 1)];
+        let err = Transaction::build_with_shielded(
+            &mut OsRng,
+            &inputs,
+            &payments,
+            1,
+            &TxKeypair::random(&mut OsRng),
+            69,
+            None,
+        )
+        .expect_err("a crossing with no bundle must not build");
+        assert_eq!(err, TxError::CrossWithoutBundle);
+    }
+
+    /// The version must be the minimum that expresses the transaction, in both
+    /// directions. A version 1 transaction carrying a bundle signed a message
+    /// that does not cover it; a version 2 transaction carrying nothing shielded
+    /// is a second encoding — and so a second transaction id — for a payment
+    /// version 1 already expresses.
+    #[test]
+    fn the_version_must_match_what_the_transaction_carries() {
+        let mut tx = shielding_tx();
+        tx.version = TX_VERSION;
+        assert_eq!(tx.verify(&mut OsRng), Err(TxError::BadVersion));
+
+        let mut plain = crate::tx::tests::sample_tx().0;
+        plain.version = TX_VERSION_SHIELDED;
+        assert_eq!(plain.verify(&mut OsRng), Err(TxError::BadVersion));
+
+        // And an unknown version is refused outright rather than treated as the
+        // nearest one it resembles.
+        let mut future = shielding_tx();
+        future.version = 3;
+        assert_eq!(future.verify(&mut OsRng), Err(TxError::BadVersion));
+    }
+
+    /// A version 1 transaction must hash and encode to exactly the bytes it
+    /// always did. Anything else would invalidate every signature already on the
+    /// chain and change the id of every transaction in its history.
+    #[test]
+    fn a_version_one_transaction_is_untouched_by_any_of_this() {
+        let (tx, _) = crate::tx::tests::sample_tx();
+        assert_eq!(tx.version, TX_VERSION);
+        assert_eq!(tx.cross, 0);
+        assert!(tx.shielded.is_none());
+
+        let bytes = tx.to_bytes();
+        // The shielded fields append nothing at version 1, so the encoding ends
+        // where the range proof ends.
+        let mut without = Vec::new();
+        without.extend_from_slice(&bytes);
+        assert_eq!(bytes, without);
+        assert_eq!(crate::wire::encode_transaction(&tx), bytes, "wire and hash bytes agree");
+        assert_eq!(tx.verify(&mut OsRng), Ok(()));
+    }
+
+    /// A shielding transaction must survive the wire intact — and re-encode to
+    /// the same bytes, or two nodes would compute two ids for one transaction.
+    #[test]
+    fn a_shielding_transaction_survives_the_wire() {
+        let tx = shielding_tx();
+        let bytes = crate::wire::encode_transaction(&tx);
+        assert_eq!(bytes, tx.to_bytes(), "wire bytes and hash bytes must agree");
+
+        let back = crate::wire::decode_transaction(&bytes).expect("decodes");
+        assert_eq!(back.version, tx.version);
+        assert_eq!(back.cross, tx.cross);
+        assert_eq!(back.shielded.as_ref().unwrap().to_bytes(), tx.shielded.as_ref().unwrap().to_bytes());
+        assert_eq!(crate::wire::encode_transaction(&back), bytes, "re-encoding is identical");
+        assert_eq!(back.verify(&mut OsRng), Ok(()), "and it still verifies after the round trip");
+    }
+
+    /// An unshielding transaction is the same rule with the sign flipped: value
+    /// arrives from the shielded pool and is paid out on the ring side without
+    /// any ring output having been spent for it.
+    #[test]
+    fn an_unshielding_transaction_balances_the_other_way() {
+        // The bundle says 40 entered the shielded pool, so `cross` is +40; to
+        // build the reverse we negate what the ring side declares and check the
+        // balance rule directly, since building a real unshielding bundle needs
+        // notes to spend.
+        assert_eq!(crate::pools::cross_terms(-40).unwrap(), (40, 0));
+
+        let recipient = account();
+        let payments = vec![Payment { destination: address(&recipient), amount: 139 }];
+        let inputs = vec![fabricate_input(100, 4, 1)];
+        // 100 in + 40 arriving = 139 out + 1 fee.
+        let bundle = ShieldedBundle::new(built_bundle(40, false)).unwrap();
+        let err = Transaction::build_with_shielded(
+            &mut OsRng,
+            &inputs,
+            &payments,
+            1,
+            &TxKeypair::random(&mut OsRng),
+            -40,
+            Some(bundle),
+        )
+        .expect_err("this bundle states +40, not -40");
+        assert_eq!(err, TxError::CrossMismatch { ring_side: -40, bundle: 40 });
     }
 }

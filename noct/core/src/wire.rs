@@ -32,7 +32,8 @@ use crate::block::{Block, BlockHeader, Coinbase, CoinbaseOutput};
 use crate::keys::PublicKey;
 use crate::p2p::{Phase, Wire};
 use crate::ring::{InputSignature, KeyImage, RingMember};
-use crate::tx::{Input, Output, Transaction};
+use crate::shielded::{max_bundle_bytes, ShieldedBundle};
+use crate::tx::{Input, Output, Transaction, TX_VERSION, TX_VERSION_SHIELDED};
 
 /// A wire (de)serialization error.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -227,6 +228,20 @@ fn write_transaction_into(out: &mut Vec<u8>, tx: &Transaction) {
     write_vec(out, &tx.inputs, write_input);
     write_vec(out, &tx.outputs, write_output);
     out.extend_from_slice(&tx.range_proof.to_bytes());
+    // Only from version 2, so a version 1 transaction's bytes — and therefore
+    // its id — are exactly what they have always been.
+    if tx.version >= TX_VERSION_SHIELDED {
+        out.extend_from_slice(&tx.cross.to_le_bytes());
+        match &tx.shielded {
+            Some(bundle) => {
+                out.push(1);
+                let encoded = bundle.to_bytes();
+                out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&encoded);
+            }
+            None => out.push(0),
+        }
+    }
 }
 
 fn read_transaction(cur: &mut &[u8]) -> Result<Transaction, WireError> {
@@ -252,7 +267,48 @@ fn read_transaction(cur: &mut &[u8]) -> Result<Transaction, WireError> {
     let inputs = read_vec(cur, MAX_INPUTS, read_input)?;
     let outputs = read_vec(cur, MAX_COMMITMENTS, read_output)?;
     let range_proof = RangeProof::read_from(cur).map_err(|_| WireError::BadProof)?;
-    Ok(Transaction { version, tx_public, additional_tx_public, fee, inputs, outputs, range_proof })
+
+    // Versions are an allow-list, not a number to step over: an unknown version
+    // is refused here rather than parsed as whatever it resembles. That is also
+    // what makes this a hard fork — a node running this code rejects a version
+    // it does not implement instead of ignoring the part it cannot see.
+    let (cross, shielded) = match version {
+        TX_VERSION => (0, None),
+        TX_VERSION_SHIELDED => {
+            let cross = read_u64(cur)? as i64;
+            match read_u8(cur)? {
+                0 => (cross, None),
+                1 => {
+                    // Bounded before the slice is taken, like every other length
+                    // in this module. The bundle's own decoder then refuses
+                    // anything left over inside it, so the length cannot be used
+                    // to smuggle padding either.
+                    let len = read_u32(cur)? as usize;
+                    if len > max_bundle_bytes() {
+                        return Err(WireError::TooLarge);
+                    }
+                    let bytes = take(cur, len)?;
+                    let bundle =
+                        ShieldedBundle::from_bytes(bytes).map_err(|_| WireError::BadProof)?;
+                    (cross, Some(bundle))
+                }
+                _ => return Err(WireError::BadTag),
+            }
+        }
+        _ => return Err(WireError::BadTag),
+    };
+
+    Ok(Transaction {
+        version,
+        tx_public,
+        additional_tx_public,
+        fee,
+        inputs,
+        outputs,
+        range_proof,
+        cross,
+        shielded,
+    })
 }
 
 /// Serialize a transaction. Byte-identical to [`Transaction::to_bytes`], so the

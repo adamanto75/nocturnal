@@ -218,6 +218,16 @@ pub const ACTION_BYTES: usize = 32 + 32 + 32 + 32 + 32 + 580 + 80 + 64;
 /// spare, while a larger claim is refused before a byte is allocated.
 pub const MAX_ACTIONS: usize = 512;
 
+/// The largest a bundle can legitimately be: [`MAX_ACTIONS`] actions and the
+/// proof that goes with them.
+///
+/// A bound for whoever embeds a bundle in something larger — a transaction has
+/// to know when to stop reading — and checked before any slice is taken, like
+/// every other length in [`crate::wire`].
+pub fn max_bundle_bytes() -> usize {
+    2 + MAX_ACTIONS * ACTION_BYTES + 1 + 8 + 32 + Proof::expected_proof_size(MAX_ACTIONS) + 64
+}
+
 /// Why a bundle could not be decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BundleWireError {
@@ -390,7 +400,7 @@ fn read_u8(cur: &mut &[u8]) -> Result<u8, BundleWireError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use orchard::builder::{Builder, BundleType};
     use orchard::bundle::{BundleVersion, Flags};
@@ -425,7 +435,7 @@ mod tests {
     ///
     /// `coinbase` picks the two shapes Noct needs: value crossing in from the
     /// ring pool, and a block reward minted straight into the shielded pool.
-    pub(super) fn built_bundle(value: u64, coinbase: bool) -> Bundle<Authorized, i64> {
+    pub(crate) fn built_bundle(value: u64, coinbase: bool) -> Bundle<Authorized, i64> {
         let mut rng = OsRng;
         let version = BundleVersion::orchard_v2();
         let fvk = FullViewingKey::from(&spending_key());
