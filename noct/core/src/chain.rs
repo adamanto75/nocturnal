@@ -869,6 +869,25 @@ impl<P: ProofOfWork> Blockchain<P> {
                 return Err(ChainError::DoubleSpend);
             }
         }
+        // The shielded half gets the same treatment, and for the same reason the
+        // comment above gives. A bundle whose anchor this chain has forgotten, or
+        // whose nullifier is already spent, can never be mined — and both are a
+        // hash lookup, while the proof it carries is nine milliseconds an action.
+        // Checking after `verify` would sell an attacker that work for the price
+        // of replaying one transaction.
+        if let Some(bundle) = &tx.shielded {
+            let anchor = bundle.anchor();
+            if !self.shielded.accepts_anchor(&anchor) {
+                return Err(ChainError::Shielded(ShieldedStateError::UnknownAnchor(anchor)));
+            }
+            for nullifier in bundle.nullifiers() {
+                if self.shielded.is_spent(&nullifier) {
+                    return Err(ChainError::Shielded(ShieldedStateError::DuplicateNullifier(
+                        nullifier,
+                    )));
+                }
+            }
+        }
         tx.verify(rng).map_err(ChainError::InvalidTx)?;
         Ok(())
     }

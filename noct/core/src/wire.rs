@@ -227,7 +227,12 @@ fn write_transaction_into(out: &mut Vec<u8>, tx: &Transaction) {
     out.extend_from_slice(&tx.fee.to_le_bytes());
     write_vec(out, &tx.inputs, write_input);
     write_vec(out, &tx.outputs, write_output);
-    out.extend_from_slice(&tx.range_proof.to_bytes());
+    // Present exactly when the transaction has outputs, so the output count
+    // already written says whether these bytes follow. A version 1 transaction
+    // always has outputs, so its bytes are unchanged.
+    if let Some(proof) = &tx.range_proof {
+        out.extend_from_slice(&proof.to_bytes());
+    }
     // Only from version 2, so a version 1 transaction's bytes — and therefore
     // its id — are exactly what they have always been.
     if tx.version >= TX_VERSION_SHIELDED {
@@ -266,7 +271,11 @@ fn read_transaction(cur: &mut &[u8]) -> Result<Transaction, WireError> {
     let fee = read_u64(cur)?;
     let inputs = read_vec(cur, MAX_INPUTS, read_input)?;
     let outputs = read_vec(cur, MAX_COMMITMENTS, read_output)?;
-    let range_proof = RangeProof::read_from(cur).map_err(|_| WireError::BadProof)?;
+    let range_proof = if outputs.is_empty() {
+        None
+    } else {
+        Some(RangeProof::read_from(cur).map_err(|_| WireError::BadProof)?)
+    };
 
     // Versions are an allow-list, not a number to step over: an unknown version
     // is refused here rather than parsed as whatever it resembles. That is also

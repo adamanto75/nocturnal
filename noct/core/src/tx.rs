@@ -73,6 +73,13 @@ pub enum TxError {
     CrossMismatch { ring_side: i64, bundle: i64 },
     /// The shielded bundle itself was refused.
     Shielded(crate::shielded::ShieldedError),
+    /// The caller's `authorize` callback could not produce a bundle.
+    ///
+    /// Deliberately carries no detail: the reason belongs to whoever wrote the
+    /// callback — a wallet with no spendable notes, a proving failure — and this
+    /// layer has no business paraphrasing it. A caller that wants the reason keeps
+    /// it from its own closure.
+    BundleUnavailable,
     /// A transaction with no inputs.
     NoInputs,
     /// A transaction with no outputs.
@@ -142,7 +149,13 @@ pub struct Transaction {
     pub fee: u64,
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
-    pub range_proof: RangeProof,
+    /// The aggregate range proof over the ring outputs.
+    ///
+    /// `None` exactly when there are no ring outputs to prove anything about,
+    /// which is a transaction that lives entirely in the shielded pool. A proof
+    /// over nothing is not a thing Bulletproofs+ can produce, and a transaction
+    /// carrying a proof of somebody else's outputs would be worse than none.
+    pub range_proof: Option<RangeProof>,
     /// Value moving between the pools, from the **ring pool's** point of view:
     /// positive left the ring pool for the shielded pool, negative arrived from
     /// it. Public, necessarily — see [`crate::pools`]. Always 0 in a version 1
@@ -241,7 +254,7 @@ fn signed_core(
     fee: u64,
     inputs: &[(KeyImage, &[RingMember])],
     outputs: &[Output],
-    range_proof: &RangeProof,
+    range_proof: Option<&RangeProof>,
     cross: i64,
 ) -> Vec<u8> {
     let mut b = Vec::new();
@@ -267,7 +280,12 @@ fn signed_core(
         b.extend_from_slice(&o.commitment.to_bytes());
         b.extend_from_slice(&o.encrypted_amount);
     }
-    b.extend_from_slice(&range_proof.to_bytes());
+    // Present exactly when there are outputs, so the output count above already
+    // says whether these bytes are here. A version 1 transaction always has
+    // outputs, so its signed bytes are unchanged.
+    if let Some(proof) = range_proof {
+        b.extend_from_slice(&proof.to_bytes());
+    }
 
     // The shielded half, and the number that says how much crossed.
     //
@@ -296,7 +314,7 @@ fn signing_message(
     fee: u64,
     inputs: &[(KeyImage, &[RingMember])],
     outputs: &[Output],
-    range_proof: &RangeProof,
+    range_proof: Option<&RangeProof>,
     cross: i64,
     shielded: Option<&ShieldedBundle>,
 ) -> [u8; 32] {
@@ -337,7 +355,7 @@ fn bundle_sighash(
     fee: u64,
     inputs: &[(KeyImage, &[RingMember])],
     outputs: &[Output],
-    range_proof: &RangeProof,
+    range_proof: Option<&RangeProof>,
     cross: i64,
 ) -> [u8; 32] {
     let core = signed_core(
@@ -389,11 +407,15 @@ impl Transaction {
     /// The ring side must still balance, now against the crossing as well as the
     /// fee: `Σ inputs == Σ payments + fee + cross`.
     ///
-    /// A transaction with no ring side at all — shielded to shielded, spending
-    /// and creating only notes — is not expressible yet: the structural rules
-    /// below still require an input and an output. That case arrives with the
-    /// chain-state work, where a transaction with nothing to spend on the ring
-    /// side can be handled coherently rather than as a special case here.
+    /// **With a bundle, the ring side may be empty on either half or both.** A
+    /// shielded-to-shielded send has no ring side at all: no inputs, no outputs,
+    /// no range proof, and the fee is paid by crossing it out of the pool —
+    /// `fee = F` with `cross = -F` — for the block's coinbase to collect like any
+    /// other fee. The balance rule needs no special case for it,
+    /// `0 == 0 + (F + (-F))·H`, which is why it was worth writing that rule once.
+    /// A full shield with no change is the same freedom on the other half: ring
+    /// inputs, no ring outputs, and no change output to link the payment back.
+    ///
     /// `authorize` is called once, with the sighash the bundle must be signed
     /// over, and returns the finished bundle. It is a callback rather than a
     /// ready-made bundle because that sighash covers the ring side, which does
@@ -413,11 +435,15 @@ impl Transaction {
         R: rand_core::RngCore + rand_core::CryptoRng,
         F: FnOnce(&[u8; 32]) -> Result<ShieldedBundle, TxError>,
     {
-        if inputs.is_empty() {
-            return Err(TxError::NoInputs);
-        }
-        if payments.is_empty() {
-            return Err(TxError::NoOutputs);
+        // A ring-only transaction needs both halves; with a bundle, either may be
+        // empty and the balance rule decides. See `verify`.
+        if authorize.is_none() {
+            if inputs.is_empty() {
+                return Err(TxError::NoInputs);
+            }
+            if payments.is_empty() {
+                return Err(TxError::NoOutputs);
+            }
         }
         if cross != 0 && authorize.is_none() {
             return Err(TxError::CrossWithoutBundle);
@@ -478,8 +504,13 @@ impl Transaction {
             Vec::new()
         };
 
-        // Aggregate range proof over the output commitments.
-        let (range_proof, _points) = RangeProof::prove(rng, &openings)?;
+        // Aggregate range proof over the output commitments — and none at all when
+        // there are no outputs, because there is nothing to prove in range.
+        let range_proof = if openings.is_empty() {
+            None
+        } else {
+            Some(RangeProof::prove(rng, &openings)?.0)
+        };
         let output_mask_sum: Scalar = openings.iter().map(|o| o.mask).sum();
 
         // Message to sign, then the ring signatures.
@@ -507,7 +538,7 @@ impl Transaction {
                     fee,
                     &msg_inputs,
                     &outputs,
-                    &range_proof,
+                    range_proof.as_ref(),
                     cross,
                 );
                 let bundle = authorize(&sighash)?;
@@ -527,12 +558,19 @@ impl Transaction {
             fee,
             &msg_inputs,
             &outputs,
-            &range_proof,
+            range_proof.as_ref(),
             cross,
             shielded.as_ref(),
         );
 
-        let signatures = ring::sign(rng, &spend_inputs, output_mask_sum, message)?;
+        // Nothing to sign when there is no ring side. `ring::sign` refuses an empty
+        // set, and rightly — a ring signature over no inputs is not a degenerate
+        // case of anything, it is a call that should not have been made.
+        let signatures = if spend_inputs.is_empty() {
+            Vec::new()
+        } else {
+            ring::sign(rng, &spend_inputs, output_mask_sum, message)?
+        };
 
         let tx_inputs = inputs
             .iter()
@@ -565,7 +603,7 @@ impl Transaction {
             self.fee,
             &msg_inputs,
             &self.outputs,
-            &self.range_proof,
+            self.range_proof.as_ref(),
             self.cross,
             self.shielded.as_ref(),
         )
@@ -607,7 +645,9 @@ impl Transaction {
             b.extend_from_slice(&o.commitment.to_bytes());
             b.extend_from_slice(&o.encrypted_amount);
         }
-        b.extend_from_slice(&self.range_proof.to_bytes());
+        if let Some(proof) = &self.range_proof {
+            b.extend_from_slice(&proof.to_bytes());
+        }
         // As in `signing_message`: only from version 2, so a version 1
         // transaction's id is exactly what it always was.
         if self.version >= TX_VERSION_SHIELDED {
@@ -655,11 +695,24 @@ impl Transaction {
         &self,
         rng: &mut R,
     ) -> Result<(), TxError> {
-        if self.inputs.is_empty() {
-            return Err(TxError::NoInputs);
-        }
-        if self.outputs.is_empty() {
-            return Err(TxError::NoOutputs);
+        // A ring-only transaction must have both halves: without inputs it mints
+        // and without outputs it destroys, and neither is a payment.
+        //
+        // **With a bundle, either may be empty**, and the structural rule stops
+        // deciding. A full shield with no change has inputs and no ring outputs; a
+        // shielded-to-shielded send has neither, and pays its fee by crossing it
+        // out of the pool. What makes those safe is not a shape check but the
+        // balance rule — `Σ pseudo-outs == Σ outputs + (fee + cross)·H` — which
+        // holds for `0 == 0 + (F + (-F))·H` with nothing on the ring side at all.
+        // That is the rule doing its job, and a shape check second-guessing it
+        // would only be able to be wrong.
+        if self.shielded.is_none() {
+            if self.inputs.is_empty() {
+                return Err(TxError::NoInputs);
+            }
+            if self.outputs.is_empty() {
+                return Err(TxError::NoOutputs);
+            }
         }
 
         // Structural checks on the shielded half come first, before any
@@ -718,10 +771,21 @@ impl Transaction {
             }
         }
 
-        // Range proof over all output commitments.
+        // Range proof over all output commitments, and the proof has to be
+        // present exactly when there is something for it to cover. A proof
+        // alongside no outputs proves something about commitments this
+        // transaction does not contain; no proof alongside outputs is outputs
+        // whose amounts were never shown to be in range, which is where a
+        // negative amount mints money.
         let commitments: Vec<Commitment> = self.outputs.iter().map(|o| o.commitment).collect();
-        if !self.range_proof.verify(rng, &commitments) {
-            return Err(TxError::BadRangeProof);
+        match (&self.range_proof, commitments.is_empty()) {
+            (Some(proof), false) => {
+                if !proof.verify(rng, &commitments) {
+                    return Err(TxError::BadRangeProof);
+                }
+            }
+            (None, true) => {}
+            _ => return Err(TxError::BadRangeProof),
         }
 
         // Every ring signature, against the transaction message.
@@ -747,7 +811,7 @@ impl Transaction {
                 self.fee,
                 &msg_inputs,
                 &self.outputs,
-                &self.range_proof,
+                self.range_proof.as_ref(),
                 self.cross,
             );
             bundle.verify(&sighash).map_err(TxError::Shielded)?;
@@ -1409,6 +1473,62 @@ mod shielded_tx_tests {
             tx.verify(&mut OsRng),
             Err(TxError::Shielded(crate::shielded::ShieldedError::BadSpendAuth)),
         );
+    }
+
+    /// The range proof must be present exactly when there is something for it to
+    /// cover. A proof beside no outputs proves something about commitments the
+    /// transaction does not contain; no proof beside outputs is outputs whose
+    /// amounts were never shown to be in range, and a negative amount there mints
+    /// money.
+    #[test]
+    fn a_range_proof_is_present_exactly_when_there_are_outputs() {
+        let tx = shielding_tx();
+        assert!(tx.range_proof.is_some(), "it has outputs, so it has a proof");
+
+        let mut stripped = tx.clone();
+        stripped.range_proof = None;
+        assert_eq!(stripped.verify(&mut OsRng), Err(TxError::BadRangeProof));
+
+        let mut orphaned = tx.clone();
+        orphaned.outputs.clear();
+        assert_eq!(
+            orphaned.verify(&mut OsRng),
+            Err(TxError::BadRangeProof),
+            "a proof with nothing left to cover is refused, not ignored"
+        );
+    }
+
+    /// A transaction with **no ring side at all** is only a transaction if a bundle
+    /// carries it. Without one it moves nothing and is refused as it always was.
+    ///
+    /// The case where it *is* valid — a shielded-to-shielded payment, whose fee
+    /// crosses out of the pool — needs a bundle that spends a note, so it needs a
+    /// note to exist. That is tested end to end in the wallet crate
+    /// (`wallet/tests/shielded_end_to_end.rs`), against real block validation,
+    /// which is where it belongs: the interesting part is that the chain accepts
+    /// it, not that this function returns `Ok`.
+    #[test]
+    fn a_transaction_with_no_ring_side_needs_a_bundle() {
+        let err = Transaction::build_with_shielded(
+            &mut OsRng,
+            &[],
+            &[],
+            5,
+            &TxKeypair::random(&mut OsRng),
+            0,
+            NO_BUNDLE,
+        )
+        .expect_err("no bundle, no ring side, no transaction");
+        assert_eq!(err, TxError::NoInputs);
+
+        // And the same holds at verification, for a transaction that arrived over
+        // the wire rather than being built here.
+        let mut stripped = shielding_tx();
+        stripped.inputs.clear();
+        stripped.outputs.clear();
+        stripped.range_proof = None;
+        stripped.shielded = None;
+        assert_eq!(stripped.verify(&mut OsRng), Err(TxError::NoInputs));
     }
 
     /// A version 1 transaction must hash and encode to exactly the bytes it
