@@ -34,6 +34,7 @@ pub mod p2p;
 pub mod pow;
 pub mod ring;
 pub mod shielded;
+pub mod shielded_state;
 pub mod stealth;
 pub mod subaddress;
 pub mod tx;

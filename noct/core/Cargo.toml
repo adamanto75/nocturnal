@@ -18,6 +18,9 @@ orchard = "0.15.5"
 # Only to name the type `orchard::Bundle::try_from_parts` takes. Kept in step
 # with orchard's own dependency: a different major version is a different type.
 nonempty = "0.11"
+# The note-commitment tree's frontier. Same version orchard uses: the tree is
+# consensus state, so two versions of it would be two chains.
+incrementalmerkletree = "0.8.1"
 curve25519-dalek = { version = "4", features = ["rand_core"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

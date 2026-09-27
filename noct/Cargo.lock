@@ -1032,6 +1032,7 @@ dependencies = [
  "bs58",
  "curve25519-dalek",
  "hex",
+ "incrementalmerkletree",
  "monero-bulletproofs",
  "monero-clsag",
  "monero-ed25519",

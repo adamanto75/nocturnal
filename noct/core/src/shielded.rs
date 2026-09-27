@@ -139,6 +139,16 @@ impl ShieldedBundle {
         self.0.actions().iter().map(|a| a.nullifier().to_bytes())
     }
 
+    /// Every note commitment this bundle creates, in the order the tree must
+    /// append them.
+    ///
+    /// Order is consensus: the tree's root depends on it, and two nodes that
+    /// appended the same commitments in a different order would disagree about
+    /// every anchor afterwards.
+    pub fn commitments(&self) -> impl Iterator<Item = orchard::note::ExtractedNoteCommitment> + '_ {
+        self.0.actions().iter().map(|a| *a.cmx())
+    }
+
     /// Whether this bundle may spend notes. False for a coinbase bundle, where
     /// every spend must be a dummy.
     pub fn spends_enabled(&self) -> bool {
