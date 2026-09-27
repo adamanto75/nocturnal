@@ -40,6 +40,30 @@
     <div class="card"><h3>Unlinkable recipients</h3><p>One-time stealth keys; subaddresses under a single view key.</p></div>
     <div class="card"><h3>CPU mining</h3><p>RandomX, 120-second target, ~1,000,000 NOCT asymptote.</p></div>
   </div>
+
+  <h3 style="margin-top:26px">Two ways to be private, on one chain</h3>
+  <p>Nocturnal is being extended with a second, zero-knowledge value pool built on Zcash's
+     <b>Orchard</b> (Halo 2, no trusted setup), alongside the ring-signature pool it runs today.
+     A transaction picks which one it uses, and value can move between them in either direction.
+     Neither replaces the other: they are different privacy models with different trade-offs, and
+     both stay.</p>
+  <div class="grid" style="margin-top:14px">
+    <div class="card">
+      <h3>Ring signatures <span style="color:var(--good);font-size:12px;letter-spacing:.08em">LIVE</span></h3>
+      <p>CLSAG over 16 ring members, Pedersen commitments, Bulletproofs+. Your spend hides among
+         decoys chosen from the chain. Running on the testnet now.</p>
+    </div>
+    <div class="card">
+      <h3>zk proofs <span style="color:var(--warn);font-size:12px;letter-spacing:.08em">IN DEVELOPMENT</span></h3>
+      <p>Orchard notes with a nullifier set and a note-commitment tree. Your spend hides among
+         every note ever created, not a ring of sixteen. Not yet on the testnet — the consensus
+         work is being written in the open.</p>
+    </div>
+  </div>
+  <p style="margin-top:14px">Each pool's supply is tracked publicly and can never go below zero, so
+     a flaw in one pool's cryptography cannot mint coins in the other. The cost of that guarantee is
+     stated rather than hidden: <b>the amount moving between pools is public</b>, so shielding an
+     unusual amount and later unshielding the same one links the two.</p>
   <p style="margin-top:18px">There is a pool, if you would rather not mine alone:
      <a class="ext" href="https://pool.nocturnalcoin.com" rel="noopener noreferrer">pool.nocturnalcoin.com</a>
      — PPLNS, <b>no pool fee</b>, payouts settle automatically once a block is buried. Point a

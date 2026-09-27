@@ -155,8 +155,8 @@ impl ShieldedState {
     /// Apply one block's worth of shielded activity.
     ///
     /// `bundles` are every bundle in the block, in the order the block commits
-    /// to them, and `coinbase_to_shielded` is value minted straight into the
-    /// pool by the block reward.
+    /// to them; `minted` is the block reward and `minted_into` the pool it is
+    /// created in.
     ///
     /// Either the whole block applies or nothing does: the state is only
     /// modified after every check has passed, so a block refused halfway leaves
@@ -166,7 +166,8 @@ impl ShieldedState {
     pub fn apply_block<'a, I>(
         &mut self,
         bundles: I,
-        coinbase_to_shielded: u64,
+        minted_into: Pool,
+        minted: u64,
     ) -> Result<ShieldedUndo, ShieldedStateError>
     where
         I: IntoIterator<Item = &'a ShieldedBundle>,
@@ -187,8 +188,10 @@ impl ShieldedState {
         // same note is a double-spend that never touches the stored set.
         let mut seen_here: HashSet<[u8; 32]> = HashSet::new();
 
-        if coinbase_to_shielded > 0 {
-            totals.mint(Pool::Shielded, coinbase_to_shielded).map_err(ShieldedStateError::Turnstile)?;
+        // The block reward. Today it lands in the ring pool; when coinbase
+        // becomes a shielded note this is the only line that changes.
+        if minted > 0 {
+            totals.mint(minted_into, minted).map_err(ShieldedStateError::Turnstile)?;
         }
 
         for bundle in bundles {
@@ -258,6 +261,148 @@ impl ShieldedState {
     }
 }
 
+
+// --- snapshot -----------------------------------------------------------
+//
+// A node that restarts must rebuild a byte-identical tree. If it did not, it
+// would accept anchors nobody else has and reject ones everybody else does —
+// a fork that looks like a bug in someone else's node. So the whole shielded
+// state travels with the chain snapshot rather than being re-derived.
+//
+// ```text
+// state := u8 version
+//          u8 tree_present  (0: empty tree)
+//          [ u64 position | [u8;32] leaf | u32 ommers | [u8;32] × ommers ]
+//          u64 ring_total | u64 shielded_total
+//          u32 anchors  | [u8;32] × anchors      (oldest first)
+//          u32 nullifiers | [u8;32] × nullifiers (sorted, so it is canonical)
+// ```
+
+/// Snapshot format tag, so a file this build does not understand is refused
+/// rather than guessed at.
+const SHIELDED_STATE_VERSION: u8 = 1;
+
+impl ShieldedState {
+    /// Encode for a chain snapshot.
+    ///
+    /// Nullifiers are sorted before writing: a `HashSet` has no order, and two
+    /// nodes whose snapshots differ byte-for-byte cannot be compared at all.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(SHIELDED_STATE_VERSION);
+
+        match self.tree.value() {
+            None => out.push(0),
+            Some(frontier) => {
+                out.push(1);
+                out.extend_from_slice(&u64::from(frontier.position()).to_le_bytes());
+                out.extend_from_slice(&frontier.leaf().to_bytes());
+                let ommers = frontier.ommers();
+                out.extend_from_slice(&(ommers.len() as u32).to_le_bytes());
+                for o in ommers {
+                    out.extend_from_slice(&o.to_bytes());
+                }
+            }
+        }
+
+        out.extend_from_slice(&self.totals.ring().to_le_bytes());
+        out.extend_from_slice(&self.totals.shielded().to_le_bytes());
+
+        out.extend_from_slice(&(self.anchors.len() as u32).to_le_bytes());
+        for a in &self.anchors {
+            out.extend_from_slice(a);
+        }
+
+        let mut nullifiers: Vec<[u8; 32]> = self.nullifiers.iter().copied().collect();
+        nullifiers.sort_unstable();
+        out.extend_from_slice(&(nullifiers.len() as u32).to_le_bytes());
+        for n in &nullifiers {
+            out.extend_from_slice(n);
+        }
+        out
+    }
+
+    /// Decode a snapshot, refusing anything malformed.
+    ///
+    /// Returns `None` rather than a partly-built state: a shielded state that is
+    /// almost right is a node that forks, and it is better to refuse to start.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut cur = bytes;
+        if take_n(&mut cur, 1)?[0] != SHIELDED_STATE_VERSION {
+            return None;
+        }
+
+        let tree = match take_n(&mut cur, 1)?[0] {
+            0 => Frontier::<MerkleHashOrchard, TREE_DEPTH>::empty(),
+            1 => {
+                let position = u64::from_le_bytes(take_n(&mut cur, 8)?.try_into().ok()?);
+                let leaf = MerkleHashOrchard::from_bytes(&take32(&mut cur)?).into_option()?;
+                let count = u32::from_le_bytes(take_n(&mut cur, 4)?.try_into().ok()?) as usize;
+                // An ommer per level at most: the bound is the tree's depth, and
+                // it is checked before anything is read.
+                if count > TREE_DEPTH as usize {
+                    return None;
+                }
+                let mut ommers = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ommers.push(MerkleHashOrchard::from_bytes(&take32(&mut cur)?).into_option()?);
+                }
+                Frontier::from_parts(position.into(), leaf, ommers).ok()?
+            }
+            _ => return None,
+        };
+
+        let ring = u64::from_le_bytes(take_n(&mut cur, 8)?.try_into().ok()?);
+        let shielded = u64::from_le_bytes(take_n(&mut cur, 8)?.try_into().ok()?);
+        let mut totals = PoolTotals::new();
+        totals.mint(Pool::Ring, ring).ok()?;
+        totals.mint(Pool::Shielded, shielded).ok()?;
+
+        let anchor_count = u32::from_le_bytes(take_n(&mut cur, 4)?.try_into().ok()?) as usize;
+        if anchor_count > ANCHOR_DEPTH {
+            return None;
+        }
+        let mut anchors = Vec::with_capacity(anchor_count);
+        for _ in 0..anchor_count {
+            anchors.push(take32(&mut cur)?);
+        }
+
+        let nullifier_count = u32::from_le_bytes(take_n(&mut cur, 4)?.try_into().ok()?) as usize;
+        // Not pre-allocated from the count: the same rule the wire decoder
+        // follows, for the same reason.
+        let mut nullifiers = HashSet::new();
+        for _ in 0..nullifier_count {
+            nullifiers.insert(take32(&mut cur)?);
+        }
+
+        if !cur.is_empty() {
+            return None;
+        }
+
+        let state = ShieldedState { tree, nullifiers, anchors, totals };
+        // The state must agree with itself: the root it computes has to be the
+        // newest anchor it claims. A snapshot that fails this was built by
+        // something that does not share this chain's rules.
+        match state.anchors.last() {
+            Some(newest) if *newest == state.root() => Some(state),
+            None if state.notes() == 0 => Some(state),
+            _ => None,
+        }
+    }
+}
+
+fn take_n<'a>(cur: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    if cur.len() < n {
+        return None;
+    }
+    let (head, rest) = cur.split_at(n);
+    *cur = rest;
+    Some(head)
+}
+
+fn take32(cur: &mut &[u8]) -> Option<[u8; 32]> {
+    take_n(cur, 32)?.try_into().ok()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,7 +438,7 @@ mod tests {
         s.totals.mint(Pool::Ring, 10_000).unwrap();
 
         let nullifiers: Vec<_> = b.nullifiers().collect();
-        s.apply_block([&b], 0).expect("applies");
+        s.apply_block([&b], Pool::Ring, 0).expect("applies");
 
         assert_ne!(s.root(), before, "appending a note must change the root");
         assert!(s.accepts_anchor(&s.root()), "the new root is an anchor");
@@ -321,7 +466,7 @@ mod tests {
         let blocks = [bundle(1_000), bundle(2_000), bundle(3_000)];
         let mut undos = Vec::new();
         for b in &blocks {
-            undos.push(lived_through_it.apply_block([b], 0).expect("applies"));
+            undos.push(lived_through_it.apply_block([b], Pool::Ring, 0).expect("applies"));
         }
         assert_ne!(lived_through_it.root(), untouched.root(), "the branch did change things");
 
@@ -356,9 +501,9 @@ mod tests {
         let repeat = b.clone();
         let n = b.nullifiers().next().unwrap();
 
-        s.apply_block([&b], 0).expect("first spend applies");
+        s.apply_block([&b], Pool::Ring, 0).expect("first spend applies");
         assert_eq!(
-            s.apply_block([&repeat], 0).unwrap_err(),
+            s.apply_block([&repeat], Pool::Ring, 0).unwrap_err(),
             ShieldedStateError::DuplicateNullifier(n),
             "across blocks"
         );
@@ -369,7 +514,7 @@ mod tests {
         let twin = b2.clone();
         assert!(
             matches!(
-                fresh.apply_block([&b2, &twin], 0),
+                fresh.apply_block([&b2, &twin], Pool::Ring, 0),
                 Err(ShieldedStateError::DuplicateNullifier(_))
             ),
             "and within one block"
@@ -384,7 +529,7 @@ mod tests {
         let mut s = ShieldedState::new();
         s.totals.mint(Pool::Ring, 100_000).unwrap();
         let good = bundle(1_000);
-        s.apply_block([&good], 0).expect("applies");
+        s.apply_block([&good], Pool::Ring, 0).expect("applies");
 
         let before_root = s.root();
         let before_notes = s.notes();
@@ -393,7 +538,7 @@ mod tests {
         // A block whose second bundle double-spends the first's note.
         let a = bundle(500);
         let twin = a.clone();
-        assert!(s.apply_block([&a, &twin], 0).is_err());
+        assert!(s.apply_block([&a, &twin], Pool::Ring, 0).is_err());
 
         assert_eq!(s.root(), before_root, "the tree must not have moved");
         assert_eq!(s.notes(), before_notes);
@@ -414,22 +559,22 @@ mod tests {
         // A recent root is still good: the tree moves on, and a bundle built
         // against the root from before still applies.
         let first = bundle(1_000);
-        s.apply_block([&first], 0).expect("applies");
+        s.apply_block([&first], Pool::Ring, 0).expect("applies");
         let later = bundle(1_000);
         assert!(s.accepts_anchor(&later.anchor()), "a recent root is still good");
-        s.apply_block([&later], 0).expect("a bundle on a recent anchor applies");
+        s.apply_block([&later], Pool::Ring, 0).expect("a bundle on a recent anchor applies");
 
         // Now push the history past its depth, so the empty-tree root the test
         // bundles carry falls out of it. A bundle proving against it must be
         // refused — this is the real path, not just the predicate.
         for _ in 0..(ANCHOR_DEPTH + 5) {
-            s.apply_block(std::iter::empty(), 0).expect("an empty block applies");
+            s.apply_block(std::iter::empty(), Pool::Ring, 0).expect("an empty block applies");
         }
         let stale = bundle(1_000);
         let anchor = stale.anchor();
         assert!(!s.accepts_anchor(&anchor), "the empty-tree root has aged out");
         assert_eq!(
-            s.apply_block([&stale], 0).unwrap_err(),
+            s.apply_block([&stale], Pool::Ring, 0).unwrap_err(),
             ShieldedStateError::UnknownAnchor(anchor),
             "a spend against an aged-out root must be refused by apply_block itself"
         );
@@ -441,7 +586,7 @@ mod tests {
     fn the_anchor_history_is_bounded() {
         let mut s = ShieldedState::new();
         for _ in 0..(ANCHOR_DEPTH + 25) {
-            s.apply_block(std::iter::empty(), 0).expect("an empty block applies");
+            s.apply_block(std::iter::empty(), Pool::Ring, 0).expect("an empty block applies");
         }
         assert_eq!(s.anchors.len(), ANCHOR_DEPTH);
         assert!(s.accepts_anchor(&s.root()));
@@ -457,7 +602,7 @@ mod tests {
 
         // The reward mints, and the bundle's own crossing moves it on from
         // there; both are the same value, so the pool nets the reward.
-        s.apply_block(std::iter::empty(), 9_000_000_000).expect("mint applies");
+        s.apply_block(std::iter::empty(), Pool::Shielded, 9_000_000_000).expect("mint applies");
         assert_eq!(s.totals().shielded(), 9_000_000_000);
         assert_eq!(s.totals().ring(), 0, "nothing was created in the ring pool");
     }
@@ -471,7 +616,7 @@ mod tests {
         let before = s.totals();
 
         let b = bundle(4_000);
-        let undo = s.apply_block([&b], 0).expect("applies");
+        let undo = s.apply_block([&b], Pool::Ring, 0).expect("applies");
         assert_eq!(s.totals().shielded(), 4_000);
 
         s.undo_block(undo);

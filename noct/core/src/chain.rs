@@ -32,6 +32,8 @@ use crate::emission::base_reward;
 use crate::keys::PublicKey;
 use crate::pow::{check_hash, next_difficulty, Difficulty, ProofOfWork, MIN_DIFFICULTY};
 use crate::ring::{KeyImage, RingMember};
+use crate::pools::Pool;
+use crate::shielded_state::{ShieldedState, ShieldedStateError};
 use crate::tx::{Transaction, TxError};
 
 /// How many recent block timestamps the median-time-past is taken over.
@@ -121,6 +123,9 @@ pub const COINBASE_MATURITY: u64 = 100;
 /// Errors from validating a block against the chain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChainError {
+    /// The shielded half of a block was refused: a spent nullifier, an anchor
+    /// this chain does not accept, or a crossing the turnstile will not allow.
+    Shielded(ShieldedStateError),
     /// The block does not build on the current tip.
     BadPrevId,
     /// The proof of work does not meet the required difficulty.
@@ -186,10 +191,16 @@ pub struct StoredBlock {
 /// output *contents* are re-derivable from the stored block itself; only these
 /// two scalars cannot be recovered after the fact (`emitted` is not invertible
 /// through the emission curve).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Undo {
     outputs_len_before: usize,
     emitted_before: u64,
+    /// What the shielded pool looked like before this block.
+    ///
+    /// This is why `Undo` is no longer `Copy`: a frontier is not a scalar. It is
+    /// also the point — the shielded half is restored wholesale rather than
+    /// inverted, which is what makes the rollback trustworthy.
+    shielded_before: crate::shielded_state::ShieldedUndo,
 }
 
 /// The result of a successful reorganisation.
@@ -232,6 +243,9 @@ pub struct Blockchain<P: ProofOfWork> {
     /// one.
     spent_key_images: HashSet<[u8; 32]>,
     emitted: u64,
+    /// The shielded pool: commitment tree, nullifiers, anchors, and the
+    /// per-pool supply the turnstile guards.
+    shielded: ShieldedState,
     /// Blocks a coinbase output must be buried before it can be spent. Always
     /// [`COINBASE_MATURITY`] in production; tests may lower it via
     /// [`Blockchain::with_maturity`] so they need not mine 60 warm-up blocks.
@@ -312,6 +326,7 @@ impl<P: ProofOfWork> Blockchain<P> {
             output_meta: Vec::new(),
             spent_key_images: HashSet::new(),
             emitted: 0,
+            shielded: ShieldedState::new(),
             maturity,
         };
         chain.apply_genesis();
@@ -333,8 +348,16 @@ impl<P: ProofOfWork> Blockchain<P> {
             self.push_output(member, 0, true);
         }
         let premined = block.coinbase.total().expect("genesis premine fits u64");
+        // The premine enters the ring pool, because that is where a coinbase
+        // output lives today. When coinbase becomes a shielded note this line
+        // changes, and the supply invariant (`ring + shielded == emitted`) is
+        // what will catch it if only half the change is made.
+        let shielded_before = self
+            .shielded
+            .apply_block(std::iter::empty(), Pool::Ring, premined)
+            .expect("the genesis premine cannot overflow an empty pool");
         self.blocks.push(StoredBlock { block: block.clone(), txs: Vec::new() });
-        self.undos.push(Undo { outputs_len_before: 0, emitted_before: 0 });
+        self.undos.push(Undo { outputs_len_before: 0, emitted_before: 0, shielded_before });
         self.block_ids.push(block.id());
         self.timestamps.push(block.header.timestamp);
         self.cumulative_difficulties.push(MIN_DIFFICULTY as u128);
@@ -553,9 +576,24 @@ impl<P: ProofOfWork> Blockchain<P> {
             return Err(ChainError::BadCoinbaseReward);
         }
 
+        // 9. The shielded half: anchors, nullifiers and the turnstile.
+        //
+        //    Done before anything is committed, and all-or-nothing in itself, so
+        //    a block whose shielded side is invalid leaves neither half applied.
+        //    The block reward mints into the ring pool, since a coinbase output
+        //    is a ring output today.
+        let shielded_before = self
+            .shielded
+            .apply_block(txs.iter().filter_map(|t| t.shielded.as_ref()), Pool::Ring, subsidy)
+            .map_err(ChainError::Shielded)?;
+
         // --- All checks passed; commit state. ---
         // Capture what we cannot re-derive later, so this block can be undone.
-        let undo = Undo { outputs_len_before: self.outputs.len(), emitted_before: self.emitted };
+        let undo = Undo {
+            outputs_len_before: self.outputs.len(),
+            emitted_before: self.emitted,
+            shielded_before,
+        };
         let height = self.height();
         for member in block.coinbase.output_refs() {
             self.push_output(member, height, true);
@@ -620,6 +658,9 @@ impl<P: ProofOfWork> Blockchain<P> {
         self.output_meta.truncate(undo.outputs_len_before);
 
         self.emitted = undo.emitted_before;
+        // The shielded half goes back wholesale: the tree, the supply, the
+        // nullifiers this block banked, and the anchor history.
+        self.shielded.undo_block(undo.shielded_before);
         self.block_ids.pop();
         self.timestamps.pop();
         self.cumulative_difficulties.pop();
@@ -1100,6 +1141,12 @@ pub struct ChainState {
     /// Parallel to `outputs`: creating height, and whether it is coinbase.
     output_meta: Vec<(u64, bool)>,
     spent_key_images: Vec<[u8; 32]>,
+    /// The shielded pool, encoded by `ShieldedState::to_bytes`.
+    ///
+    /// Carried rather than re-derived: a restored node with an empty tree would
+    /// accept anchors nobody else has and reject the ones everybody else does,
+    /// which is a fork that looks like a bug in someone else’s node.
+    shielded: Vec<u8>,
 }
 
 /// Format tag. A state file this build does not fully understand must be
@@ -1144,6 +1191,10 @@ impl ChainState {
         for k in &self.spent_key_images {
             o.extend_from_slice(k);
         }
+        // The shielded pool, length-prefixed so this format can carry it
+        // without knowing what is inside.
+        o.extend_from_slice(&(self.shielded.len() as u64).to_le_bytes());
+        o.extend_from_slice(&self.shielded);
         o
     }
 
@@ -1193,6 +1244,9 @@ impl ChainState {
         let spent_key_images: Vec<[u8; 32]> =
             imgs.chunks_exact(32).map(|r| <[u8; 32]>::try_from(r).unwrap()).collect();
 
+        let nshielded = u64::from_le_bytes(take(&mut c, 8)?.try_into().ok()?) as usize;
+        let shielded = take(&mut c, nshielded)?.to_vec();
+
         // Trailing bytes mean this is not the file we think it is.
         if !c.is_empty() {
             return None;
@@ -1201,6 +1255,7 @@ impl ChainState {
             maturity,
             emitted,
             genesis,
+            shielded,
             block_ids,
             timestamps,
             cumulative_difficulties,
@@ -1233,6 +1288,7 @@ impl<P: ProofOfWork> Blockchain<P> {
                 images.sort_unstable();
                 images
             },
+            shielded: self.shielded.to_bytes(),
         }
     }
 
@@ -1267,6 +1323,9 @@ impl<P: ProofOfWork> Blockchain<P> {
         if output_membership.len() != outputs.len() || spent_key_images.len() != state.spent_key_images.len() {
             return None;
         }
+        // A snapshot whose shielded half will not decode is refused outright: a
+        // chain that started with an almost-right tree would fork quietly.
+        let shielded = ShieldedState::from_bytes(&state.shielded)?;
         Some(Blockchain {
             pow,
             network,
@@ -1286,6 +1345,7 @@ impl<P: ProofOfWork> Blockchain<P> {
                 .collect(),
             spent_key_images,
             emitted: state.emitted,
+            shielded,
             maturity: state.maturity,
         })
     }
@@ -1328,7 +1388,7 @@ fn normal<R: rand_core::RngCore>(rng: &mut R) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::address::{Address, Network};
     use crate::block::{Block, BlockHeader, Coinbase};
@@ -1378,7 +1438,7 @@ mod tests {
 
     // Mine a coinbase-only block to `miner` and append it; return the miner's
     // recovered coinbase output and its global index.
-    fn mine_coinbase(
+    pub(crate) fn mine_coinbase(
         chain: &mut Blockchain<KeccakPow>,
         miner: &Account,
         timestamp: u64,
@@ -1391,7 +1451,7 @@ mod tests {
 
     // Populate the chain with `n` coinbase-only blocks so the output set has
     // decoys to draw from.
-    fn warm_up(chain: &mut Blockchain<KeccakPow>, n: usize, start_ts: u64) {
+    pub(crate) fn warm_up(chain: &mut Blockchain<KeccakPow>, n: usize, start_ts: u64) {
         let filler = Account::random(&mut OsRng);
         for i in 0..n {
             mine_coinbase(chain, &filler, start_ts + i as u64 * 130);
@@ -2091,6 +2151,7 @@ mod tests {
             output_meta,
             spent_key_images,
             emitted,
+            shielded,
         } = c;
 
         let mut f = Vec::new();
@@ -2107,6 +2168,10 @@ mod tests {
             f.extend_from_slice(&u.outputs_len_before.to_le_bytes());
             f.extend_from_slice(&u.emitted_before.to_le_bytes());
         }
+        // The shielded pool, so a rollback that forgets it fails here rather
+        // than on a live chain: this is the whole tree, supply and nullifier
+        // set, encoded canonically.
+        f.extend_from_slice(&shielded.to_bytes());
         for id in block_ids {
             f.extend_from_slice(id);
         }
@@ -2679,3 +2744,119 @@ mod decoy_distribution_tests {
     }
 }
 
+
+#[cfg(test)]
+mod shielded_chain_tests {
+    use super::tests::{mine_coinbase, warm_up};
+    use crate::pow::KeccakPow;
+    use super::*;
+    use crate::keys::Account;
+    use rand_core::OsRng;
+
+    /// **The invariant that ties the two pools to the chain's own accounting:**
+    /// what the pools hold together must equal what the chain says it has
+    /// emitted. If the coinbase were ever credited to one pool and counted in
+    /// the other, or to neither, this is what notices.
+    ///
+    /// Checked at several heights rather than once, because a drift that starts
+    /// at genesis and one that starts at the first mined block look the same
+    /// from the end.
+    #[test]
+    fn the_two_pools_always_hold_exactly_what_the_chain_emitted() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+
+        let supply = |c: &Blockchain<KeccakPow>| c.shielded.totals().total().expect("supply fits");
+        assert_eq!(supply(&chain), chain.emitted(), "at genesis, with only the premine");
+
+        mine_coinbase(&mut chain, &miner, 1_000);
+        assert_eq!(supply(&chain), chain.emitted(), "after one mined block");
+
+        warm_up(&mut chain, 25, 1_100);
+        assert_eq!(supply(&chain), chain.emitted(), "after a run of blocks");
+
+        // Nothing has crossed, so it is all still in the ring pool.
+        assert_eq!(chain.shielded.totals().shielded(), 0);
+        assert_eq!(chain.shielded.totals().ring(), chain.emitted());
+    }
+
+    /// A rollback must put the shielded pool back exactly, including the supply.
+    /// The chain's own fingerprint test covers the general case; this one states
+    /// the shielded part explicitly, because a rollback that restored the tree
+    /// and forgot the totals would be counterfeiting by accident.
+    #[test]
+    fn rolling_back_restores_the_shielded_pool() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        mine_coinbase(&mut chain, &miner, 1_000);
+
+        let height = chain.height();
+        let root = chain.shielded.root();
+        let totals = chain.shielded.totals();
+
+        warm_up(&mut chain, 10, 1_100);
+        assert_ne!(chain.shielded.totals(), totals, "the blocks did move the supply");
+
+        chain.rollback_to(height);
+        assert_eq!(chain.shielded.root(), root, "the tree must be where it was");
+        assert_eq!(chain.shielded.totals(), totals, "and so must the supply");
+        assert_eq!(
+            chain.shielded.totals().total().unwrap(),
+            chain.emitted(),
+            "the invariant survives the rollback"
+        );
+    }
+
+    /// A restored node must agree with the node it was snapshotted from. If the
+    /// shielded state did not travel with the snapshot, a restarted node would
+    /// have an empty tree: it would accept anchors nobody else has and reject
+    /// the ones everybody else does — a fork that looks like someone else's bug.
+    #[test]
+    fn a_restored_chain_has_the_same_shielded_pool() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        mine_coinbase(&mut chain, &miner, 1_000);
+        warm_up(&mut chain, 12, 1_100);
+
+        let state = chain.snapshot();
+        let restored = Blockchain::from_state(KeccakPow, crate::address::Network::Mainnet, &state)
+            .expect("the snapshot restores");
+
+        assert_eq!(restored.shielded.root(), chain.shielded.root());
+        assert_eq!(restored.shielded.totals(), chain.shielded.totals());
+        assert!(
+            restored.shielded.accepts_anchor(&chain.shielded.root()),
+            "a restored node must still accept the anchor it stopped on"
+        );
+
+        // And the snapshot survives its own file format.
+        let encoded = state.encode();
+        let decoded = ChainState::decode(&encoded).expect("decodes");
+        assert_eq!(decoded, state, "the state file round-trips with the shielded pool in it");
+    }
+
+    /// A snapshot whose shielded half is damaged must be refused, not patched
+    /// over. Starting from an almost-right tree is how a node ends up quietly
+    /// disagreeing with the network.
+    #[test]
+    fn a_damaged_shielded_snapshot_is_refused() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        mine_coinbase(&mut chain, &miner, 1_000);
+
+        let mut state = chain.snapshot();
+        state.shielded.clear();
+        assert!(
+            Blockchain::from_state(KeccakPow, crate::address::Network::Mainnet, &state).is_none(),
+            "an empty shielded blob is not an empty pool"
+        );
+
+        let mut state = chain.snapshot();
+        let last = state.shielded.len() - 1;
+        state.shielded[last] ^= 0xff;
+        assert!(
+            Blockchain::from_state(KeccakPow, crate::address::Network::Mainnet, &state).is_none(),
+            "a corrupted shielded blob must not restore"
+        );
+    }
+}
