@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use curve25519_dalek::scalar::Scalar;
-use noct_core::address::{Address, Network};
+use noct_core::address::{Address, Network, ShieldedAddress};
 use noct_core::block::Block;
 use noct_core::chain::{Blockchain, OutputSet};
 use noct_core::keys::{Account, PublicKey};
@@ -28,6 +28,8 @@ use noct_core::ring::KeyImage;
 use noct_core::stealth::TxKeypair;
 use noct_core::subaddress::{self, SubaddressIndex};
 use noct_core::tx::{InputSecret, Payment, ReceivedOutput, Transaction, TxError};
+
+use crate::shielded::ShieldedWallet;
 
 /// How many subaddresses (of account 0) the wallet pre-derives so it can detect
 /// funds sent to them even after a restart. Indices at or beyond this window are
@@ -39,6 +41,7 @@ pub mod joint;
 pub mod outputs;
 pub mod mnemonic;
 pub mod secure_file;
+pub mod shielded;
 pub mod state;
 
 /// The ring size every transaction uses: 1 real member + N−1 decoys.
@@ -128,11 +131,55 @@ pub enum WalletError {
     Overflow,
     /// Transaction assembly failed.
     Tx(TxError),
+    /// The shielded half of the wallet refused. Kept whole rather than flattened
+    /// into [`WalletError::Tx`]: the reason a bundle could not be made is a wallet
+    /// fact, not a transaction-format one.
+    Shielded(crate::shielded::ShieldedWalletError),
 }
 
 impl From<TxError> for WalletError {
     fn from(e: TxError) -> Self {
         WalletError::Tx(e)
+    }
+}
+
+/// Build a transaction whose bundle is authorized by `plan`.
+///
+/// The only reason this is not inline is the error plumbing. The callback must
+/// hand back a [`TxError`], because that is all the transaction builder knows
+/// about, so a wallet-side failure is stashed here and put back afterwards. The
+/// alternative — making the builder generic over the caller's error — would push
+/// this crate's concerns into consensus code.
+fn build_authorized<R: rand_core::RngCore + rand_core::CryptoRng>(
+    rng: &mut R,
+    inputs: &[InputSecret],
+    payments: &[Payment],
+    fee: u64,
+    tx_keys: &TxKeypair,
+    cross: i64,
+    plan: crate::shielded::Plan<'_>,
+) -> Result<Transaction, WalletError> {
+    let mut failure = None;
+    let result = Transaction::build_with_shielded(
+        rng,
+        inputs,
+        payments,
+        fee,
+        tx_keys,
+        cross,
+        Some(|sighash: &[u8; 32]| {
+            plan.authorize(sighash).map_err(|e| {
+                failure = Some(e);
+                TxError::BundleUnavailable
+            })
+        }),
+    );
+    match result {
+        Ok(tx) => Ok(tx),
+        Err(TxError::BundleUnavailable) => Err(WalletError::Shielded(
+            failure.expect("the callback set it before returning this error"),
+        )),
+        Err(e) => Err(WalletError::Tx(e)),
     }
 }
 
@@ -434,6 +481,133 @@ impl Wallet {
         let tx_keys = TxKeypair::random(rng);
         let tx = Transaction::build(rng, &inputs, &all_payments, fee, &tx_keys)?;
         Ok(tx)
+    }
+
+    /// Build a transaction that moves `amount` from the ring pool **into** the
+    /// shielded pool, as a note for `to`.
+    ///
+    /// The ring side spends this wallet's outputs and creates change; the value
+    /// crossing is public, and that is the whole of what a crossing reveals. See
+    /// the design's §11.
+    ///
+    /// `change_to_ring` decides where the remainder goes. `true` keeps it on the
+    /// ring side as an ordinary change output; `false` sends it into the pool as a
+    /// second note, leaving **no ring output at all** — which is the more private
+    /// choice, because there is then no change output to tie the payment back to
+    /// this wallet, and the crossing's public amount is the whole input rather
+    /// than the payment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_shielding<P: ProofOfWork, R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        rng: &mut R,
+        chain: &Blockchain<P>,
+        shielded: &ShieldedWallet,
+        to: &ShieldedAddress,
+        amount: u64,
+        fee: u64,
+        ring_size: usize,
+        change_to_ring: bool,
+    ) -> Result<Transaction, WalletError> {
+        let needed = amount.checked_add(fee).ok_or(WalletError::Overflow)?;
+        let (inputs, in_total) = self.select_ring_inputs(rng, chain, needed, ring_size)?;
+        let change = in_total - needed;
+
+        // What crosses, and therefore what the bundle must be worth. When change
+        // stays on the ring side that is just the payment; when it does not, the
+        // whole remaining input crosses and the bundle carries two notes.
+        let crossing = if change_to_ring { amount } else { amount + change };
+        let mut payments = Vec::new();
+        if change_to_ring && change > 0 {
+            payments.push(Payment { destination: self.address(), amount: change });
+        }
+
+        let plan = if change_to_ring || change == 0 {
+            shielded.plan_shield(to, crossing)
+        } else {
+            shielded.plan_shield_with_change(to, amount, change)
+        }
+        .map_err(WalletError::Shielded)?;
+        let cross = plan.cross();
+
+        let tx_keys = TxKeypair::random(rng);
+        build_authorized(rng, &inputs, &payments, fee, &tx_keys, cross, plan)
+    }
+
+    /// Build a transaction that moves `amount` **out of** the shielded pool and
+    /// pays it to `payments` on the ring side.
+    ///
+    /// An unshielding transaction keeps a ring side even though nothing is being
+    /// spent there: the ring outputs' masks have to cancel against something, and
+    /// a pseudo-out from a real input is what supplies that. So this spends a ring
+    /// output of its own as well, and the value arriving from the pool is added to
+    /// what that input covers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_unshielding<P: ProofOfWork, R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        rng: &mut R,
+        chain: &Blockchain<P>,
+        shielded: &ShieldedWallet,
+        payments: &[Payment],
+        amount: u64,
+        fee: u64,
+        ring_size: usize,
+    ) -> Result<Transaction, WalletError> {
+        let out_total = payments
+            .iter()
+            .try_fold(0u64, |acc, p| acc.checked_add(p.amount))
+            .and_then(|s| s.checked_add(fee))
+            .ok_or(WalletError::Overflow)?;
+        // The pool supplies `amount`; the ring side supplies the rest.
+        let from_ring = out_total.saturating_sub(amount);
+        let (inputs, in_total) = self.select_ring_inputs(rng, chain, from_ring, ring_size)?;
+
+        let mut payments = payments.to_vec();
+        let change = (in_total + amount) - out_total;
+        if change > 0 {
+            payments.push(Payment { destination: self.address(), amount: change });
+        }
+
+        let plan = shielded
+            .plan_unshield(amount, chain.shielded())
+            .map_err(WalletError::Shielded)?;
+        let cross = plan.cross();
+
+        let tx_keys = TxKeypair::random(rng);
+        build_authorized(rng, &inputs, &payments, fee, &tx_keys, cross, plan)
+    }
+
+    /// Ring inputs worth at least `needed`, with decoy rings resolved, and their
+    /// total. Shared by every builder so decoy selection happens in one place.
+    fn select_ring_inputs<P: ProofOfWork, R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        rng: &mut R,
+        chain: &Blockchain<P>,
+        needed: u64,
+        ring_size: usize,
+    ) -> Result<(Vec<InputSecret>, u64), WalletError> {
+        let mut selected: Vec<&OwnedOutput> = Vec::new();
+        let mut in_total: u64 = 0;
+        for owned in self.unspent() {
+            if in_total >= needed {
+                break;
+            }
+            if !chain.spendable_now(owned.global_index) {
+                continue;
+            }
+            in_total = in_total.checked_add(owned.amount()).ok_or(WalletError::Overflow)?;
+            selected.push(owned);
+        }
+        if in_total < needed {
+            return Err(WalletError::InsufficientFunds);
+        }
+        let mut inputs: Vec<InputSecret> = Vec::with_capacity(selected.len());
+        for owned in &selected {
+            let (ring, signer_index) = chain
+                .select_ring_recency_biased(rng, ring_size, owned.global_index)
+                .ok_or(WalletError::NotEnoughDecoys)?;
+            inputs.push(owned.output.to_input(ring, signer_index));
+        }
+        Ok((inputs, in_total))
     }
 }
 

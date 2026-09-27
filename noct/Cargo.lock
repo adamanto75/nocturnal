@@ -1113,9 +1113,12 @@ dependencies = [
  "bip39",
  "curve25519-dalek",
  "hex",
+ "incrementalmerkletree",
  "noct-core",
  "noct-tls",
+ "orchard",
  "rand_core",
+ "zip32",
 ]
 
 [[package]]

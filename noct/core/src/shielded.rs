@@ -26,7 +26,7 @@
 use std::sync::OnceLock;
 
 use orchard::bundle::Authorized;
-use orchard::circuit::{OrchardCircuitVersion, VerifyingKey};
+use orchard::circuit::{OrchardCircuitVersion, ProvingKey, VerifyingKey};
 use orchard::Bundle;
 
 /// The only Orchard circuit this chain will verify against.
@@ -45,6 +45,22 @@ pub const CIRCUIT: OrchardCircuitVersion = OrchardCircuitVersion::FixedPostNu6_2
 pub fn verifying_key() -> &'static VerifyingKey {
     static VK: OnceLock<VerifyingKey> = OnceLock::new();
     VK.get_or_init(|| VerifyingKey::build(CIRCUIT))
+}
+
+/// The shared **proving** key for [`CIRCUIT`].
+///
+/// Built on first use and kept for the life of the process, like
+/// [`verifying_key`], and about as expensive to build. It holds no secret
+/// either — a proving key is public parameters, and what makes a proof yours is
+/// the witness you feed it, not this.
+///
+/// A node never needs one; a wallet and a miner both do, because both create
+/// notes. It lives here rather than in either of them so there is one circuit
+/// and one key, and no chance of proving against a circuit the chain does not
+/// verify against.
+pub fn proving_key() -> &'static ProvingKey {
+    static PK: OnceLock<ProvingKey> = OnceLock::new();
+    PK.get_or_init(|| ProvingKey::build(CIRCUIT))
 }
 
 /// Why a bundle was refused.
@@ -473,8 +489,7 @@ pub(crate) mod tests {
     /// otherwise each pay it. Proving in a debug build is slow enough already;
     /// tests that prove should stay few and share this.
     fn proving_key() -> &'static orchard::circuit::ProvingKey {
-        static PK: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
-        PK.get_or_init(|| orchard::circuit::ProvingKey::build(CIRCUIT))
+        super::proving_key()
     }
 
     /// `SpendingKey::random` is private to the crate, and not every 32 bytes is

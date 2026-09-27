@@ -56,6 +56,10 @@ pub enum ShieldedStateError {
     UnknownAnchor([u8; 32]),
     /// The tree is full. At depth 32 that is 4.3 billion notes.
     TreeFull,
+    /// A note commitment is not a valid one. Unreachable from a bundle, whose
+    /// commitments are valid by construction; it guards the pending coinbase
+    /// queue, which can also arrive from a decoded snapshot.
+    BadCommitment([u8; 32]),
     /// The movement would take a pool below zero.
     Turnstile(TurnstileError),
 }
@@ -70,6 +74,9 @@ impl std::fmt::Display for ShieldedStateError {
                 write!(f, "shielded: anchor {} is not one this chain accepts", hex32(a))
             }
             ShieldedStateError::TreeFull => f.write_str("shielded: the commitment tree is full"),
+            ShieldedStateError::BadCommitment(c) => {
+                write!(f, "shielded: {} is not a valid note commitment", hex32(c))
+            }
             ShieldedStateError::Turnstile(e) => write!(f, "{e}"),
         }
     }
@@ -209,6 +216,62 @@ impl ShieldedState {
         self.tree.tree_size()
     }
 
+    /// The commitment tree as it stands, for building note witnesses against.
+    ///
+    /// A wallet needs this to make a Merkle path for a note it owns, which is
+    /// the one thing it cannot derive from the note alone.
+    pub fn frontier(&self) -> &Frontier<MerkleHashOrchard, TREE_DEPTH> {
+        &self.tree
+    }
+
+    /// Coinbase notes that are due to enter the tree when the block at `height`
+    /// is applied, oldest first, with the height each was queued at.
+    ///
+    /// Due **by height**, not by position in the queue. Counting places back
+    /// would only be right if every block queued a note, and a rule that depends
+    /// on that is a rule waiting to be broken by the first block that does not.
+    ///
+    /// The boundary is `chain_height_after >= queued_at + maturity`, which is the
+    /// rule coinbase outputs have always had — created at `H`, spendable once the
+    /// chain has reached `H + maturity` — stated over the tree instead of over a
+    /// spend, because an Orchard spend names nothing a validator could age.
+    fn coinbase_due_at(&self, height: u64, maturity: u64) -> Vec<(u64, [u8; 32])> {
+        let chain_height_after = height.saturating_add(1);
+        self.pending_coinbase
+            .iter()
+            .take_while(|(queued_at, _)| {
+                chain_height_after >= queued_at.saturating_add(maturity)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Every note commitment the block at `height` appends, in the order the
+    /// tree must take them: coinbase notes that have become due first (oldest
+    /// first, because they belong to older blocks), then each bundle's, in the
+    /// order the block commits to them.
+    ///
+    /// **This ordering is consensus** — the root, and therefore every anchor
+    /// after it, depends on it — and it is stated here once. [`Self::apply_block`]
+    /// appends exactly this list, and a wallet assigning positions to its own
+    /// notes calls the same function instead of restating the rule. Two
+    /// statements of a consensus ordering is one statement too many; the first
+    /// time they disagree, the wallet builds a proof against a path the chain
+    /// does not have and the money looks gone.
+    ///
+    /// The position of the first entry is [`Self::notes`] as it stands now.
+    pub fn block_commitments<'a, I>(&self, bundles: I, height: u64, maturity: u64) -> Vec<[u8; 32]>
+    where
+        I: IntoIterator<Item = &'a ShieldedBundle>,
+    {
+        let mut out: Vec<[u8; 32]> =
+            self.coinbase_due_at(height, maturity).into_iter().map(|(_, note)| note).collect();
+        for bundle in bundles {
+            out.extend(bundle.commitments().map(|cmx| cmx.to_bytes()));
+        }
+        out
+    }
+
     /// Apply one block's worth of shielded activity.
     ///
     /// `bundles` are every bundle in the block, in the order the block commits
@@ -279,31 +342,22 @@ impl ShieldedState {
             totals.apply_cross(crossing).map_err(ShieldedStateError::Turnstile)?;
         }
 
-        // A coinbase note that has now been buried deep enough enters the tree
-        // first, before this block's own transactions. The order is consensus —
-        // the root depends on it — so it is fixed here and nowhere else: the
-        // older note goes in first, because it belongs to an older block.
+        // A coinbase note that has been buried deep enough enters the tree first,
+        // before this block's own transactions, and the whole order comes from
+        // `block_commitments` so that nothing here restates it.
         //
-        // Due by height, not by position in the queue. Counting places back
-        // would only be right if every block queued a note, and a rule that
-        // depends on that is a rule waiting to be broken by the first block
-        // that does not.
-        let chain_height_after = height.saturating_add(1);
-        let mut matured: Vec<(u64, [u8; 32])> = Vec::new();
-        // Counted, not popped: nothing may leave the real queue until every
-        // check below has passed, or a refused block would still have consumed
-        // a pending note.
-        for &(queued_at, note) in self.pending_coinbase.iter() {
-            if chain_height_after < queued_at.saturating_add(maturity) {
-                break;
-            }
+        // `matured` is *counted, not popped*: nothing may leave the real queue
+        // until every check below has passed, or a refused block would still have
+        // consumed a pending note.
+        let bundles: Vec<&ShieldedBundle> = bundles.into_iter().collect();
+        let matured = self.coinbase_due_at(height, maturity);
+        for note in self.block_commitments(bundles.iter().copied(), height, maturity) {
             let cmx = orchard::note::ExtractedNoteCommitment::from_bytes(&note)
                 .into_option()
-                .expect("a queued note was a valid commitment when it was queued");
+                .ok_or(ShieldedStateError::BadCommitment(note))?;
             if !tree.append(MerkleHashOrchard::from_cmx(&cmx)) {
                 return Err(ShieldedStateError::TreeFull);
             }
-            matured.push((queued_at, note));
         }
 
         for bundle in bundles {
@@ -322,12 +376,8 @@ impl ShieldedState {
                 added.push(nullifier);
             }
 
-            for cmx in bundle.commitments() {
-                if !tree.append(MerkleHashOrchard::from_cmx(&cmx)) {
-                    return Err(ShieldedStateError::TreeFull);
-                }
-            }
-
+            // Commitments are not appended here: `block_commitments` above put
+            // every one of them in, in the one order that is consensus.
             let cross = bundle.cross().map_err(|_| {
                 ShieldedStateError::Turnstile(TurnstileError::NotRepresentable)
             })?;

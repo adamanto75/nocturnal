@@ -377,6 +377,71 @@ The wallet-state work already done (public-only records, secrets re-derived on
 load, checksummed, owner-only) is the right foundation: Orchard note records must
 follow the same rule — **nothing that can spend is written to disk**.
 
+**Built, in `wallet/src/shielded.rs`.** What was decided along the way:
+
+*One seed, both pools.* A Noct wallet is a single 32-byte spend secret and the
+24-word phrase encodes it directly, so the Orchard key is derived from those same
+bytes — hashed with a domain tag first, then through ZIP-32's own
+`SpendingKey::from_zip32_seed` at `m/32'/1337'/account'`. An existing backup
+restores the shielded side too, and there is no second thing to write down and
+lose. The coin type is a placeholder (Noct has no SLIP-44 number) and is pinned by
+a test, because changing it silently changes every address the wallet ever handed
+out.
+
+*Positions come from core, not from the wallet.* Leaf order is consensus, and a
+coinbase note enters the tree maturity blocks after the one that made it, so the
+wallet cannot compute positions from what it sees in a block. It asks
+`ShieldedState::block_commitments` — one statement of that ordering, in core, and
+the wallet is a consumer of it. `apply_block` appends exactly the same list.
+
+*Every block is checked against the chain's root.* `scan_block` takes the chain's
+shielded state from **both** sides of the block: the earlier one decides leaf
+order, the later one is what its own tree is compared against. Scanning out of
+order otherwise produces positions that are wrong and nothing that looks wrong —
+balances still add up, and the failure surfaces much later as a transaction the
+network rejects for no visible reason.
+
+*No rollback, by design.* The ring side already settled this: a node shorter than
+the wallet has scanned is reported and the caller rebuilds, because that can cost
+time and never correctness. Inverting a witness is the arithmetic the node refused
+to do to its own tree, with less to check it against. So a reorg surfaces as a
+root mismatch at the block that caused it.
+
+*What is on disk, and why it is allowed to be.* The note plaintexts, positions,
+witnesses and the wallet's copy of the tree. A note plaintext does not let its
+reader spend — that needs the spend authorizing key, which comes from the seed and
+is never written — but it does reveal value and recipient, exactly as the ring
+records already reveal which outputs are the wallet's and what they were worth.
+Nullifiers are **recomputed** on load rather than stored, so a reader cannot watch
+the wallet's spends. Loading checks the file against the chain: same root, same
+leaf count, and every unspent note's witness must give a path to *that note* under
+a root the chain still accepts.
+
+### The shape a shielded-to-shielded payment takes
+
+Making the wallet usable needed one thing the transaction format did not yet
+express, and §4 had deferred: **a transaction with no ring side at all.** Without
+it, someone who wants to live inside the shielded pool has to touch the ring pool
+to move money, which is most of the point gone.
+
+The fee is what makes it work. A shielded-to-shielded payment states `fee = F` and
+`cross = -F`: that much value leaves the pool for the ring side, where fees live,
+and the block's coinbase collects it like any other fee. The ring balance rule
+needs no special case — `0 == 0 + (F + (-F))·H` — which is the payoff for having
+written that rule once. So the transaction has no inputs, no outputs, and no range
+proof, and the structural check stops deciding: with a bundle present, either half
+of the ring side may be empty and the balance rule decides. The range proof became
+`Option`, present exactly when there are outputs to cover, which leaves a version 1
+transaction's bytes untouched. A full shield with no change uses the same freedom
+on the other half — ring inputs, no ring outputs, and no change output to tie the
+payment back.
+
+While wiring this up, one more gap closed: the mempool was admitting shielded
+transactions without checking their anchor or nullifiers, so a replayed
+double-spend of a note bought an attacker a proof verification per copy. Those are
+hash lookups and now happen before `verify`, which is the same argument the ring
+side's admission order already made.
+
 ---
 
 ## 10. The mining pool

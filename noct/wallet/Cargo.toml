@@ -17,3 +17,14 @@ curve25519-dalek = { version = "4", features = ["rand_core"] }
 hex = "0.4"
 # BIP39 mnemonic seed phrases (standard English wordlist + checksum).
 bip39 = "2"
+# The shielded half of the wallet. Same versions core pins: a different major
+# version of either is a different `Note`, `Address` and tree.
+orchard = "0.15.5"
+# `legacy-api` is what provides `CommitmentTree` and `IncrementalWitness`. The
+# node keeps only a frontier, which is all it needs to append and to state a
+# root; a wallet additionally needs a *path* for each note it owns, and that is
+# what a witness is. Core does not enable this feature and does not need it.
+incrementalmerkletree = { version = "0.8.1", features = ["legacy-api"] }
+# Only to name the ZIP-32 account number `SpendingKey::from_zip32_seed` takes.
+# Same version orchard depends on: a different major version is a different type.
+zip32 = "0.2"
