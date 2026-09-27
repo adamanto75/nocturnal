@@ -52,6 +52,11 @@ pub fn verifying_key() -> &'static VerifyingKey {
 pub enum ShieldedError {
     /// The zero-knowledge proof did not verify.
     BadProof,
+    /// An action's spend authorization signature did not verify under its `rk`.
+    BadSpendAuth,
+    /// The binding signature did not verify, so the stated value balance is not
+    /// the one the actions' value commitments add up to.
+    BadBindingSignature,
     /// The bundle was built for a different circuit than [`CIRCUIT`].
     WrongCircuit { found: OrchardCircuitVersion },
     /// The value balance has no negation, so it cannot be stated as a ring-side
@@ -63,6 +68,12 @@ impl std::fmt::Display for ShieldedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ShieldedError::BadProof => f.write_str("shielded: the proof did not verify"),
+            ShieldedError::BadSpendAuth => {
+                f.write_str("shielded: a spend authorization signature did not verify")
+            }
+            ShieldedError::BadBindingSignature => {
+                f.write_str("shielded: the binding signature did not verify")
+            }
             ShieldedError::WrongCircuit { found } => {
                 write!(f, "shielded: bundle built for {found:?}, this chain verifies {CIRCUIT:?}")
             }
@@ -167,6 +178,43 @@ impl ShieldedBundle {
     /// evidence that the notes involved exist and the arithmetic holds.
     pub fn verify_proof(&self) -> Result<(), ShieldedError> {
         self.0.verify_proof(verifying_key()).map_err(|_| ShieldedError::BadProof)
+    }
+
+    /// Verify **everything** the bundle asserts, against the message it was
+    /// signed over. This is what consensus must call; `verify_proof` alone is not
+    /// enough, and the reason is worth stating plainly.
+    ///
+    /// The proof does not cover the value balance. `value_balance` is a public
+    /// input carried beside the proof, and what ties it to the actions' value
+    /// commitments is the **binding signature**: its validating key is derived as
+    /// `Σ cv_net − value_balance·R`, which is a key somebody can sign under only
+    /// if the two agree. Verify the proof and not the binding signature and a
+    /// bundle may claim any balance it likes — which on the way into the pool is
+    /// minting coins from nothing, and on the way out is minting them in the ring
+    /// pool. It is the whole of the turnstile's arithmetic, in one signature.
+    ///
+    /// The **spend authorization** signatures are the other half: the proof shows
+    /// a note exists and that `rk` is the right randomized key for it, but only a
+    /// signature under `rk` shows its owner agreed to spend it.
+    ///
+    /// `sighash` is what both are signed over, and it must commit to everything
+    /// that could otherwise be changed around the bundle — otherwise an
+    /// authorized bundle can be lifted out of one context and replayed in
+    /// another.
+    pub fn verify(&self, sighash: &[u8; 32]) -> Result<(), ShieldedError> {
+        // Signatures first: they are microseconds, the proof is milliseconds, and
+        // a bundle that fails either is rejected either way.
+        for action in self.0.actions() {
+            action
+                .rk()
+                .verify(sighash, action.authorization())
+                .map_err(|_| ShieldedError::BadSpendAuth)?;
+        }
+        self.0
+            .binding_validating_key()
+            .verify(sighash, self.0.authorization().binding_signature())
+            .map_err(|_| ShieldedError::BadBindingSignature)?;
+        self.verify_proof()
     }
 
     /// The wrapped bundle, for code that needs the crate's own type.
@@ -446,6 +494,17 @@ pub(crate) mod tests {
     /// `coinbase` picks the two shapes Noct needs: value crossing in from the
     /// ring pool, and a block reward minted straight into the shielded pool.
     pub(crate) fn built_bundle(value: u64, coinbase: bool) -> Bundle<Authorized, i64> {
+        built_bundle_signed(value, coinbase, [0u8; 32])
+    }
+
+    /// As [`built_bundle`], but signed over a chosen sighash — what a real
+    /// consensus check needs, since the signatures are what bind the bundle to
+    /// its context.
+    pub(crate) fn built_bundle_signed(
+        value: u64,
+        coinbase: bool,
+        sighash: [u8; 32],
+    ) -> Bundle<Authorized, i64> {
         let mut rng = OsRng;
         let version = BundleVersion::orchard_v2();
         let fvk = FullViewingKey::from(&spending_key());
@@ -473,7 +532,7 @@ pub(crate) mod tests {
             .0
             .create_proof(proving_key(), &mut rng)
             .expect("proving succeeds")
-            .prepare(rng, [0u8; 32])
+            .prepare(rng, sighash)
             .finalize()
             .expect("binding signature")
     }
@@ -537,8 +596,54 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod wire_tests {
-    use super::tests::built_bundle;
+    use super::tests::{built_bundle, built_bundle_signed};
     use super::*;
+
+    /// **The reason `verify_proof` is not enough.** `value_balance` rides beside
+    /// the proof, not inside it, so a relayer can rewrite it and the proof still
+    /// verifies. What catches it is the binding signature, whose validating key
+    /// is derived from the balance — change the balance and there is no key any
+    /// signature was made under.
+    ///
+    /// This is the inflation bug the coin would have had: a bundle claiming to
+    /// bring in ten times what it created, minting the difference.
+    #[test]
+    fn rewriting_the_value_balance_leaves_the_proof_valid_and_the_binding_signature_broken() {
+        let sighash = [7u8; 32];
+        let honest = ShieldedBundle::new(built_bundle_signed(5_000, false, sighash))
+            .expect("fixed circuit");
+        assert_eq!(honest.verify(&sighash), Ok(()));
+
+        // Rewrite the balance in place: actions ‖ flags, then the i64.
+        let mut bytes = honest.to_bytes();
+        let at = 2 + honest.actions() * ACTION_BYTES + 1;
+        assert_eq!(
+            i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+            -5_000,
+            "the balance is where the layout says it is"
+        );
+        bytes[at..at + 8].copy_from_slice(&(-50_000i64).to_le_bytes());
+
+        let forged = ShieldedBundle::from_bytes(&bytes).expect("it decodes — nothing is malformed");
+        assert_eq!(forged.cross().unwrap(), 50_000, "and claims ten times the value");
+        assert_eq!(forged.verify_proof(), Ok(()), "the proof does not cover the balance");
+        assert_eq!(
+            forged.verify(&sighash),
+            Err(ShieldedError::BadBindingSignature),
+            "so the binding signature is the only thing standing between this and inflation"
+        );
+    }
+
+    /// A bundle authorized for one message must not verify against another. This
+    /// is what stops an authorized bundle being lifted into a different
+    /// transaction or a different block.
+    #[test]
+    fn a_bundle_does_not_verify_against_a_message_it_did_not_sign() {
+        let b = ShieldedBundle::new(built_bundle_signed(5_000, false, [7u8; 32]))
+            .expect("fixed circuit");
+        assert_eq!(b.verify(&[7u8; 32]), Ok(()));
+        assert_eq!(b.verify(&[8u8; 32]), Err(ShieldedError::BadSpendAuth));
+    }
 
     /// The shape of a bundle on the wire, stated as a number so a change to the
     /// layout cannot pass unnoticed. 884 bytes per action, and a proof whose

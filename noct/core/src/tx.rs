@@ -225,7 +225,16 @@ fn xor_amount(amount_bytes: [u8; 8], k: &Scalar) -> [u8; 8] {
 /// binds. It covers the version, tx public key, fee, each input's key image and
 /// ring, every output, and the range proof — i.e. everything except the CLSAG
 /// signatures themselves. Recomputed identically at verify time.
-fn signing_message(
+/// Everything a transaction commits to **except its signatures**: the ring
+/// side's contents, and (from version 2) the crossing.
+///
+/// Both signature systems in a version 2 transaction sign this, and that is what
+/// keeps them from chasing each other. The ring signatures sign this *plus* the
+/// authorized bundle, because the bundle carries the notes the value becomes.
+/// The bundle's own signatures sign this *alone* — if they also covered the ring
+/// signatures, each side would have to be made after the other.
+#[allow(clippy::too_many_arguments)]
+fn signed_core(
     version: u8,
     tx_public: &PublicKey,
     additional_tx_public: &[PublicKey],
@@ -234,8 +243,7 @@ fn signing_message(
     outputs: &[Output],
     range_proof: &RangeProof,
     cross: i64,
-    shielded: Option<&ShieldedBundle>,
-) -> [u8; 32] {
+) -> Vec<u8> {
     let mut b = Vec::new();
     b.push(version);
     b.extend_from_slice(&tx_public.to_bytes());
@@ -274,6 +282,35 @@ fn signing_message(
     // invalidate every signature already on the chain.
     if version >= TX_VERSION_SHIELDED {
         b.extend_from_slice(&cross.to_le_bytes());
+    }
+    b
+}
+
+/// The message the ring signatures are made over: the signed core, then the
+/// bundle as it will be published.
+#[allow(clippy::too_many_arguments)]
+fn signing_message(
+    version: u8,
+    tx_public: &PublicKey,
+    additional_tx_public: &[PublicKey],
+    fee: u64,
+    inputs: &[(KeyImage, &[RingMember])],
+    outputs: &[Output],
+    range_proof: &RangeProof,
+    cross: i64,
+    shielded: Option<&ShieldedBundle>,
+) -> [u8; 32] {
+    let mut b = signed_core(
+        version,
+        tx_public,
+        additional_tx_public,
+        fee,
+        inputs,
+        outputs,
+        range_proof,
+        cross,
+    );
+    if version >= TX_VERSION_SHIELDED {
         match shielded {
             Some(bundle) => {
                 b.push(1);
@@ -286,6 +323,44 @@ fn signing_message(
     }
     keccak256(&b)
 }
+
+/// The message an Orchard bundle's own signatures are made over.
+///
+/// Domain-separated from [`signing_message`] so that one scheme's message can
+/// never be read as the other's, and computed from the signed core alone so that
+/// the bundle can be authorized before the ring signatures exist.
+#[allow(clippy::too_many_arguments)]
+fn bundle_sighash(
+    version: u8,
+    tx_public: &PublicKey,
+    additional_tx_public: &[PublicKey],
+    fee: u64,
+    inputs: &[(KeyImage, &[RingMember])],
+    outputs: &[Output],
+    range_proof: &RangeProof,
+    cross: i64,
+) -> [u8; 32] {
+    let core = signed_core(
+        version,
+        tx_public,
+        additional_tx_public,
+        fee,
+        inputs,
+        outputs,
+        range_proof,
+        cross,
+    );
+    let mut b = Vec::with_capacity(17 + core.len());
+    b.extend_from_slice(b"noct.tx.bundle.v1");
+    b.extend_from_slice(&core);
+    keccak256(&b)
+}
+
+/// "No shielded bundle", for [`Transaction::build_with_shielded`].
+///
+/// A `None` needs a type for the callback it is not, and naming that type at
+/// every call site is noise; this is that `None`, named once.
+pub const NO_BUNDLE: Option<fn(&[u8; 32]) -> Result<ShieldedBundle, TxError>> = None;
 
 impl Transaction {
     /// Build and sign a transaction paying `payments`, spending `inputs`, with a
@@ -301,7 +376,7 @@ impl Transaction {
         fee: u64,
         tx: &TxKeypair,
     ) -> Result<Transaction, TxError> {
-        Self::build_with_shielded(rng, inputs, payments, fee, tx, 0, None)
+        Self::build_with_shielded(rng, inputs, payments, fee, tx, 0, NO_BUNDLE)
     }
 
     /// Build and sign a transaction that also moves value across the pools.
@@ -319,37 +394,40 @@ impl Transaction {
     /// below still require an input and an output. That case arrives with the
     /// chain-state work, where a transaction with nothing to spend on the ring
     /// side can be handled coherently rather than as a special case here.
-    pub fn build_with_shielded<R: rand_core::RngCore + rand_core::CryptoRng>(
+    /// `authorize` is called once, with the sighash the bundle must be signed
+    /// over, and returns the finished bundle. It is a callback rather than a
+    /// ready-made bundle because that sighash covers the ring side, which does
+    /// not exist until part-way through this function: a caller cannot compute it
+    /// in advance, and a bundle signed over anything else is one
+    /// [`Transaction::verify`] will refuse. Pass [`NO_BUNDLE`] for none.
+    pub fn build_with_shielded<R, F>(
         rng: &mut R,
         inputs: &[InputSecret],
         payments: &[Payment],
         fee: u64,
         tx: &TxKeypair,
         cross: i64,
-        shielded: Option<ShieldedBundle>,
-    ) -> Result<Transaction, TxError> {
+        authorize: Option<F>,
+    ) -> Result<Transaction, TxError>
+    where
+        R: rand_core::RngCore + rand_core::CryptoRng,
+        F: FnOnce(&[u8; 32]) -> Result<ShieldedBundle, TxError>,
+    {
         if inputs.is_empty() {
             return Err(TxError::NoInputs);
         }
         if payments.is_empty() {
             return Err(TxError::NoOutputs);
         }
-        if cross != 0 && shielded.is_none() {
+        if cross != 0 && authorize.is_none() {
             return Err(TxError::CrossWithoutBundle);
         }
-        if let Some(bundle) = &shielded {
-            let stated = bundle.cross().map_err(TxError::Shielded)?;
-            if stated != cross {
-                return Err(TxError::CrossMismatch { ring_side: cross, bundle: stated });
-            }
-        }
-
-        // The version is whatever the transaction needs, never a choice.
-        let version = if cross != 0 || shielded.is_some() {
-            TX_VERSION_SHIELDED
-        } else {
-            TX_VERSION
-        };
+        // The version is whatever the transaction needs, never a choice. Known
+        // before the bundle exists, because it depends on whether there is one
+        // rather than on what is in it — and it has to be, since the version is
+        // the first thing the bundle's own sighash covers.
+        let has_bundle = authorize.is_some();
+        let version = if cross != 0 || has_bundle { TX_VERSION_SHIELDED } else { TX_VERSION };
 
         // Value balance (checked with i128 to avoid overflow, and because a
         // crossing can be negative: value arriving from the shielded pool is
@@ -416,6 +494,32 @@ impl Transaction {
             .collect();
         let msg_inputs: Vec<(KeyImage, &[RingMember])> =
             spend_inputs.iter().map(|s| (s.key_image(), s.ring.as_slice())).collect();
+
+        // The bundle is authorized now: the ring side is settled, so its sighash
+        // is fixed, and the ring signatures below then cover the authorized
+        // bundle in turn. Neither side has to be built twice.
+        let shielded = match authorize {
+            Some(authorize) => {
+                let sighash = bundle_sighash(
+                    version,
+                    &tx.public,
+                    &additional_tx_public,
+                    fee,
+                    &msg_inputs,
+                    &outputs,
+                    &range_proof,
+                    cross,
+                );
+                let bundle = authorize(&sighash)?;
+                let stated = bundle.cross().map_err(TxError::Shielded)?;
+                if stated != cross {
+                    return Err(TxError::CrossMismatch { ring_side: cross, bundle: stated });
+                }
+                Some(bundle)
+            }
+            None => None,
+        };
+
         let message = signing_message(
             version,
             &tx.public,
@@ -628,12 +732,25 @@ impl Transaction {
             }
         }
 
-        // The proof is the only evidence that the notes exist and that the
-        // bundle's own arithmetic holds. Left until here, with the other
-        // cryptography, because it is the most expensive check in the
-        // transaction.
+        // The bundle in full: its proof, its spend authorizations, and — the one
+        // that guards the turnstile — its binding signature, which is the only
+        // thing tying the crossing it claims to the notes it actually created.
+        // Signed over the core rather than over `message`, so that the two
+        // signature systems do not each have to wait for the other.
         if let Some(bundle) = &self.shielded {
-            bundle.verify_proof().map_err(TxError::Shielded)?;
+            let msg_inputs: Vec<(KeyImage, &[RingMember])> =
+                self.inputs.iter().map(|i| (i.signature.key_image, i.ring.as_slice())).collect();
+            let sighash = bundle_sighash(
+                self.version,
+                &self.tx_public,
+                &self.additional_tx_public,
+                self.fee,
+                &msg_inputs,
+                &self.outputs,
+                &self.range_proof,
+                self.cross,
+            );
+            bundle.verify(&sighash).map_err(TxError::Shielded)?;
         }
 
         // Balance: Σ pseudo-outs == Σ output commitments + (fee + cross)·H.
@@ -1109,13 +1226,22 @@ mod cross_balance_tests {
 mod shielded_tx_tests {
     use super::tests::{account, address, fabricate_input};
     use super::*;
-    use crate::shielded::tests::built_bundle;
+    use crate::shielded::tests::{built_bundle, built_bundle_signed};
     use rand_core::OsRng;
 
     /// A shielding transaction: 100 in from the ring pool, 30 paid out inside
     /// it, 1 as fee, and 69 crossing into the shielded pool as a note.
+    /// Authorize a bundle worth `value` over whatever sighash the builder hands
+    /// us — what a wallet will do, and the only way to get a bundle that
+    /// verifies.
+    fn authorizing(value: u64) -> impl FnOnce(&[u8; 32]) -> Result<ShieldedBundle, TxError> {
+        move |sighash| {
+            ShieldedBundle::new(built_bundle_signed(value, false, *sighash))
+                .map_err(TxError::Shielded)
+        }
+    }
+
     fn shielding_tx() -> Transaction {
-        let bundle = ShieldedBundle::new(built_bundle(69, false)).expect("fixed circuit");
         let recipient = account();
         let payments = vec![Payment { destination: address(&recipient), amount: 30 }];
         let inputs = vec![fabricate_input(100, 4, 1)];
@@ -1126,7 +1252,7 @@ mod shielded_tx_tests {
             1,
             &TxKeypair::random(&mut OsRng),
             69,
-            Some(bundle),
+            Some(authorizing(69)),
         )
         .expect("a balanced shielding transaction builds")
     }
@@ -1191,10 +1317,11 @@ mod shielded_tx_tests {
     /// prevent.
     #[test]
     fn the_two_sides_must_agree_about_how_much_crossed() {
-        let bundle = ShieldedBundle::new(built_bundle(69, false)).unwrap();
         let recipient = account();
         let payments = vec![Payment { destination: address(&recipient), amount: 30 }];
-        let inputs = vec![fabricate_input(100, 4, 1)];
+        // 101 in = 30 paid + 1 fee + 70 crossing, so the ring side balances on
+        // its own terms and the disagreement with the bundle is the only fault.
+        let inputs = vec![fabricate_input(101, 4, 1)];
 
         let err = Transaction::build_with_shielded(
             &mut OsRng,
@@ -1203,7 +1330,7 @@ mod shielded_tx_tests {
             1,
             &TxKeypair::random(&mut OsRng),
             70, // the ring side says 70, the bundle says 69
-            Some(bundle),
+            Some(authorizing(69)),
         )
         .expect_err("a transaction whose two sides disagree must not build");
         assert_eq!(err, TxError::CrossMismatch { ring_side: 70, bundle: 69 });
@@ -1224,7 +1351,7 @@ mod shielded_tx_tests {
             1,
             &TxKeypair::random(&mut OsRng),
             69,
-            None,
+            NO_BUNDLE,
         )
         .expect_err("a crossing with no bundle must not build");
         assert_eq!(err, TxError::CrossWithoutBundle);
@@ -1250,6 +1377,38 @@ mod shielded_tx_tests {
         let mut future = shielding_tx();
         future.version = 3;
         assert_eq!(future.verify(&mut OsRng), Err(TxError::BadVersion));
+    }
+
+    /// **A bundle is not a bearer instrument.** Its signatures cover the ring
+    /// side, so one authorized for a different transaction — or for nothing in
+    /// particular — is refused. Without this, anyone who saw a shielding
+    /// transaction could lift its bundle into a transaction of their own and
+    /// take credit for the value it brought in.
+    #[test]
+    fn a_bundle_signed_over_the_wrong_message_is_refused() {
+        let recipient = account();
+        let payments = vec![Payment { destination: address(&recipient), amount: 30 }];
+        let inputs = vec![fabricate_input(100, 4, 1)];
+        let tx = Transaction::build_with_shielded(
+            &mut OsRng,
+            &inputs,
+            &payments,
+            1,
+            &TxKeypair::random(&mut OsRng),
+            69,
+            // Ignores the sighash it is handed and signs over something else,
+            // which is what a lifted bundle looks like from here.
+            Some(|_: &[u8; 32]| {
+                ShieldedBundle::new(built_bundle_signed(69, false, [0u8; 32]))
+                    .map_err(TxError::Shielded)
+            }),
+        )
+        .expect("it builds — nothing structural is wrong with it");
+
+        assert_eq!(
+            tx.verify(&mut OsRng),
+            Err(TxError::Shielded(crate::shielded::ShieldedError::BadSpendAuth)),
+        );
     }
 
     /// A version 1 transaction must hash and encode to exactly the bytes it
@@ -1303,7 +1462,6 @@ mod shielded_tx_tests {
         let payments = vec![Payment { destination: address(&recipient), amount: 139 }];
         let inputs = vec![fabricate_input(100, 4, 1)];
         // 100 in + 40 arriving = 139 out + 1 fee.
-        let bundle = ShieldedBundle::new(built_bundle(40, false)).unwrap();
         let err = Transaction::build_with_shielded(
             &mut OsRng,
             &inputs,
@@ -1311,7 +1469,7 @@ mod shielded_tx_tests {
             1,
             &TxKeypair::random(&mut OsRng),
             -40,
-            Some(bundle),
+            Some(authorizing(40)),
         )
         .expect_err("this bundle states +40, not -40");
         assert_eq!(err, TxError::CrossMismatch { ring_side: -40, bundle: 40 });
