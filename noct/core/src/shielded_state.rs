@@ -94,6 +94,11 @@ pub struct ShieldedUndo {
     nullifiers_added: Vec<[u8; 32]>,
     /// How many roots the anchor history held before this block.
     anchors_before: usize,
+    /// Whether this block queued a coinbase note, so undo knows to unqueue it.
+    coinbase_queued: bool,
+    /// Coinbase notes that matured in this block, oldest first, so undo can put
+    /// them back at the front of the queue in the order they left it.
+    coinbase_matured: Vec<(u64, [u8; 32])>,
 }
 
 /// The shielded pool as the chain sees it.
@@ -105,6 +110,16 @@ pub struct ShieldedState {
     /// the current root.
     anchors: Vec<[u8; 32]>,
     totals: PoolTotals,
+    /// Coinbase notes that exist but are not yet in the tree, oldest first.
+    ///
+    /// **This is how coinbase maturity survives being shielded.** In the ring
+    /// pool a spend names the output it spends, so a validator can ask how old
+    /// it is. An Orchard spend names nothing — that is the entire feature — so
+    /// nobody can ask. Instead the note is withheld from the tree until it is
+    /// buried: until then no anchor contains it, so no proof can be made
+    /// against it, and maturity becomes a property of the tree rather than of
+    /// the spend. Nothing in the audited circuit changes.
+    pending_coinbase: std::collections::VecDeque<(u64, [u8; 32])>,
 }
 
 impl Default for ShieldedState {
@@ -126,6 +141,7 @@ impl ShieldedState {
             nullifiers: HashSet::new(),
             anchors: vec![root],
             totals: PoolTotals::new(),
+            pending_coinbase: std::collections::VecDeque::new(),
         }
     }
 
@@ -163,11 +179,26 @@ impl ShieldedState {
     /// nothing behind. A partially-applied block would be worse than a rejected
     /// one — it would be a node quietly disagreeing with the network about its
     /// own state.
+    /// `coinbase_note` is the commitment of this block's shielded coinbase, if it
+    /// has one, `height` the index of the block being applied, and `maturity`
+    /// the depth a coinbase must reach before it can be spent. The note is
+    /// **queued, not appended**: it enters the tree only once `maturity` blocks
+    /// have been applied on top of it.
+    ///
+    /// The boundary matches the rule coinbase outputs have always had: created at
+    /// height `H`, spendable once the chain has reached `H + maturity`. Applying
+    /// the block at index `B` takes the chain to height `B + 1`, so every queued
+    /// note with `queued_at + maturity <= B + 1` enters the tree here — compared
+    /// by height rather than by position in the queue, because counting places
+    /// back would only be right if every block queued one.
     pub fn apply_block<'a, I>(
         &mut self,
         bundles: I,
         minted_into: Pool,
         minted: u64,
+        coinbase_note: Option<[u8; 32]>,
+        height: u64,
+        maturity: u64,
     ) -> Result<ShieldedUndo, ShieldedStateError>
     where
         I: IntoIterator<Item = &'a ShieldedBundle>,
@@ -177,6 +208,8 @@ impl ShieldedState {
             totals_before: self.totals,
             nullifiers_added: Vec::new(),
             anchors_before: self.anchors.len(),
+            coinbase_queued: false,
+            coinbase_matured: Vec::new(),
         };
 
         // Work on copies, and commit only once everything has passed.
@@ -188,10 +221,36 @@ impl ShieldedState {
         // same note is a double-spend that never touches the stored set.
         let mut seen_here: HashSet<[u8; 32]> = HashSet::new();
 
-        // The block reward. Today it lands in the ring pool; when coinbase
-        // becomes a shielded note this is the only line that changes.
+        // The block reward, into whichever pool it is created in.
         if minted > 0 {
             totals.mint(minted_into, minted).map_err(ShieldedStateError::Turnstile)?;
+        }
+
+        // A coinbase note that has now been buried deep enough enters the tree
+        // first, before this block's own transactions. The order is consensus —
+        // the root depends on it — so it is fixed here and nowhere else: the
+        // older note goes in first, because it belongs to an older block.
+        //
+        // Due by height, not by position in the queue. Counting places back
+        // would only be right if every block queued a note, and a rule that
+        // depends on that is a rule waiting to be broken by the first block
+        // that does not.
+        let chain_height_after = height.saturating_add(1);
+        let mut matured: Vec<(u64, [u8; 32])> = Vec::new();
+        // Counted, not popped: nothing may leave the real queue until every
+        // check below has passed, or a refused block would still have consumed
+        // a pending note.
+        for &(queued_at, note) in self.pending_coinbase.iter() {
+            if chain_height_after < queued_at.saturating_add(maturity) {
+                break;
+            }
+            let cmx = orchard::note::ExtractedNoteCommitment::from_bytes(&note)
+                .into_option()
+                .expect("a queued note was a valid commitment when it was queued");
+            if !tree.append(MerkleHashOrchard::from_cmx(&cmx)) {
+                return Err(ShieldedStateError::TreeFull);
+            }
+            matured.push((queued_at, note));
         }
 
         for bundle in bundles {
@@ -226,13 +285,28 @@ impl ShieldedState {
         self.tree = tree;
         self.totals = totals;
         self.nullifiers.extend(added.iter().copied());
+        // The notes counted above actually leave the queue now, and this
+        // block's own coinbase note joins the back of it — after the maturing
+        // ones, so a maturity of zero could never insert a note in the same
+        // block that made it.
+        for _ in 0..matured.len() {
+            self.pending_coinbase.pop_front();
+        }
+        if let Some(note) = coinbase_note {
+            self.pending_coinbase.push_back((height, note));
+        }
         self.anchors.push(self.root());
         if self.anchors.len() > ANCHOR_DEPTH {
             let excess = self.anchors.len() - ANCHOR_DEPTH;
             self.anchors.drain(..excess);
         }
 
-        Ok(ShieldedUndo { nullifiers_added: added, ..undo })
+        Ok(ShieldedUndo {
+            nullifiers_added: added,
+            coinbase_queued: coinbase_note.is_some(),
+            coinbase_matured: matured,
+            ..undo
+        })
     }
 
     /// Undo a block, restoring the state exactly as it was before it.
@@ -253,6 +327,15 @@ impl ShieldedState {
         self.totals = undo.totals_before;
         for nullifier in &undo.nullifiers_added {
             self.nullifiers.remove(nullifier);
+        }
+        // Exactly the reverse of the commit above, in reverse order: this
+        // block's own note comes off the back, then the notes that matured go
+        // back on the front, oldest last so they end up oldest first.
+        if undo.coinbase_queued {
+            self.pending_coinbase.pop_back();
+        }
+        for entry in undo.coinbase_matured.into_iter().rev() {
+            self.pending_coinbase.push_front(entry);
         }
         self.anchors.truncate(undo.anchors_before.min(self.anchors.len()));
         if self.anchors.is_empty() {
@@ -319,6 +402,16 @@ impl ShieldedState {
         for n in &nullifiers {
             out.extend_from_slice(n);
         }
+
+        // Coinbase notes not yet in the tree. A restored node that forgot these
+        // would never insert them, so rewards would silently vanish; one that
+        // mis-ordered them would insert at different heights and compute a
+        // different root from everyone else.
+        out.extend_from_slice(&(self.pending_coinbase.len() as u32).to_le_bytes());
+        for (height, note) in &self.pending_coinbase {
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(note);
+        }
         out
     }
 
@@ -375,11 +468,23 @@ impl ShieldedState {
             nullifiers.insert(take32(&mut cur)?);
         }
 
+        let pending_count = u32::from_le_bytes(take_n(&mut cur, 4)?.try_into().ok()?) as usize;
+        // One per block of the maturity window at most, and nothing is
+        // allocated from the count before it is checked.
+        if pending_count > ANCHOR_DEPTH {
+            return None;
+        }
+        let mut pending_coinbase = std::collections::VecDeque::new();
+        for _ in 0..pending_count {
+            let height = u64::from_le_bytes(take_n(&mut cur, 8)?.try_into().ok()?);
+            pending_coinbase.push_back((height, take32(&mut cur)?));
+        }
+
         if !cur.is_empty() {
             return None;
         }
 
-        let state = ShieldedState { tree, nullifiers, anchors, totals };
+        let state = ShieldedState { tree, nullifiers, anchors, totals, pending_coinbase };
         // The state must agree with itself: the root it computes has to be the
         // newest anchor it claims. A snapshot that fails this was built by
         // something that does not share this chain's rules.
@@ -438,7 +543,7 @@ mod tests {
         s.totals.mint(Pool::Ring, 10_000).unwrap();
 
         let nullifiers: Vec<_> = b.nullifiers().collect();
-        s.apply_block([&b], Pool::Ring, 0).expect("applies");
+        s.apply_block([&b], Pool::Ring, 0, None, 0, 1).expect("applies");
 
         assert_ne!(s.root(), before, "appending a note must change the root");
         assert!(s.accepts_anchor(&s.root()), "the new root is an anchor");
@@ -466,7 +571,7 @@ mod tests {
         let blocks = [bundle(1_000), bundle(2_000), bundle(3_000)];
         let mut undos = Vec::new();
         for b in &blocks {
-            undos.push(lived_through_it.apply_block([b], Pool::Ring, 0).expect("applies"));
+            undos.push(lived_through_it.apply_block([b], Pool::Ring, 0, None, 0, 1).expect("applies"));
         }
         assert_ne!(lived_through_it.root(), untouched.root(), "the branch did change things");
 
@@ -501,9 +606,9 @@ mod tests {
         let repeat = b.clone();
         let n = b.nullifiers().next().unwrap();
 
-        s.apply_block([&b], Pool::Ring, 0).expect("first spend applies");
+        s.apply_block([&b], Pool::Ring, 0, None, 0, 1).expect("first spend applies");
         assert_eq!(
-            s.apply_block([&repeat], Pool::Ring, 0).unwrap_err(),
+            s.apply_block([&repeat], Pool::Ring, 0, None, 0, 1).unwrap_err(),
             ShieldedStateError::DuplicateNullifier(n),
             "across blocks"
         );
@@ -514,7 +619,7 @@ mod tests {
         let twin = b2.clone();
         assert!(
             matches!(
-                fresh.apply_block([&b2, &twin], Pool::Ring, 0),
+                fresh.apply_block([&b2, &twin], Pool::Ring, 0, None, 0, 1),
                 Err(ShieldedStateError::DuplicateNullifier(_))
             ),
             "and within one block"
@@ -529,7 +634,7 @@ mod tests {
         let mut s = ShieldedState::new();
         s.totals.mint(Pool::Ring, 100_000).unwrap();
         let good = bundle(1_000);
-        s.apply_block([&good], Pool::Ring, 0).expect("applies");
+        s.apply_block([&good], Pool::Ring, 0, None, 0, 1).expect("applies");
 
         let before_root = s.root();
         let before_notes = s.notes();
@@ -538,7 +643,7 @@ mod tests {
         // A block whose second bundle double-spends the first's note.
         let a = bundle(500);
         let twin = a.clone();
-        assert!(s.apply_block([&a, &twin], Pool::Ring, 0).is_err());
+        assert!(s.apply_block([&a, &twin], Pool::Ring, 0, None, 0, 1).is_err());
 
         assert_eq!(s.root(), before_root, "the tree must not have moved");
         assert_eq!(s.notes(), before_notes);
@@ -559,22 +664,22 @@ mod tests {
         // A recent root is still good: the tree moves on, and a bundle built
         // against the root from before still applies.
         let first = bundle(1_000);
-        s.apply_block([&first], Pool::Ring, 0).expect("applies");
+        s.apply_block([&first], Pool::Ring, 0, None, 0, 1).expect("applies");
         let later = bundle(1_000);
         assert!(s.accepts_anchor(&later.anchor()), "a recent root is still good");
-        s.apply_block([&later], Pool::Ring, 0).expect("a bundle on a recent anchor applies");
+        s.apply_block([&later], Pool::Ring, 0, None, 0, 1).expect("a bundle on a recent anchor applies");
 
         // Now push the history past its depth, so the empty-tree root the test
         // bundles carry falls out of it. A bundle proving against it must be
         // refused — this is the real path, not just the predicate.
         for _ in 0..(ANCHOR_DEPTH + 5) {
-            s.apply_block(std::iter::empty(), Pool::Ring, 0).expect("an empty block applies");
+            s.apply_block(std::iter::empty(), Pool::Ring, 0, None, 0, 1).expect("an empty block applies");
         }
         let stale = bundle(1_000);
         let anchor = stale.anchor();
         assert!(!s.accepts_anchor(&anchor), "the empty-tree root has aged out");
         assert_eq!(
-            s.apply_block([&stale], Pool::Ring, 0).unwrap_err(),
+            s.apply_block([&stale], Pool::Ring, 0, None, 0, 1).unwrap_err(),
             ShieldedStateError::UnknownAnchor(anchor),
             "a spend against an aged-out root must be refused by apply_block itself"
         );
@@ -586,7 +691,7 @@ mod tests {
     fn the_anchor_history_is_bounded() {
         let mut s = ShieldedState::new();
         for _ in 0..(ANCHOR_DEPTH + 25) {
-            s.apply_block(std::iter::empty(), Pool::Ring, 0).expect("an empty block applies");
+            s.apply_block(std::iter::empty(), Pool::Ring, 0, None, 0, 1).expect("an empty block applies");
         }
         assert_eq!(s.anchors.len(), ANCHOR_DEPTH);
         assert!(s.accepts_anchor(&s.root()));
@@ -602,7 +707,7 @@ mod tests {
 
         // The reward mints, and the bundle's own crossing moves it on from
         // there; both are the same value, so the pool nets the reward.
-        s.apply_block(std::iter::empty(), Pool::Shielded, 9_000_000_000).expect("mint applies");
+        s.apply_block(std::iter::empty(), Pool::Shielded, 9_000_000_000, None, 0, 1).expect("mint applies");
         assert_eq!(s.totals().shielded(), 9_000_000_000);
         assert_eq!(s.totals().ring(), 0, "nothing was created in the ring pool");
     }
@@ -616,7 +721,7 @@ mod tests {
         let before = s.totals();
 
         let b = bundle(4_000);
-        let undo = s.apply_block([&b], Pool::Ring, 0).expect("applies");
+        let undo = s.apply_block([&b], Pool::Ring, 0, None, 0, 1).expect("applies");
         assert_eq!(s.totals().shielded(), 4_000);
 
         s.undo_block(undo);

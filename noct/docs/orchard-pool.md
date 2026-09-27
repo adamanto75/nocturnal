@@ -1,5 +1,13 @@
 # A second value pool: Orchard (Halo 2) beside the ring pool
 
+> **SUPERSEDED 2026-09-27 by [`shielded-only.md`](shielded-only.md).** The
+> two-pool design made the amount crossing between pools public, and it could
+> not be made private without bespoke cross-curve cryptography in the consensus
+> path. Nocturnal is shielded-only instead: one pool, mandatory, in the style of
+> Pirate Chain rather than Zcash. This document is kept because the reasoning
+> that led there is worth reading, and because its treatment of bundles, the
+> commitment tree and coinbase maturity is still what the chain does.
+
 Status: **design, no code** (2026-09-26). The dependency spike is done and its
 numbers are in §2; nothing has been written in `core/`, `node/`, `wallet/` or
 `pool/` yet. This document is the thing to argue with before any of that

@@ -354,7 +354,7 @@ impl<P: ProofOfWork> Blockchain<P> {
         // what will catch it if only half the change is made.
         let shielded_before = self
             .shielded
-            .apply_block(std::iter::empty(), Pool::Ring, premined)
+            .apply_block(std::iter::empty(), Pool::Ring, premined, None, 0, self.maturity)
             .expect("the genesis premine cannot overflow an empty pool");
         self.blocks.push(StoredBlock { block: block.clone(), txs: Vec::new() });
         self.undos.push(Undo { outputs_len_before: 0, emitted_before: 0, shielded_before });
@@ -584,7 +584,17 @@ impl<P: ProofOfWork> Blockchain<P> {
         //    is a ring output today.
         let shielded_before = self
             .shielded
-            .apply_block(txs.iter().filter_map(|t| t.shielded.as_ref()), Pool::Ring, subsidy)
+            .apply_block(
+                txs.iter().filter_map(|t| t.shielded.as_ref()),
+                Pool::Ring,
+                subsidy,
+                // No shielded coinbase yet: the block reward is still a ring
+                // output. The queue and its maturity rule are in place for when
+                // that changes.
+                None,
+                self.height(),
+                self.maturity,
+            )
             .map_err(ChainError::Shielded)?;
 
         // --- All checks passed; commit state. ---
