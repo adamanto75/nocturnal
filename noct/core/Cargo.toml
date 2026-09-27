@@ -15,6 +15,9 @@ rust-version.workspace = true
 #
 # This is the dependency that set the workspace's Rust floor at 1.85.1.
 orchard = "0.15.5"
+# Only to name the type `orchard::Bundle::try_from_parts` takes. Kept in step
+# with orchard's own dependency: a different major version is a different type.
+nonempty = "0.11"
 curve25519-dalek = { version = "4", features = ["rand_core"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

@@ -1036,6 +1036,7 @@ dependencies = [
  "monero-clsag",
  "monero-ed25519",
  "monero-primitives",
+ "nonempty",
  "orchard",
  "rand_core",
  "tiny-keccak",
