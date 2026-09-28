@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use curve25519_dalek::scalar::Scalar;
-use noct_core::address::{Address, Network, ShieldedAddress};
+use noct_core::address::{Address, AnyAddress, Network, ShieldedAddress};
 use noct_core::block::Block;
 use noct_core::chain::{Blockchain, OutputSet};
 use noct_core::keys::{Account, PublicKey};
@@ -130,6 +130,8 @@ pub enum WalletError {
     /// Value overflow while summing amounts.
     Overflow,
     /// Transaction assembly failed.
+    /// A payout with no destinations.
+    NoPayments,
     Tx(TxError),
     /// The shielded half of the wallet refused. Kept whole rather than flattened
     /// into [`WalletError::Tx`]: the reason a bundle could not be made is a wallet
@@ -574,6 +576,109 @@ impl Wallet {
 
         let tx_keys = TxKeypair::random(rng);
         build_authorized(rng, &inputs, &payments, fee, &tx_keys, cross, plan)
+    }
+
+
+    /// Pay a batch of destinations that may be in **either** pool, in one
+    /// transaction.
+    ///
+    /// This is what a mining pool needs: miners choose where they want to be paid,
+    /// and a payout batch is whatever mix they chose. Splitting it into two
+    /// transactions would double the fee and publish two crossings instead of one.
+    ///
+    /// ## Where the money comes from
+    ///
+    /// **Each side is funded from its own pool where it can be, and only the
+    /// shortfall crosses.** A crossing publishes its amount, so the rule is to
+    /// cross as little as possible and never out of habit:
+    ///
+    /// * Shielded destinations are paid from notes when the notes cover them, and
+    ///   then nothing crosses at all — the transaction is two independent halves
+    ///   that happen to share a fee.
+    /// * Otherwise they are paid by crossing in from the ring side, and the total
+    ///   going into the pool is public.
+    /// * Ring destinations and the fee are paid from ring outputs, and the
+    ///   shortfall crosses out of the pool.
+    ///
+    /// The notes are used only when they cover the whole shielded side, rather
+    /// than being topped up by a crossing. Spending notes *and* crossing would
+    /// mean more actions, a public amount, and a half-spent set of notes — three
+    /// costs to save one crossing that is happening anyway.
+    ///
+    /// ## What it cannot do
+    ///
+    /// **Paying a ring destination needs at least one ring input**, even when the
+    /// money is coming out of the shielded pool. The ring outputs' masks have to
+    /// cancel against something, and a pseudo-out from a real input is the only
+    /// thing that supplies it — the balance rule is written over commitments, and
+    /// with no pseudo-out there is nothing for an output's mask to cancel with. A
+    /// wallet with no ring outputs at all therefore cannot unshield, and gets
+    /// [`WalletError::InsufficientFunds`]. A pool that pays ring addresses has to
+    /// keep some ring value for that reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_payout<P: ProofOfWork, R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        rng: &mut R,
+        chain: &Blockchain<P>,
+        shielded: &ShieldedWallet,
+        destinations: &[(AnyAddress, u64)],
+        fee: u64,
+        ring_size: usize,
+    ) -> Result<Transaction, WalletError> {
+        if destinations.is_empty() {
+            return Err(WalletError::NoPayments);
+        }
+        let mut ring_payments: Vec<Payment> = Vec::new();
+        let mut shielded_payments: Vec<(ShieldedAddress, u64)> = Vec::new();
+        for (destination, amount) in destinations {
+            match destination {
+                AnyAddress::Ring(a) => {
+                    ring_payments.push(Payment { destination: *a, amount: *amount })
+                }
+                AnyAddress::Shielded(a) => shielded_payments.push((*a, *amount)),
+            }
+        }
+
+        let ring_total = ring_payments
+            .iter()
+            .try_fold(0u64, |acc, p| acc.checked_add(p.amount))
+            .and_then(|s| s.checked_add(fee))
+            .ok_or(WalletError::Overflow)?;
+        let shielded_total = shielded_payments
+            .iter()
+            .try_fold(0u64, |acc, (_, a)| acc.checked_add(*a))
+            .ok_or(WalletError::Overflow)?;
+
+        // Nothing shielded to pay: this is the transaction the pool has always
+        // built, and it stays byte-for-byte a version 1 one.
+        if shielded_payments.is_empty() {
+            return self.build_transaction(rng, chain, &ring_payments, fee, ring_size);
+        }
+
+        let notes_cover_it =
+            shielded_total > 0 && shielded.spendable_value() >= shielded_total;
+
+        // How much the ring side has to raise, and therefore what crosses.
+        let from_ring = if notes_cover_it { ring_total } else { ring_total + shielded_total };
+        let (inputs, in_total) = self.select_ring_inputs(rng, chain, from_ring, ring_size)?;
+        let ring_change = in_total - from_ring;
+        if ring_change > 0 {
+            ring_payments.push(Payment { destination: self.address(), amount: ring_change });
+        }
+
+        let plan = if notes_cover_it {
+            shielded
+                .plan_payout(&shielded_payments, chain.shielded())
+                .map_err(WalletError::Shielded)?
+        } else {
+            shielded
+                .plan_shield_many(&shielded_payments)
+                .map_err(WalletError::Shielded)?
+        };
+        let cross = plan.cross();
+
+        let tx_keys = TxKeypair::random(rng);
+        build_authorized(rng, &inputs, &ring_payments, fee, &tx_keys, cross, plan)
     }
 
     /// Ring inputs worth at least `needed`, with decoy rings resolved, and their

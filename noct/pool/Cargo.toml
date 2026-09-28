@@ -33,3 +33,6 @@ randomx = ["noct-node/randomx"]
 # Only the tests build templates (which need randomness); the library itself is
 # deterministic and does no key generation.
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Only to derive a real shielded address in a test, rather than assert against a
+# plausible-looking string. Same version core pins.
+orchard = "0.15.5"

@@ -20,9 +20,11 @@ use noct_core::keys::Account;
 use noct_core::tx::Payment;
 use noct_tls::Endpoint;
 use noct_wallet::client::{
-    format_noct, load_account, parse_noct, replay_cache, rpc_token_from_args, save_state, state_path, sync, BlockCache,
+    format_noct, load_account, parse_noct, replay_cache, rpc_token_from_args, save_state, state_path,
+    sync_both, BlockCache,
     NodeClient, TrustedPow,
 };
+use noct_wallet::shielded::ShieldedWallet;
 use noct_wallet::{Direction, Wallet, DEFAULT_RING_SIZE};
 use rand_core::OsRng;
 
@@ -32,6 +34,11 @@ const MAX_BODY: usize = 1 << 20;
 struct App {
     chain: Blockchain<TrustedPow>,
     wallet: Wallet,
+    /// The shielded half of the same account. Synced and saved alongside the ring
+    /// half whether or not anything asks about it: leaving it behind would leave
+    /// its commitment tree behind the chain, and then every note witness it holds
+    /// is stale and every note it owns unspendable.
+    shielded: ShieldedWallet,
     client: NodeClient,
     /// On-disk cache of validated blocks, so a restart resumes from the last
     /// synced height instead of re-downloading the whole chain.
@@ -56,7 +63,13 @@ struct App {
 /// the cache is discarded and the wallet is rebuilt from genesis so the next
 /// poll recovers.
 fn sync_app(app: &mut App) -> Result<u64, String> {
-    let height = match sync(&app.client, &mut app.chain, &mut app.wallet, Some(&app.cache)) {
+    let height = match sync_both(
+        &app.client,
+        &mut app.chain,
+        &mut app.wallet,
+        Some(&mut app.shielded),
+        Some(&app.cache),
+    ) {
         Ok(height) => height,
         Err(_) => {
             app.cache.clear();
@@ -69,13 +82,19 @@ fn sync_app(app: &mut App) -> Result<u64, String> {
             // as at startup, or funds at addresses past the lookahead window
             // vanish from the rebuilt wallet.
             app.wallet.register_issued((0..app.next_subaddress).map(|i| (0, i)));
-            sync(&app.client, &mut app.chain, &mut app.wallet, Some(&app.cache))?
+            sync_both(
+                &app.client,
+                &mut app.chain,
+                &mut app.wallet,
+                Some(&mut app.shielded),
+                Some(&app.cache),
+            )?
         }
     };
     // Keyed on the tip, not the height: a rebuild onto another branch can land
     // at the height already saved.
     if app.chain.tip_id() != app.saved_tip {
-        match save_state(&app.state_path, &app.chain, &app.wallet) {
+        match save_state(&app.state_path, &app.chain, &app.wallet, &app.shielded) {
             Ok(()) => app.saved_tip = app.chain.tip_id(),
             Err(e) => eprintln!("warning: could not save wallet state to {}: {e}", app.state_path.display()),
         }
@@ -145,9 +164,11 @@ fn main() {
     // counter alone was never enough.
     let issued: Vec<(u32, u32)> = (0..next_subaddress).map(|i| (0, i)).collect();
     let state_path = state_path(std::path::Path::new(&cache_path));
-    let (chain, wallet, cache) = replay_cache(account, network, &cache_path, &issued);
+    let (chain, wallet, shielded, cache) =
+        replay_cache(account, network, &cache_path, &issued);
 
     let app = Arc::new(Mutex::new(App {
+        shielded,
         chain,
         wallet,
         client: NodeClient::with_token(node.clone(), node_token.clone()),

@@ -57,11 +57,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use noct_core::address::{Address, Network};
+use noct_core::address::{Address, AnyAddress, Network};
 use noct_core::chain::COINBASE_MATURITY;
 use noct_core::p2p::Wire;
 use noct_core::pow::Difficulty;
-use noct_core::tx::Payment;
 use noct_core::wire;
 use noct_node::rpc::{client_ip, RateLimiter};
 use noct_node::{new_pow, pow_name, NodePow};
@@ -72,7 +71,9 @@ use noct_pool::payout::{self, FeeBps, PaymentState, PayoutLedger, FEE_BPS_MAX};
 use noct_pool::vardiff::{self, VardiffParams};
 use noct_pool::window_log::WindowLog;
 use noct_pool::{JobId, Pool, ShareOutcome, DEFAULT_WINDOW};
-use noct_wallet::client::{format_noct, load_account, load_synced_wallet, parse_noct, NodeClient};
+use noct_wallet::client::{
+    format_noct, load_account, load_synced_wallets, parse_noct, NodeClient,
+};
 use noct_wallet::DEFAULT_RING_SIZE;
 
 /// How often to ask the node for a fresh template, so miners work on the
@@ -316,6 +317,16 @@ fn main() {
     // means the two cannot disagree — there is no second value to set wrong.
     let pool_network = match Address::decode(pool_address_str.trim()) {
         Ok(a) => a.network,
+        // A shielded address is a valid Noct address and still cannot be used
+        // here, so say which of the two it is. The node's block template only
+        // knows how to build a ring coinbase, so a pool mining to a shielded
+        // address would find blocks it could not be paid for — and the operator
+        // would learn that from an empty ledger, not from this message.
+        Err(_) if noct_core::address::ShieldedAddress::decode(pool_address_str.trim()).is_ok() => {
+            fail(
+                "--address is a shielded address. The pool's own mining address must be a ring                  address for now: block templates cannot yet pay a coinbase into the shielded                  pool. Miners may still be *paid* at shielded addresses.",
+            )
+        }
         Err(_) => fail("invalid --address (must be a Noct address the pool controls)"),
     };
     let share_difficulty = flag(&args, "--share-difficulty")
@@ -612,7 +623,6 @@ fn main() {
         let node = node.clone();
         let token = token.clone();
         let limiter = Arc::clone(&limiter);
-        let vardiff_params = vardiff_params;
         let live_guard = Arc::clone(&live);
         let proxies = Arc::clone(&trusted_proxies);
         let miner_auth = Arc::clone(&miner_auth);
@@ -694,7 +704,9 @@ fn attribute_miner(
     // strand the payout at settlement time, long after the work was done.
     if let Some(addr) = explicit {
         let addr = addr.trim();
-        if !addr.is_empty() && Address::decode(addr).is_ok() {
+        // Either pool: a miner may want to be paid as a note, and a payout
+        // address is validated in one place for both kinds (`AnyAddress`).
+        if !addr.is_empty() && AnyAddress::decode(addr).is_ok() {
             return addr.to_string();
         }
     }
@@ -985,7 +997,7 @@ fn handle(
             // quietly reopen exactly what the credential closes.
             if miner_auth.is_none() {
                 if let (Some(ip), Some(addr)) = (peer, query_param(p, "address")) {
-                    if Address::decode(addr.trim()).is_ok() {
+                    if AnyAddress::decode(addr.trim()).is_ok() {
                         shared.lock().unwrap().miners.insert(ip, addr);
                     }
                 }
@@ -1388,19 +1400,24 @@ fn run_payouts(
     // its main address and pays miners out of them, and never hands out a
     // subaddress. If it ever does, they have to be recorded and passed here, or
     // the payout wallet will not see what was sent to them.
-    let (chain, wallet, _h) = match load_synced_wallet(&client, account, network, cache, &[]) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("payout skipped: wallet sync failed: {e}");
-            return;
-        }
-    };
+    // Both halves of the pool's wallet. The shielded one is needed whether or not
+    // the pool's income is shielded: a miner paid as a note is paid out of a bundle
+    // this wallet builds, and once the pool's own rewards are notes it is what
+    // holds them.
+    let (chain, wallet, pool_shielded, _h) =
+        match load_synced_wallets(&client, account, network, cache, &[]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("payout skipped: wallet sync failed: {e}");
+                return;
+            }
+        };
 
     // Resolve destinations first: a miner id that is not a valid address cannot
     // be paid, and must not consume a slot or a reservation.
     let mut resolved = Vec::new();
     for (miner, amount) in batch {
-        match Address::decode(&miner) {
+        match AnyAddress::decode(&miner) {
             Ok(destination) => resolved.push((miner, amount, destination)),
             Err(_) => eprintln!("cannot pay {miner}: not a valid address (work stays credited)"),
         }
@@ -1416,13 +1433,13 @@ fn run_payouts(
     let owed_list: Vec<(String, u64)> =
         resolved.iter().map(|(m, a, _)| (m.clone(), *a)).collect();
     let after_fee = noct_pool::payout::deduct_fee(&owed_list, fee);
-    let mut payments = Vec::new();
+    let mut payments: Vec<(AnyAddress, u64)> = Vec::new();
     let mut payees = Vec::new();
     for (miner, gross, net) in after_fee {
         let Some((_, _, destination)) = resolved.iter().find(|(m, _, _)| *m == miner) else {
             continue;
         };
-        payments.push(Payment { destination: *destination, amount: net });
+        payments.push((*destination, net));
         // The miner is settled for the full amount owed; the fee share is a cost
         // they bear, as with any withdrawal.
         payees.push((miner, gross));
@@ -1457,8 +1474,16 @@ fn run_payouts(
         return;
     }
 
-    let total_net: u64 = payments.iter().map(|p| p.amount).sum();
-    let tx = match wallet.build_transaction(&mut rand_core::OsRng, &chain, &payments, fee, DEFAULT_RING_SIZE) {
+    let total_net: u64 = payments.iter().map(|(_, amount)| *amount).sum();
+    let shielded_count = payments.iter().filter(|(d, _)| d.is_shielded()).count();
+    let tx = match wallet.build_payout(
+        &mut rand_core::OsRng,
+        &chain,
+        &pool_shielded,
+        &payments,
+        fee,
+        DEFAULT_RING_SIZE,
+    ) {
         Ok(tx) => tx,
         Err(e) => {
             // Nothing was sent — the transaction does not exist. Safe to refund.
@@ -1479,10 +1504,15 @@ fn run_payouts(
                 let _ = s.ledger.complete_payment(id, &txid, height);
             }
             eprintln!(
-                "paid {} miner(s) {} NOCT after a shared {} NOCT fee — {txid}",
+                "paid {} miner(s) {} NOCT after a shared {} NOCT fee{} — {txid}",
                 payees.len(),
                 format_noct(total_net),
-                format_noct(fee)
+                format_noct(fee),
+                if shielded_count > 0 {
+                    format!(" ({shielded_count} into the shielded pool)")
+                } else {
+                    String::new()
+                }
             );
         }
         Ok(reply) => {
@@ -1776,8 +1806,8 @@ fn add_miner(args: &[String], address: &str) {
     let path = Path::new(&path);
     // Checked here rather than at the next startup: an address that does not
     // decode would take work and never be payable (cf. F27).
-    if Address::decode(address.trim()).is_err() {
-        fail("that is not a valid Noct address");
+    if AnyAddress::decode(address.trim()).is_err() {
+        fail("that is not a valid Noct address (ring or shielded)");
     }
     let label = flag(args, "--label").unwrap_or_default();
 
@@ -1820,6 +1850,7 @@ fn add_miner(args: &[String], address: &str) {
     println!("             --token-file <file containing the token above> --worker rig-1");
     println!();
     println!("Their payout address is fixed by this registration; nothing they send can change it.");
+    println!("It may be a ring address or a shielded one — a shielded address is paid as a note.");
 }
 
 /// Every flag, grouped by what an operator is trying to do.

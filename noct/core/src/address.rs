@@ -230,6 +230,64 @@ impl ShieldedAddress {
     }
 }
 
+/// A destination in **either** pool.
+///
+/// Anything that takes an address a user typed has to cope with both kinds now,
+/// and there is exactly one right way to tell them apart, so it is written once
+/// here. A pool that validated payout addresses in five places with `Address`
+/// alone would reject every shielded miner in some of them and accept them in
+/// others, which is worse than rejecting them everywhere.
+///
+/// Decoding is unambiguous: the two encodings differ in length before they differ
+/// in tag, so neither can be read as the other (see
+/// [`ShieldedAddress`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnyAddress {
+    /// A ring-pool address: RingCT outputs, a stealth key per output.
+    Ring(Address),
+    /// A shielded-pool address: an Orchard note.
+    Shielded(ShieldedAddress),
+}
+
+impl AnyAddress {
+    /// Decode an address of either kind.
+    ///
+    /// Tried shielded-first only because its length check is the cheaper of the
+    /// two; the order cannot change the outcome, since a string that decodes as
+    /// one cannot decode as the other.
+    pub fn decode(s: &str) -> Result<Self, AddressError> {
+        match ShieldedAddress::decode(s) {
+            Ok(a) => Ok(AnyAddress::Shielded(a)),
+            // The shielded error is discarded on purpose: for a ring address it
+            // is always `Length`, which says nothing useful. What a caller wants
+            // is why the *ring* parse failed.
+            Err(_) => Address::decode(s).map(AnyAddress::Ring),
+        }
+    }
+
+    /// Which network this address is for. Both kinds carry it, so a testnet
+    /// address can never be paid on mainnet by either route.
+    pub fn network(&self) -> Network {
+        match self {
+            AnyAddress::Ring(a) => a.network,
+            AnyAddress::Shielded(a) => a.network,
+        }
+    }
+
+    /// True if this address is paid as a shielded note.
+    pub fn is_shielded(&self) -> bool {
+        matches!(self, AnyAddress::Shielded(_))
+    }
+
+    /// Re-encode. Round-trips: `decode(x.encode()) == x`.
+    pub fn encode(&self) -> String {
+        match self {
+            AnyAddress::Ring(a) => a.encode(),
+            AnyAddress::Shielded(a) => a.encode(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +321,36 @@ mod tests {
         // And the round trips are unaffected by each other's existence.
         assert_eq!(ShieldedAddress::decode(&shielded.encode()), Ok(shielded));
         assert_eq!(Address::decode(&ring.encode()), Ok(ring));
+    }
+
+    /// One decoder for both kinds, and it must agree with each specific decoder
+    /// about which is which. Everything that accepts a typed address uses this, so
+    /// a disagreement here is a payout address accepted in one place and rejected
+    /// in another.
+    #[test]
+    fn either_kind_of_address_decodes_through_one_door() {
+        let ring = sample();
+        let shielded = sample_shielded(Network::Mainnet);
+
+        assert_eq!(AnyAddress::decode(&ring.encode()), Ok(AnyAddress::Ring(ring)));
+        assert_eq!(
+            AnyAddress::decode(&shielded.encode()),
+            Ok(AnyAddress::Shielded(shielded)),
+        );
+        assert!(!AnyAddress::decode(&ring.encode()).unwrap().is_shielded());
+        assert!(AnyAddress::decode(&shielded.encode()).unwrap().is_shielded());
+
+        // Round trips, so a stored address survives being re-read.
+        for encoded in [ring.encode(), shielded.encode()] {
+            let any = AnyAddress::decode(&encoded).unwrap();
+            assert_eq!(any.encode(), encoded);
+            assert_eq!(any.network(), Network::Mainnet);
+        }
+
+        // And nonsense is still nonsense, reported as the ring failure because
+        // that is the kind a user is most likely to have meant.
+        assert!(AnyAddress::decode("not an address").is_err());
+        assert!(AnyAddress::decode("").is_err());
     }
 
     /// The networks are separate too, so a testnet address cannot be paid on

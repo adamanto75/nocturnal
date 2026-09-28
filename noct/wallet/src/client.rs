@@ -18,6 +18,7 @@ use noct_core::tx::Transaction;
 use noct_core::wire;
 use noct_tls::Endpoint;
 
+use crate::shielded::{ShieldedKeys, ShieldedWallet};
 use crate::Wallet;
 
 /// Proof-of-work stand-in for the wallet's local validation chain: it accepts
@@ -324,6 +325,23 @@ pub fn sync<P: ProofOfWork>(
     wallet: &mut Wallet,
     cache: Option<&BlockCache>,
 ) -> Result<u64, String> {
+    sync_both(client, chain, wallet, None, cache)
+}
+
+/// As [`sync`], and also scan the wallet's **shielded** half.
+///
+/// The two are synced together rather than one after the other, because the
+/// shielded side needs the chain's shielded state from *both sides of each block*
+/// — the earlier one decides what order notes take in the commitment tree, the
+/// later one is what its own tree is checked against. A second pass over the
+/// blocks could not supply the earlier one without rewinding the chain.
+pub fn sync_both<P: ProofOfWork>(
+    client: &NodeClient,
+    chain: &mut Blockchain<P>,
+    wallet: &mut Wallet,
+    mut shielded: Option<&mut ShieldedWallet>,
+    cache: Option<&BlockCache>,
+) -> Result<u64, String> {
     let target = client.height()?;
     // A node shorter than us is not a node with nothing to send: it is a node
     // that no longer has the chain we scanned. The loop below only ever moves
@@ -342,13 +360,22 @@ pub fn sync<P: ProofOfWork>(
     if wallet.scanned_outputs() == 0 {
         wallet.scan_block(&Block::genesis_for(wallet.address().network.params()), &[]);
     }
+    let maturity = noct_core::chain::OutputSet::coinbase_maturity(&*chain);
     while chain.height() < target {
         let h = chain.height();
         let (block, txs) = client.block(h)?;
+        // Captured before the chain moves on: it is what fixes the order this
+        // block's notes take in the commitment tree.
+        let before = chain.shielded().clone();
         chain
             .add_block(&mut rng, &block, &txs)
             .map_err(|e| format!("block {h} failed validation: {e:?}"))?;
         wallet.scan_block(&block, &txs);
+        if let Some(shielded) = shielded.as_deref_mut() {
+            shielded
+                .scan_block(&block, &txs, &before, chain.shielded(), maturity)
+                .map_err(|e| format!("block {h}: {e}"))?;
+        }
         if let Some(cache) = cache {
             cache.append(&block, &txs).map_err(|e| format!("writing block cache: {e}"))?;
         }
@@ -372,22 +399,28 @@ fn load_state(
     account: Account,
     network: Network,
     issued: &[(u32, u32)],
-) -> Option<(Blockchain<TrustedPow>, Wallet)> {
+) -> Option<(Blockchain<TrustedPow>, Wallet, ShieldedWallet)> {
     let bytes = std::fs::read(path).ok()?;
-    let (chain, wallet) = crate::state::decode(TrustedPow, account, network, &bytes, issued).ok()?;
+    let (chain, wallet, shielded) =
+        crate::state::decode(TrustedPow, account, network, &bytes, issued).ok()?;
     // Every chain built here runs at the consensus maturity. A state saying
     // otherwise was not written by this build, and a chain at a lower maturity
     // would let the wallet pick coinbase outputs the network refuses to spend.
     (noct_core::chain::OutputSet::coinbase_maturity(&chain) == noct_core::chain::COINBASE_MATURITY)
-        .then_some((chain, wallet))
+        .then_some((chain, wallet, shielded))
 }
 
 /// Persist `chain` and `wallet` to `path`, owner-only and replaced atomically.
 ///
 /// The file reveals what the wallet owns but holds nothing that can spend it;
 /// see [`crate::state`].
-pub fn save_state(path: &std::path::Path, chain: &Blockchain<TrustedPow>, wallet: &Wallet) -> std::io::Result<()> {
-    crate::secure_file::replace_private(path, &crate::state::encode(chain, wallet))
+pub fn save_state(
+    path: &std::path::Path,
+    chain: &Blockchain<TrustedPow>,
+    wallet: &Wallet,
+    shielded: &ShieldedWallet,
+) -> std::io::Result<()> {
+    crate::secure_file::replace_private(path, &crate::state::encode(chain, wallet, shielded))
 }
 
 /// Build a fully-synced wallet + validation chain, resuming from what earlier
@@ -410,6 +443,24 @@ pub fn load_synced_wallet(
     cache_path: impl Into<PathBuf>,
     issued: &[(u32, u32)],
 ) -> Result<(Blockchain<TrustedPow>, Wallet, u64), String> {
+    let (chain, wallet, _shielded, height) =
+        load_synced_wallets(client, account, network, cache_path, issued)?;
+    Ok((chain, wallet, height))
+}
+
+/// As [`load_synced_wallet`], and also returns the wallet's **shielded** half.
+///
+/// Both halves are always synced — the shielded one is not optional work that can
+/// be skipped, because skipping it would leave the commitment tree behind the
+/// chain and every note witness stale. This exists only so callers that have no
+/// use for it need not mention it.
+pub fn load_synced_wallets(
+    client: &NodeClient,
+    account: Account,
+    network: Network,
+    cache_path: impl Into<PathBuf>,
+    issued: &[(u32, u32)],
+) -> Result<(Blockchain<TrustedPow>, Wallet, ShieldedWallet, u64), String> {
     let cache_path = cache_path.into();
     let state_file = state_path(&cache_path);
     let cache = BlockCache::new(cache_path);
@@ -429,7 +480,7 @@ pub fn load_synced_wallet(
         },
     };
     // Saving only ever speeds up the next run, so failing to is not fatal.
-    if let Err(e) = save_state(&state_file, &result.0, &result.1) {
+    if let Err(e) = save_state(&state_file, &result.0, &result.1, &result.2) {
         eprintln!("warning: could not save wallet state to {}: {e}", state_file.display());
     }
     Ok(result)
@@ -449,10 +500,11 @@ fn resume_from_state(
     network: Network,
     state_file: &std::path::Path,
     issued: &[(u32, u32)],
-) -> Option<(Blockchain<TrustedPow>, Wallet, u64)> {
-    let (mut chain, mut wallet) = load_state(state_file, account, network, issued)?;
-    let height = sync(client, &mut chain, &mut wallet, None).ok()?;
-    Some((chain, wallet, height))
+) -> Option<(Blockchain<TrustedPow>, Wallet, ShieldedWallet, u64)> {
+    let (mut chain, mut wallet, mut shielded) =
+        load_state(state_file, account, network, issued)?;
+    let height = sync_both(client, &mut chain, &mut wallet, Some(&mut shielded), None).ok()?;
+    Some((chain, wallet, shielded, height))
 }
 
 /// Build a wallet + validation chain from the on-disk cache **alone**, without
@@ -466,32 +518,59 @@ pub fn replay_cache(
     network: Network,
     cache_path: impl Into<PathBuf>,
     issued: &[(u32, u32)],
-) -> (Blockchain<TrustedPow>, Wallet, BlockCache) {
+) -> (Blockchain<TrustedPow>, Wallet, ShieldedWallet, BlockCache) {
     let cache_path = cache_path.into();
     // The saved state, when there is a good one, makes replaying unnecessary.
-    if let Some((chain, wallet)) = load_state(&state_path(&cache_path), account, network, issued) {
-        return (chain, wallet, BlockCache::new(cache_path));
+    if let Some((chain, wallet, shielded)) =
+        load_state(&state_path(&cache_path), account, network, issued)
+    {
+        return (chain, wallet, shielded, BlockCache::new(cache_path));
     }
     let cache = BlockCache::new(cache_path);
-    let genesis = |chain: &mut Blockchain<TrustedPow>, wallet: &mut Wallet| {
+    // A fresh shielded half is always valid: it has seen nothing, which is exactly
+    // what a chain at genesis has put in it. The `expect` cannot fire for an
+    // account that exists — deriving its Orchard key is the same derivation the
+    // account itself came through.
+    let fresh_shielded = || {
+        ShieldedWallet::new(
+            ShieldedKeys::for_account(&account, network)
+                .expect("an account's Orchard keys derive from the same secret"),
+        )
+    };
+    let genesis = |chain: &mut Blockchain<TrustedPow>,
+                   wallet: &mut Wallet,
+                   shielded: &mut ShieldedWallet| {
         *chain = Blockchain::for_network(network, TrustedPow);
         *wallet = Wallet::new(account, network);
+        *shielded = fresh_shielded();
         wallet.register_issued(issued.iter().copied());
         wallet.scan_block(&Block::genesis_for(network.params()), &[]);
     };
     let mut chain = Blockchain::for_network(network, TrustedPow);
     let mut wallet = Wallet::new(account, network);
+    let mut shielded = fresh_shielded();
     let mut rng = rand_core::OsRng;
+    let maturity = noct_core::chain::OutputSet::coinbase_maturity(&chain);
     wallet.scan_block(&Block::genesis_for(network.params()), &[]);
     for (block, txs) in cache.load_clean() {
+        let before = chain.shielded().clone();
         if chain.add_block(&mut rng, &block, &txs).is_err() {
             cache.clear();
-            genesis(&mut chain, &mut wallet);
+            genesis(&mut chain, &mut wallet, &mut shielded);
             break;
         }
         wallet.scan_block(&block, &txs);
+        // A shielded scan that disagrees with the chain is the same class of
+        // problem as a block that failed to apply, and takes the same remedy:
+        // throw the cache away and start over rather than carry on with a tree
+        // that has drifted.
+        if shielded.scan_block(&block, &txs, &before, chain.shielded(), maturity).is_err() {
+            cache.clear();
+            genesis(&mut chain, &mut wallet, &mut shielded);
+            break;
+        }
     }
-    (chain, wallet, cache)
+    (chain, wallet, shielded, cache)
 }
 
 fn build_synced(
@@ -501,9 +580,13 @@ fn build_synced(
     cache: &BlockCache,
     use_cache: bool,
     issued: &[(u32, u32)],
-) -> Result<(Blockchain<TrustedPow>, Wallet, u64), String> {
+) -> Result<(Blockchain<TrustedPow>, Wallet, ShieldedWallet, u64), String> {
     let mut chain = Blockchain::for_network(network, TrustedPow);
     let mut wallet = Wallet::new(account, network);
+    let mut shielded = ShieldedWallet::new(
+        ShieldedKeys::for_account(&account, network)
+            .map_err(|e| format!("cannot derive the wallet's shielded keys: {e}"))?,
+    );
     // Before anything is scanned: a subaddress outside the lookahead window is
     // only known to whatever issued it, and a scan without its keys registered
     // silently reports no funds.
@@ -512,17 +595,22 @@ fn build_synced(
     // Genesis first, so global-index assignment lines up before any cached or
     // downloaded block is scanned.
     wallet.scan_block(&Block::genesis_for(network.params()), &[]);
+    let maturity = noct_core::chain::OutputSet::coinbase_maturity(&chain);
     if use_cache {
         for (block, txs) in cache.load_clean() {
             let h = chain.height();
+            let before = chain.shielded().clone();
             chain
                 .add_block(&mut rng, &block, &txs)
                 .map_err(|e| format!("cached block {h} failed validation: {e:?}"))?;
             wallet.scan_block(&block, &txs);
+            shielded
+                .scan_block(&block, &txs, &before, chain.shielded(), maturity)
+                .map_err(|e| format!("cached block {h}: {e}"))?;
         }
     }
-    let height = sync(client, &mut chain, &mut wallet, Some(cache))?;
-    Ok((chain, wallet, height))
+    let height = sync_both(client, &mut chain, &mut wallet, Some(&mut shielded), Some(cache))?;
+    Ok((chain, wallet, shielded, height))
 }
 
 /// Parse a decimal NOCT amount ("1.5") into atomic units.

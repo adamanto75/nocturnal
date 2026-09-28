@@ -1065,6 +1065,7 @@ dependencies = [
  "noct-node",
  "noct-tls",
  "noct-wallet",
+ "orchard",
  "rand_core",
 ]
 

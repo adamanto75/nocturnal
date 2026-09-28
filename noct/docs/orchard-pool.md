@@ -458,6 +458,52 @@ The pool mines into an Orchard address, so its rewards are shielded notes and
 - The existing ledger invariants (`owed + non-lost payments == credited_total`)
   are unaffected: they are bookkeeping, not chain state.
 
+**Built, from the payout side.** A miner's payout address may now be **either
+kind**, and one transaction pays a mixed batch. That is the half that matters to a
+miner, and it works with the pool's income as it is today — ring coinbases — so it
+did not have to wait for the pool to mine into an Orchard address.
+
+*One decoder, one decision.* `AnyAddress::decode` accepts either kind and lives in
+core, because the pool validated payout addresses in five places and five copies of
+that decision would reject shielded miners in some of them and accept them in
+others — which is worse than rejecting them everywhere.
+
+*Fund each side from its own pool, and cross only the shortfall.* A crossing
+publishes its amount, so it happens when it must and not out of habit. Shielded
+payees are paid from the pool's own notes when the notes cover them, and then
+**nothing crosses at all** — the transaction is two independent halves sharing a
+fee. Otherwise they are paid by crossing in, and the total entering the pool is
+public. An all-ring batch is still byte-for-byte the version 1 transaction the pool
+has always built: no bundle, no proof, nothing to pay for.
+
+*Both halves of the pool's wallet are synced and saved together.* The state file
+(`wallet::state`, now version 3) carries the shielded half, because rescanning for
+it would mean trial-decrypting every action in the chain on every payout run. They
+sync in one pass over the blocks rather than two, since the shielded side needs the
+chain's shielded state from *both sides of each block* and a second pass could not
+supply the earlier one without rewinding.
+
+**What the pool cannot do yet, and why.** Its income is still a ring coinbase: the
+node's template builder only knows how to make one, so §10's opening sentence — "the
+pool mines into an Orchard address" — is not true yet. Making it true means the
+template proving a coinbase bundle on the block-production path, cached per template
+so a miner polling `/getblocktemplate` does not pay for a proof per poll. That is
+miner-side work, and it is what remains of §10.
+
+Two consequences worth recording, both found by building this rather than by
+reasoning about it:
+
+- **Paying a ring address needs at least one ring input**, even when the money comes
+  out of the shielded pool. The ring outputs' masks have to cancel against a
+  pseudo-out, and a wallet with no ring outputs has nothing to supply one. So a pool
+  that pays ring addresses has to keep some ring value, and a purely shielded pool
+  could not unshield at all.
+- **A shielded wallet cannot join the commitment tree in the middle.** A note's
+  position is its index among every note the chain has ever made, so scanning has to
+  start at genesis — the same rule the ring side has for global output indices. It
+  is now its own error (`BehindTheChain`) rather than being reported as a diverged
+  tree, because it is a different mistake with a different remedy.
+
 ---
 
 ## 11. Privacy costs, stated plainly

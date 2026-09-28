@@ -10,7 +10,7 @@
 //! of it, so `scan_block` checks its own tree against the chain's root at every
 //! step. A position that drifted by one would fail at the block that drifted it.
 
-use noct_core::address::{Address, Network};
+use noct_core::address::{Address, AnyAddress, Network};
 use noct_core::block::{Block, BlockHeader, Coinbase};
 use noct_core::chain::Blockchain;
 use noct_core::emission::base_reward;
@@ -461,4 +461,160 @@ fn saving_the_same_wallet_twice_gives_the_same_bytes() {
     }
     assert_eq!(sh.notes().len(), 2);
     assert_eq!(sh.to_bytes(), sh.to_bytes());
+}
+
+/// **A pool payout: some miners paid as ring outputs, some as notes, in one
+/// transaction.** This is what the shielded pool is for from a miner's side —
+/// choosing to be paid privately — and it has to work in the same batch as
+/// everyone else, or a pool would need one transaction per pool and pay two fees.
+#[test]
+fn one_transaction_pays_both_kinds_of_address() {
+    let mut f = Fixture::new();
+    let pool_account = Account::random(&mut OsRng);
+    let mut pool = Wallet::new(pool_account, Network::Mainnet);
+    pool.scan_block(&Block::genesis(), &[]);
+    let pool_addr = pool.address();
+    // The pool's own shielded half. It holds nothing here — the pool's income is
+    // a ring coinbase — so every shielded payment has to cross in.
+    let mut pool_sh = shielded_wallet(20);
+    // The note payees, created before any note exists and scanned from here on —
+    // a wallet cannot join the commitment tree in the middle.
+    let mut note_miner_a = shielded_wallet(21);
+    let mut note_miner_b = shielded_wallet(22);
+    let ring_miner_a = Account::random(&mut OsRng);
+    let ring_miner_b = Account::random(&mut OsRng);
+
+    f.mine(
+        &pool_addr,
+        &[],
+        &mut [&mut pool],
+        &mut [&mut pool_sh, &mut note_miner_a, &mut note_miner_b],
+    );
+    f.warm_up(20, &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner_a, &mut note_miner_b]);
+    assert_eq!(pool_sh.spendable_value(), 0, "no notes, so the payment must cross in");
+    let destinations = vec![
+        (AnyAddress::Ring(address(&ring_miner_a)), 11_000u64),
+        (AnyAddress::Shielded(note_miner_a.address()), 12_000),
+        (AnyAddress::Ring(address(&ring_miner_b)), 13_000),
+        (AnyAddress::Shielded(note_miner_b.address()), 14_000),
+    ];
+    let fee = 100;
+    let tx = pool
+        .build_payout(&mut OsRng, &f.chain, &pool_sh, &destinations, fee, DEFAULT_RING_SIZE)
+        .expect("a mixed payout builds");
+
+    assert_eq!(tx.cross, 12_000 + 14_000, "only the shielded side's total crosses");
+    assert!(tx.shielded.is_some());
+    f.chain.validate_tx(&mut OsRng, &tx).expect("the chain accepts it");
+
+    let miner = address(&Account::random(&mut OsRng));
+    let mut miner_a_ring = Wallet::new(ring_miner_a, Network::Mainnet);
+    let mut miner_b_ring = Wallet::new(ring_miner_b, Network::Mainnet);
+    miner_a_ring.scan_block(&Block::genesis(), &[]);
+    miner_b_ring.scan_block(&Block::genesis(), &[]);
+    // These two only start scanning here, so they see the payment but not the
+    // history before it — which is all a payee needs.
+    f.mine(
+        &miner,
+        &[tx],
+        &mut [&mut pool],
+        &mut [&mut pool_sh, &mut note_miner_a, &mut note_miner_b],
+    );
+    f.warm_up(1, &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner_a, &mut note_miner_b]);
+
+    assert_eq!(note_miner_a.balance(), 12_000, "paid as a note");
+    assert_eq!(note_miner_b.balance(), 14_000, "and so was the other one");
+    assert_eq!(
+        f.chain.shielded().totals().shielded(),
+        12_000 + 14_000,
+        "the turnstile saw exactly the crossing the transaction declared"
+    );
+}
+
+/// An all-ring batch must still be the transaction the pool has always built: a
+/// version 1 one, with no bundle and nothing crossing. A pool that grew a
+/// shielded bundle on every payout would be paying for proofs nobody asked for.
+#[test]
+fn an_all_ring_payout_is_still_a_version_one_transaction() {
+    let mut f = Fixture::new();
+    let pool_account = Account::random(&mut OsRng);
+    let mut pool = Wallet::new(pool_account, Network::Mainnet);
+    pool.scan_block(&Block::genesis(), &[]);
+    let pool_addr = pool.address();
+    let mut pool_sh = shielded_wallet(23);
+
+    f.mine(&pool_addr, &[], &mut [&mut pool], &mut [&mut pool_sh]);
+    f.warm_up(20, &mut [&mut pool], &mut [&mut pool_sh]);
+
+    let miner_account = Account::random(&mut OsRng);
+    let destinations = vec![(AnyAddress::Ring(address(&miner_account)), 5_000u64)];
+    let tx = pool
+        .build_payout(&mut OsRng, &f.chain, &pool_sh, &destinations, 100, DEFAULT_RING_SIZE)
+        .expect("builds");
+
+    assert_eq!(tx.version, noct_core::tx::TX_VERSION);
+    assert_eq!(tx.cross, 0);
+    assert!(tx.shielded.is_none());
+    assert!(tx.range_proof.is_some());
+    f.chain.validate_tx(&mut OsRng, &tx).expect("the chain accepts it");
+}
+
+/// Once the pool holds notes, a shielded payout spends them and **nothing
+/// crosses**: no public amount at all beyond the fee. That is the behaviour the
+/// pool gets for free the day its own rewards are notes.
+#[test]
+fn a_pool_holding_notes_pays_shielded_miners_without_crossing() {
+    let mut f = Fixture::new();
+    let pool_account = Account::random(&mut OsRng);
+    let mut pool = Wallet::new(pool_account, Network::Mainnet);
+    pool.scan_block(&Block::genesis(), &[]);
+    let pool_addr = pool.address();
+    let mut pool_sh = shielded_wallet(24);
+    // Created before the chain holds any note, and scanned from here on. A note's
+    // position is its index among every note the chain ever made, so a wallet
+    // cannot join in the middle — the same rule the ring side has for global
+    // output indices.
+    let mut note_miner = shielded_wallet(25);
+
+    f.mine(&pool_addr, &[], &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner]);
+    f.warm_up(20, &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner]);
+
+    // Give the pool a note to pay out of, by shielding to itself.
+    let shield = pool
+        .build_shielding(
+            &mut OsRng,
+            &f.chain,
+            &pool_sh,
+            &pool_sh.address(),
+            60_000,
+            100,
+            DEFAULT_RING_SIZE,
+            true,
+        )
+        .expect("builds");
+    let miner = address(&Account::random(&mut OsRng));
+    f.mine(&miner, &[shield], &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner]);
+    f.warm_up(1, &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner]);
+    assert_eq!(pool_sh.spendable_value(), 60_000);
+
+    let destinations = vec![(AnyAddress::Shielded(note_miner.address()), 20_000u64)];
+    let tx = pool
+        .build_payout(&mut OsRng, &f.chain, &pool_sh, &destinations, 100, DEFAULT_RING_SIZE)
+        .expect("builds");
+
+    assert_eq!(tx.cross, 0, "the notes covered it, so nothing crossed");
+    assert!(tx.shielded.is_some());
+    f.chain.validate_tx(&mut OsRng, &tx).expect("the chain accepts it");
+
+    let pool_shielded_before = f.chain.shielded().totals().shielded();
+    f.mine(&miner, &[tx], &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner]);
+    f.warm_up(1, &mut [&mut pool], &mut [&mut pool_sh, &mut note_miner]);
+
+    assert_eq!(note_miner.balance(), 20_000, "the miner was paid a note");
+    assert_eq!(pool_sh.balance(), 40_000, "and the pool kept its change as a note");
+    assert_eq!(
+        f.chain.shielded().totals().shielded(),
+        pool_shielded_before,
+        "the pool's total did not move: nothing entered or left it"
+    );
 }

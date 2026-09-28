@@ -35,6 +35,20 @@
 //! The chain state itself is not re-validated. It was validated block by
 //! block when it was built, and a file is trusted as far as the key file
 //! beside it: whoever can write one can replace the other.
+//!
+//! **The shielded half** goes in whole, as [`crate::shielded`] writes it, and is
+//! checked by that module's own loader rather than here. Two reasons it is not
+//! interleaved with the records above. What is safe to write down is decided by
+//! different reasoning — an Orchard note plaintext reveals value and recipient but
+//! cannot spend, and its nullifiers are recomputed on load rather than stored. And
+//! the checks that matter are different: not "does this output re-derive" but
+//! "does this tree have the chain's root, and does each unspent note's witness
+//! still give a path to that note under an anchor the chain accepts".
+//!
+//! It is saved rather than rescanned because rescanning means trial-decrypting
+//! every action in the chain, which is the cost this whole module exists to avoid
+//! — and for a mining pool that pays out on a timer, it would be paid on every
+//! payout run.
 
 use noct_core::address::Network;
 use noct_core::block::{recover_coinbase_output, Block, CoinbaseOutput};
@@ -45,12 +59,14 @@ use noct_core::pow::ProofOfWork;
 use noct_core::subaddress::{self, SubaddressIndex};
 use noct_core::tx::{recover_output, Output};
 
+use crate::shielded::{ShieldedKeys, ShieldedWallet};
 use crate::{Direction, HistoryEntry, OutputSource, OwnedOutput, Wallet};
 
 const MAGIC: &[u8; 8] = b"NOCTWLST";
 /// Bumped whenever the layout changes. An older file is refused and rebuilt
-/// rather than misread. Version 2 added the trailing checksum.
-const STATE_VERSION: u8 = 2;
+/// rather than misread. Version 2 added the trailing checksum; version 3 added
+/// the wallet's shielded half.
+const STATE_VERSION: u8 = 3;
 /// Trailing Keccak-256 over everything before it.
 const CHECKSUM: usize = 32;
 
@@ -95,7 +111,11 @@ fn account_tag(account: &Account) -> [u8; 32] {
 ///
 /// The two must be in step: every block `chain` accepted, `wallet` scanned.
 /// [`decode`] checks that, so a mismatched pair is refused rather than loaded.
-pub fn encode<P: ProofOfWork>(chain: &Blockchain<P>, wallet: &Wallet) -> Vec<u8> {
+pub fn encode<P: ProofOfWork>(
+    chain: &Blockchain<P>,
+    wallet: &Wallet,
+    shielded: &ShieldedWallet,
+) -> Vec<u8> {
     let chain_bytes = chain.snapshot().encode();
     let mut o = Vec::with_capacity(
         8 + 1
@@ -142,6 +162,13 @@ pub fn encode<P: ProofOfWork>(chain: &Blockchain<P>, wallet: &Wallet) -> Vec<u8>
         o.push(u8::from(h.coinbase));
     }
 
+    // The shielded half, as its own module writes it. It goes in whole rather
+    // than being interleaved, because what is safe to write down there is decided
+    // by different reasoning — see `crate::shielded`.
+    let shielded_bytes = shielded.to_bytes();
+    o.extend_from_slice(&(shielded_bytes.len() as u64).to_le_bytes());
+    o.extend_from_slice(&shielded_bytes);
+
     o.extend_from_slice(&(chain_bytes.len() as u64).to_le_bytes());
     o.extend_from_slice(&chain_bytes);
     let sum = keccak256(&o);
@@ -163,7 +190,7 @@ pub fn decode<P: ProofOfWork>(
     network: Network,
     bytes: &[u8],
     issued: &[(u32, u32)],
-) -> Result<(Blockchain<P>, Wallet), StateError> {
+) -> Result<(Blockchain<P>, Wallet, ShieldedWallet), StateError> {
     use StateError::Malformed;
 
     let body_len = bytes.len().checked_sub(CHECKSUM).ok_or(Malformed)?;
@@ -182,6 +209,8 @@ pub fn decode<P: ProofOfWork>(
     let next_global_index = read_u64(&mut c)?;
     let owned_bytes = take_records(&mut c, OWNED_RECORD)?;
     let history_bytes = take_records(&mut c, HISTORY_RECORD)?;
+    let shielded_len = usize::try_from(read_u64(&mut c)?).map_err(|_| Malformed)?;
+    let shielded_bytes = take(&mut c, shielded_len)?.to_vec();
     let chain_len = usize::try_from(read_u64(&mut c)?).map_err(|_| Malformed)?;
     let chain_bytes = take(&mut c, chain_len)?;
     // Trailing bytes mean this is not the file we think it is.
@@ -232,7 +261,16 @@ pub fn decode<P: ProofOfWork>(
             coinbase,
         });
     }
-    Ok((chain, wallet))
+    // The shielded half is checked against the chain by its own loader: same
+    // root, same leaf count, and every unspent note's witness must give a path to
+    // that note under an anchor the chain still accepts. Its failures are folded
+    // into `Malformed` here, because the remedy is the same one this whole module
+    // offers — refuse and let the caller rescan.
+    let keys = ShieldedKeys::for_account(&account, network).map_err(|_| Malformed)?;
+    let shielded = ShieldedWallet::from_bytes(keys, &shielded_bytes, chain.shielded())
+        .map_err(|_| Malformed)?;
+
+    Ok((chain, wallet, shielded))
 }
 
 /// Re-derive one owned output from its record, checking it against `chain`.
@@ -467,8 +505,20 @@ mod tests {
         s
     }
 
-    fn restore(s: &Scenario, bytes: &[u8]) -> Result<(Blockchain<KeccakPow>, Wallet), StateError> {
+    fn restore(
+        s: &Scenario,
+        bytes: &[u8],
+    ) -> Result<(Blockchain<KeccakPow>, Wallet, ShieldedWallet), StateError> {
         decode(KeccakPow, s.alice_account, Network::Mainnet, bytes, &[s.far])
+    }
+
+    /// The shielded half of the scenario's account. These tests mine no shielded
+    /// activity, so it has seen nothing — which is exactly what a replay of this
+    /// chain produces, and therefore what a restore has to match.
+    fn shielded_of(s: &Scenario) -> ShieldedWallet {
+        ShieldedWallet::new(
+            ShieldedKeys::for_account(&s.alice_account, Network::Mainnet).expect("derives"),
+        )
     }
 
     /// Everything a replay would produce, field by field. The secrets and key
@@ -496,12 +546,12 @@ mod tests {
     #[test]
     fn a_restored_wallet_is_the_wallet_a_replay_builds() {
         let s = scenario();
-        let bytes = encode(&s.chain, &s.alice);
-        let (chain, wallet) = restore(&s, &bytes).expect("restores");
+        let bytes = encode(&s.chain, &s.alice, &shielded_of(&s));
+        let (chain, wallet, shielded) = restore(&s, &bytes).expect("restores");
         assert_same_wallet(&wallet, &s.alice);
         assert_eq!(chain.snapshot(), s.chain.snapshot());
         // And it survives being saved again unchanged.
-        assert_eq!(encode(&chain, &wallet), bytes);
+        assert_eq!(encode(&chain, &wallet, &shielded), bytes);
     }
 
     /// Restoring is only useful if the pair carries on working: the chain
@@ -510,7 +560,8 @@ mod tests {
     #[test]
     fn a_restored_wallet_keeps_scanning_and_can_spend() {
         let mut s = scenario();
-        let (mut chain, mut wallet) = restore(&s, &encode(&s.chain, &s.alice)).expect("restores");
+        let (mut chain, mut wallet, _shielded) =
+            restore(&s, &encode(&s.chain, &s.alice, &shielded_of(&s))).expect("restores");
 
         let alice_main = s.alice.address();
         s.ts += 130;
@@ -535,8 +586,9 @@ mod tests {
     #[test]
     fn a_paid_subaddress_is_remembered_without_the_issued_list() {
         let s = scenario();
-        let bytes = encode(&s.chain, &s.alice);
-        let (_, wallet) = decode(KeccakPow, s.alice_account, Network::Mainnet, &bytes, &[]).expect("restores");
+        let bytes = encode(&s.chain, &s.alice, &shielded_of(&s));
+        let (_, wallet, _) =
+            decode(KeccakPow, s.alice_account, Network::Mainnet, &bytes, &[]).expect("restores");
         assert_same_wallet(&wallet, &s.alice);
         let far = SubaddressIndex::new(s.far.0, s.far.1);
         let d = subaddress::spend_public(&s.alice_account, far);
@@ -550,7 +602,7 @@ mod tests {
     #[test]
     fn nothing_that_can_spend_is_written() {
         let s = scenario();
-        let bytes = encode(&s.chain, &s.alice);
+        let bytes = encode(&s.chain, &s.alice, &shielded_of(&s));
         let contains = |needle: [u8; 32]| bytes.windows(32).any(|w| w == needle);
 
         assert!(!contains(s.alice_account.spend_secret.to_bytes()), "account spend secret");
@@ -573,7 +625,7 @@ mod tests {
     #[test]
     fn a_tampered_record_is_refused() {
         let s = scenario();
-        let good = encode(&s.chain, &s.alice);
+        let good = encode(&s.chain, &s.alice, &shielded_of(&s));
         let tx_rec = record_of(&s, |o| matches!(o.source, OutputSource::Transaction { .. }));
         let cb_rec = record_of(&s, |o| matches!(o.source, OutputSource::Coinbase { .. }));
         let refused = |edit: &dyn Fn(&mut Vec<u8>)| {
@@ -605,7 +657,7 @@ mod tests {
     #[test]
     fn a_state_for_someone_else_is_refused() {
         let s = scenario();
-        let bytes = encode(&s.chain, &s.alice);
+        let bytes = encode(&s.chain, &s.alice, &shielded_of(&s));
         let other = Account::random(&mut OsRng);
         assert_eq!(
             decode(KeccakPow, other, Network::Mainnet, &bytes, &[]).err(),
@@ -622,7 +674,7 @@ mod tests {
     #[test]
     fn a_wallet_out_of_step_with_its_chain_is_refused() {
         let s = scenario();
-        let mut bytes = encode(&s.chain, &s.alice);
+        let mut bytes = encode(&s.chain, &s.alice, &shielded_of(&s));
         let counter = 8 + 1 + 32;
         let n = le_u64(&bytes[counter..counter + 8]) + 1;
         bytes[counter..counter + 8].copy_from_slice(&n.to_le_bytes());
@@ -636,7 +688,7 @@ mod tests {
     #[test]
     fn accidental_damage_anywhere_is_refused() {
         let s = scenario();
-        let good = encode(&s.chain, &s.alice);
+        let good = encode(&s.chain, &s.alice, &shielded_of(&s));
         for at in [0, OWNED_AT + 3, good.len() / 2, good.len() - CHECKSUM - 1, good.len() - 1] {
             let mut bad = good.clone();
             bad[at] ^= 0x10;
@@ -647,7 +699,7 @@ mod tests {
     #[test]
     fn a_damaged_state_is_refused_rather_than_misread() {
         let s = scenario();
-        let good = encode(&s.chain, &s.alice);
+        let good = encode(&s.chain, &s.alice, &shielded_of(&s));
 
         assert_eq!(restore(&s, &[]).err(), Some(StateError::Malformed), "empty");
         assert_eq!(restore(&s, &good[..good.len() - 1]).err(), Some(StateError::Malformed), "truncated");

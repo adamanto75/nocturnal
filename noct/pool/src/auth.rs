@@ -41,7 +41,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use noct_core::address::Address;
+use noct_core::address::AnyAddress;
 
 /// Longest credentials file we will read. A credential list is small; anything
 /// larger is a wrong path or a mistake, and reading it into memory unbounded
@@ -110,7 +110,7 @@ impl MinerAuth {
             // An address that does not decode would take work and never be
             // payable — the same defect as F27, and here it is catchable at
             // startup instead of at settlement.
-            if Address::decode(payout).is_err() {
+            if AnyAddress::decode(payout).is_err() {
                 return Err(at("payout address does not decode"));
             }
             // Two miners sharing a token cannot be told apart, and revoking one
@@ -239,6 +239,31 @@ mod tests {
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(body.as_bytes()).unwrap();
         p
+    }
+
+    /// A shielded payout address must register like any other. A miner who wants
+    /// to be paid as a note is the whole point of the second pool existing, and a
+    /// credentials file that refused one would shut them out before they mined a
+    /// share.
+    #[test]
+    fn a_shielded_payout_address_registers() {
+        // Derived from a fixed seed, so this is a real address rather than a
+        // plausible-looking string: the check it has to pass is a real decode.
+        let shielded = noct_core::address::ShieldedAddress::new(
+            noct_core::address::Network::Mainnet,
+            orchard::keys::FullViewingKey::from(
+                &orchard::keys::SpendingKey::from_bytes([3u8; 32]).unwrap(),
+            )
+            .address_at(0u32, orchard::keys::Scope::External),
+        )
+        .encode();
+
+        let t = new_token();
+        let p = write_file("shielded", &format!("{t} {shielded} note-rig
+"));
+        let auth = MinerAuth::load(&p).unwrap();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth.lookup(&t).map(|m| m.payout.as_str()), Some(shielded.as_str()));
     }
 
     #[test]

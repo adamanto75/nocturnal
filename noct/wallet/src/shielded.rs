@@ -100,10 +100,20 @@ pub enum ShieldedWalletError {
     /// A note's witness has no path. Only possible for a witness that was never
     /// fed the leaf it witnesses, which this module does not construct.
     NoPath { position: u64 },
-    /// The wallet's tree has drifted from the chain's: its root is not the
-    /// chain's root. Every path it produced would be worthless, so it refuses to
+    /// The wallet's tree has drifted from the chain's: same number of leaves,
+    /// different root. Every path it produced would be worthless, so it refuses to
     /// produce more.
     TreeDiverged,
+    /// The wallet has taken in fewer notes than the chain holds, which means it
+    /// did not start scanning at genesis.
+    ///
+    /// A distinct error from [`Self::TreeDiverged`] because it is a distinct
+    /// mistake with a distinct remedy: nothing has drifted, the wallet simply
+    /// began in the middle. A note's position is its index among *every* note the
+    /// chain has ever created, so there is no way to join late — the wallet has to
+    /// see them all, exactly as the ring side has to see every output to know its
+    /// global indices.
+    BehindTheChain { scanned: u64, chain: u64 },
     /// A send of nothing. Refused rather than built, because a bundle with no
     /// value is a proof made and verified for no reason.
     NothingToDo,
@@ -135,6 +145,10 @@ impl std::fmt::Display for ShieldedWalletError {
             ShieldedWalletError::TreeDiverged => {
                 f.write_str("shielded: the wallet's commitment tree disagrees with the chain's")
             }
+            ShieldedWalletError::BehindTheChain { scanned, chain } => write!(
+                f,
+                "shielded: {scanned} notes scanned but the chain holds {chain};                  scanning must start at genesis"
+            ),
             ShieldedWalletError::NothingToDo => f.write_str("shielded: nothing to send"),
             ShieldedWalletError::Insufficient { have, need } => {
                 write!(f, "shielded: {have} spendable, {need} needed")
@@ -193,6 +207,21 @@ impl ShieldedKeys {
             .map_err(|_| ShieldedWalletError::BadSeed)?;
         let fvk = FullViewingKey::from(&spending);
         Ok(ShieldedKeys { spending, fvk, network })
+    }
+
+    /// The Orchard keys belonging to the same [`Account`] as a wallet's ring keys.
+    ///
+    /// The point of this existing at all: an account **is** its spend secret, and
+    /// both pools' keys come from it. A caller that had to remember to pass the
+    /// right 32 bytes could pass the wrong ones and get a wallet that quietly
+    /// scans for somebody else's notes.
+    ///
+    /// [`Account`]: noct_core::keys::Account
+    pub fn for_account(
+        account: &noct_core::keys::Account,
+        network: Network,
+    ) -> Result<Self, ShieldedWalletError> {
+        Self::from_spend_secret(&account.spend_secret.to_bytes(), 0, network)
     }
 
     /// The spending key. Held in memory only, never written down by this crate.
@@ -337,6 +366,16 @@ impl ShieldedWallet {
         self.unspent().map(|n| n.value()).sum()
     }
 
+    /// Value of notes that can actually be spent right now: unspent, in the tree,
+    /// and with a live witness.
+    ///
+    /// Not the same as [`Self::balance`], and the difference matters to a caller
+    /// deciding whether to cross value in: a note with no witness is money the
+    /// wallet can see and cannot move.
+    pub fn spendable_value(&self) -> u64 {
+        self.spendable().iter().map(|n| n.value()).sum()
+    }
+
     /// Value the wallet has found but which is not yet in the tree, so not yet
     /// spendable — a shielded block reward waiting out its maturity.
     ///
@@ -419,7 +458,17 @@ impl ShieldedWallet {
             }
         }
 
-        if self.root() != after.root() || self.leaves != after.notes() {
+        // Two different failures, kept apart because they mean different things.
+        // A different leaf count is a wallet that started late. The same count with
+        // a different root is a wallet that saw the same notes in another order,
+        // which is the one that would silently produce bad paths.
+        if self.leaves != after.notes() {
+            return Err(ShieldedWalletError::BehindTheChain {
+                scanned: self.leaves,
+                chain: after.notes(),
+            });
+        }
+        if self.root() != after.root() {
             return Err(ShieldedWalletError::TreeDiverged);
         }
         Ok(())
@@ -713,6 +762,59 @@ impl ShieldedWallet {
             anchor: Anchor::empty_tree(),
             cross: i64::try_from(crossing).map_err(|_| ShieldedWalletError::AmountTooLarge)?,
         })
+    }
+
+    /// Plan a shield paying **several** recipients inside the pool at once.
+    ///
+    /// One action per recipient, one public crossing for the total. A pool paying
+    /// a batch of shielded miners builds this; splitting it into one transaction
+    /// per miner would publish one crossing each and pay a fee each.
+    pub fn plan_shield_many(
+        &self,
+        payments: &[(ShieldedAddress, u64)],
+    ) -> Result<Plan<'_>, ShieldedWalletError> {
+        let total = payments
+            .iter()
+            .try_fold(0u64, |acc, (_, a)| acc.checked_add(*a))
+            .ok_or(ShieldedWalletError::AmountTooLarge)?;
+        if total == 0 {
+            return Err(ShieldedWalletError::NothingToDo);
+        }
+        Ok(Plan {
+            keys: &self.keys,
+            spends: Vec::new(),
+            outputs: payments.iter().map(|(a, v)| (a.inner(), *v)).collect(),
+            anchor: Anchor::empty_tree(),
+            cross: i64::try_from(total).map_err(|_| ShieldedWalletError::AmountTooLarge)?,
+        })
+    }
+
+    /// Plan a payout to **several** recipients inside the pool, spending this
+    /// wallet's own notes and crossing nothing.
+    ///
+    /// The fee is not paid here: this is the shielded half of a transaction whose
+    /// ring half pays it. A wallet paying purely inside the pool with no ring side
+    /// wants [`Self::plan_transfer`], which crosses the fee out.
+    pub fn plan_payout(
+        &self,
+        payments: &[(ShieldedAddress, u64)],
+        shielded: &ShieldedState,
+    ) -> Result<Plan<'_>, ShieldedWalletError> {
+        let total = payments
+            .iter()
+            .try_fold(0u64, |acc, (_, a)| acc.checked_add(*a))
+            .ok_or(ShieldedWalletError::AmountTooLarge)?;
+        if total == 0 {
+            return Err(ShieldedWalletError::NothingToDo);
+        }
+        let (spends, change) = self.select(total, shielded)?;
+        let mut outputs: Vec<(orchard::Address, u64)> =
+            payments.iter().map(|(a, v)| (a.inner(), *v)).collect();
+        if change > 0 {
+            outputs.push((self.keys.address_at(0).inner(), change));
+        }
+        let anchor = self.anchor_of(&spends)?;
+        Ok(Plan { keys: &self.keys, spends, outputs, anchor, cross: 0 })
     }
 
     /// Plan a move of `amount` **inside** the pool, to `to`, paying `fee`.
