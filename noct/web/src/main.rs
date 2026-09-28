@@ -425,7 +425,7 @@ fn shell(active: Page) -> String {
          <meta charset=\"utf-8\">
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
          <title>{title}</title>
-         <meta name=\"description\" content=\"Nocturnal (NOCT) is a Monero-style privacy coin:          confidential amounts, ring signatures, stealth addresses. Testnet only.\">
+         <meta name=\"description\" content=\"Nocturnal (NOCT) is a privacy coin with two permanent value          pools: ring signatures or zero-knowledge proofs, your choice. Confidential amounts, stealth          addresses, CPU mining. Testnet only.\">
          <link rel=\"icon\" href=\"{favicon}\" type=\"image/svg+xml\">
          <link rel=\"stylesheet\" href=\"{style}\">
          </head>

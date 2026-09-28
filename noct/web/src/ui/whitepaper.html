@@ -6,11 +6,16 @@
 <section class="reveal"><div class="wrap">
   <h2>Abstract</h2>
   <p>Nocturnal is a proof-of-work chain with confidential amounts, sender ambiguity and unlinkable
-     recipients. It deliberately contributes no new cryptography: commitments, range proofs and
-     ring signatures are taken from the <code>monero-oxide</code> crates, which implement Monero's
-     reviewed construction. The contribution is the chain around them — written to be small enough
-     that one reviewer can read all of it, with the reasoning behind each rule written down and the
-     internal security review published in full, including the parts that turned out to be wrong.</p>
+     recipients, carrying <b>two permanent value pools</b>: one using ring signatures, one using
+     zero-knowledge proofs. A user chooses which anonymity protocol to transact with; neither choice
+     is a transparent one, so privacy is not something anybody can switch off.</p>
+  <p>It deliberately contributes no new cryptography. The ring pool's commitments, range proofs and
+     ring signatures come from the <code>monero-oxide</code> crates, which implement Monero's
+     reviewed construction; the shielded pool is Zcash's <code>orchard</code> — Halo 2, with no
+     trusted setup. The contribution is the chain around them, and the boundary between them:
+     written to be small enough that one reviewer can read all of it, with the reasoning behind each
+     rule written down and the internal security review published in full, including the parts that
+     turned out to be wrong.</p>
   <p class="muted">This document describes intent and design. The normative rules live in the
      <a href="https://github.com/adamanto75/nocturnal/blob/main/noct/docs/SPECIFICATION.md">protocol
      specification</a>; where the two disagree, the specification and then the code are
@@ -65,6 +70,79 @@
 </div></section>
 
 <section class="reveal"><div class="wrap">
+  <h3>2.5 A second value pool: zero-knowledge proofs</h3>
+  <p>Everything above describes the <b>ring pool</b>, which is what the testnet runs today.
+     Nocturnal also carries a <b>shielded pool</b> built on Zcash's Orchard protocol — Halo 2, with
+     <b>no trusted setup</b> — and both pools are permanent. A transaction picks which one it spends
+     from, and value can move between them in either direction.</p>
+  <p><b>This is not optional privacy, and the distinction is the whole point.</b> Zcash offers a
+     choice between private and <em>public</em>: pick the transparent pool and a transaction's
+     sender, recipient and amount are published for ever. Nocturnal's choice is between two private
+     protocols. Nobody can opt out of privacy and nobody can leak by accident. What a user chooses
+     is which anonymity model they trust — a ring of sixteen decoys, or an anonymity set of every
+     note the chain has ever created.</p>
+  <p>The two make genuinely different bets. A ring of sixteen is cheap to verify, easy to reason
+     about, and has a bounded anonymity set that a well-funded observer can attack statistically. A
+     note-commitment tree hides a spend among everything ever created, but rests on far more
+     mathematics and costs about nine milliseconds per action to verify and hundreds of milliseconds
+     to produce. Rather than choose on a user's behalf, this chain runs both.</p>
+
+  <h3>2.6 The turnstile</h3>
+  <p>Each pool's supply is tracked as a separate public total, and neither may go below zero. Their
+     sum is the emitted supply, and that is checked on every block. The purpose is
+     <b>containment</b>: a counterfeiting flaw in one pool's cryptography cannot mint coins in the
+     other, because taking value out of a pool that does not hold it is refused by arithmetic that
+     involves no cryptography at all. A single pool holding the whole supply would have no such
+     boundary, and that is the main argument for keeping two.</p>
+  <p>A transaction states the movement as one public signed integer, from the ring pool's point of
+     view: positive means value left the ring pool for the shielded one. The bundle states the same
+     movement from its own side, and the two must agree exactly or the transaction is refused — they
+     are one movement described twice, and if they could differ the two pools would drift apart.</p>
+  <p><b>What this costs, stated rather than buried.</b> The amount moving between pools is
+     <b>public</b>, and only for those who move it. Shielding an unusual amount and later
+     unshielding the same one links the two. A payment that stays inside one pool publishes nothing
+     but its fee. The reason the crossing amount cannot be hidden is not laziness: the pools commit
+     to value in different groups — Pedersen commitments over ed25519 on one side, value commitments
+     over Pallas on the other — and a point on one curve cannot be added to a point on the other.
+     The only quantity both sides can agree on is a plain integer. Hiding it would need a
+     cross-curve equality proof in the consensus path, and this project's standing rule is that its
+     cryptography is unoriginal so it can be audited by comparison. A bespoke cross-curve proof is
+     the opposite of that.</p>
+
+  <h3>2.7 What a shielded transaction looks like</h3>
+  <p>A transaction carrying a bundle may have <b>no ring side at all</b>: no inputs, no outputs and
+     no range proof. That is what a payment inside the shielded pool is. It pays its fee by crossing
+     exactly the fee out of the pool, which the block's coinbase then collects like any other fee,
+     and the ordinary balance rule holds with nothing on either side of it. The same freedom on the
+     other half gives a full shield with no change output, so there is nothing tying the payment back
+     to the sender's ring outputs.</p>
+  <p>A bundle's zero-knowledge proof does <em>not</em> cover the value it claims to move: the value
+     balance is a public input carried beside the proof, and what ties it to the notes is the
+     <b>binding signature</b>. Verifying the proof and not that signature would let a bundle claim
+     any balance it liked — minting coins from nothing on the way into the pool and minting them in
+     the ring pool on the way out. That was a real defect in this implementation, found and fixed
+     before deployment, and it is recorded here because the shape of the mistake is instructive: the
+     expensive, impressive check was present and the cheap one that actually guards the arithmetic
+     was missing.</p>
+
+  <h3>2.8 Maturity without a spend to inspect</h3>
+  <p>A coinbase must be buried before it can be spent, and in the ring pool a validator can simply
+     ask how old the output being spent is. An Orchard spend names nothing — that is the entire
+     feature — so nobody can ask. Maturity therefore becomes a property of the <b>tree</b>: a
+     shielded coinbase note is withheld from the note-commitment tree until the chain has buried it,
+     so until then no published root contains it and no proof can be made against it. Nothing in the
+     audited circuit changes.</p>
+  <p>The consequence to accept is that the spendable supply lags the emitted supply by up to one
+     maturity window, and a wallet has to show that as pending rather than as balance. Both kinds of
+     reward become spendable on exactly the same block, which is asserted by a test that drives both
+     through real blocks rather than restating the arithmetic.</p>
+  <p><b>The miner chooses which pool its reward is created in</b>, per block, the same way it
+     already chooses an address. If every reward entered one pool, anyone who preferred the other
+     would have to cross to reach it — publishing an amount purely for choosing a mechanism. A
+     choice that is free in one direction and costs privacy in the other is not much of a choice.</p>
+</div></section>
+
+<section class="reveal"><div class="wrap">
   <h2>3. Consensus</h2>
   <p>Blocks target 120 seconds. Difficulty retargets over a windowed average with a lag, outlier
      trimming at both ends, and a per-step clamp — three independent defences, because an unbounded
@@ -75,23 +153,21 @@
      act on. That is a persistent chain split with no attacker involved. It was found and fixed
      before launch, and it is the kind of defect that only shows up when someone writes down what
      each layer actually believes.</p>
-  <p>Coinbase outputs mature for sixty blocks before they can be spent — including as ring decoys,
-     since ring signatures hide which member is real — so a short reorg cannot invalidate an
+  <p>Coinbase outputs mature for <b>one hundred blocks</b> before they can be spent — including as
+     ring decoys, since ring signatures hide which member is real — so a reorg cannot invalidate an
      already-spent fresh coinbase.</p>
-  <p><b>An earlier version of this section claimed more than that, and was wrong.</b> It said a
-     reorg <em>cannot</em> invalidate an already-spent fresh coinbase, full stop. That holds only
-     while reorgs are shallower than the maturity window, and this implementation permits deeper
-     ones: a node will consider a reorg up to <b>100</b> blocks deep, while maturity is
-     <b>60</b>. A reorg between those two numbers would invalidate a coinbase that had already
-     matured and been spent — exactly what the rule is meant to prevent.</p>
-  <p>Nothing observed has come close to that depth, and no proof-of-work chain relies on such a
-     bound in practice: Bitcoin matures coinbase for 100 blocks and Monero for 60, neither with a
-     reorg cap, both trusting hashrate to make deep reorgs impractical. But a stated guarantee
-     should either hold or not be stated. The invariant that would make it hold is that maturity
-     is at least the deepest reorg a node will accept, and closing the gap — by raising maturity,
-     or by refusing reorgs deeper than it — is a parameter decision still to be made. It is
-     recorded here rather than quietly fixed, because the gap was found by running the chain and
-     the reasoning is the point.</p>
+  <p><b>That number is one hundred for a reason, and an earlier version of this document was wrong
+     about it.</b> It said sixty, and claimed a reorg could not invalidate an already-spent fresh
+     coinbase, full stop. That holds only while reorgs are shallower than the maturity window, and a
+     node will consider a reorg up to <b>100</b> blocks deep. A reorg between sixty and a hundred
+     would have invalidated a coinbase that had already matured and been spent — exactly what the
+     rule exists to prevent.</p>
+  <p>The gap is closed: maturity is now equal to the deepest reorg a node will accept, so there is
+     one number rather than two that have to be kept in a relationship nobody is checking. The
+     anchor history the shielded pool keeps is the same hundred, for the same reason — an anchor
+     older than the deepest reorg can never be invalidated by one.</p>
+  <p>It is recorded this way rather than quietly corrected because the gap was found by running the
+     chain and writing down what each layer actually believed, and that is the part worth keeping.</p>
 </div></section>
 
 <section class="reveal"><div class="wrap">
@@ -227,6 +303,19 @@
     <li><b>Clock dependence.</b> One validity rule — the future-timestamp bound — depends on the
         validating node's wall clock rather than on chain data. This is deliberate and matches both
         Bitcoin and Monero: the alternative makes recovery from a long network outage impossible.</li>
+    <li><b>The two pools do not offer equal privacy, and will not for a while.</b> A ring of
+        sixteen is a ring of sixteen from the first block. A note-commitment tree has to grow: early
+        in a chain's life the shielded pool's anonymity set is small, and a pool holding three notes
+        hides very little however good the proof is. The zk pool's advantage over the ring pool is a
+        promise about the long run, not a property it has on day one.</li>
+    <li><b>Crossing between pools is not private about the amount.</b> Inherent to the two pools
+        committing to value in different groups, as §2.6 sets out — not an implementation shortcut,
+        and not something a later version will quietly fix.</li>
+    <li><b>The shielded pool is younger than everything else here.</b> It is written, tested and
+        adversarially probed, and it has had far less running time than the ring pool. One real
+        defect in it — a missing binding-signature check that would have allowed minting — was found
+        by review rather than by an attacker, which is the argument for review and not evidence that
+        nothing else is there.</li>
     <li><b>Decoy selection is calibrated but young.</b> Ring members are drawn from a
         gamma-shaped age distribution fitted to observed spending, so decoys look like
         real spends instead of being spread evenly over all history — uniform selection
@@ -241,10 +330,20 @@
 
 <section class="reveal"><div class="wrap">
   <h2>6. Status, and what has to happen next</h2>
-  <p>A public testnet is running. Mainnet parameters — genesis timestamp, address tags, the RandomX
-     seed schedule — are still placeholders.</p>
+  <p>A public testnet is running the ring pool. Mainnet parameters — genesis timestamp, address
+     tags, the RandomX seed schedule — are still placeholders.</p>
+  <p>The shielded pool is <b>written and not yet deployed</b>. It changes consensus from end to end
+     — a new transaction version, a second coinbase shape, a commitment tree inside the chain state
+     — so it is wholly incompatible with the chain now running and arrives with a testnet reset.
+     What that reset is waiting on is listed first below, because it is the honest answer to "when".</p>
   <ul>
-    <li>A long and genuinely adversarial testnet</li>
+    <li>A minimum-fee floor. A transaction can currently pay nothing, which mattered little when the
+        cheapest thing a verifier could be asked to do was a ring signature; an Orchard action costs
+        every node about nine milliseconds, so the floor is now a denial-of-service parameter rather
+        than a policy preference.</li>
+    <li>Moving the genesis premine into the shielded pool, which changes the chain id and so belongs
+        with the reset rather than before it.</li>
+    <li>A long and genuinely adversarial testnet — for the shielded pool, starting from zero</li>
     <li>A professional third-party audit, which has not been commissioned</li>
     <li>Reproducible builds on every platform. Linux binaries are reproducible from
         v0.1.4; Windows is not, and the release archives themselves are not yet

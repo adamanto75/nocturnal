@@ -6,9 +6,16 @@
 <section class="reveal"><div class="wrap">
   <h2>Why another privacy coin</h2>
   <p>Most chains are transparent ledgers: every amount and every counterparty is permanently
-     public. That is a poor property for money. Monero solved this well, and Nocturnal does not
-     claim to improve on its cryptography. It reuses that cryptography through the
-     <code>monero-oxide</code> crates and builds a smaller, more readable chain around it in Rust.</p>
+     public. That is a poor property for money. Monero solved it well and Zcash solved it
+     differently, and Nocturnal does not claim to improve on either one's cryptography. It reuses
+     both — the <code>monero-oxide</code> crates and Zcash's <code>orchard</code> — and builds a
+     smaller, more readable chain around them in Rust.</p>
+  <p>Carrying both is the one design decision here that is genuinely a decision. Ring signatures
+     and zero-knowledge proofs make different bets: a ring of sixteen is cheap, well understood and
+     has a bounded anonymity set, while a note-commitment tree hides a spend among everything ever
+     created but rests on a much larger pile of mathematics. Rather than pick for you, Nocturnal
+     runs both permanently, tracks each pool's supply separately so a flaw in one cannot mint coins
+     in the other, and states what moving between them costs.</p>
   <p>The goal is a codebase one reviewer can hold in their head. The consensus layer is a few
      thousand lines, each module documents the reasoning behind it, and the security review is
      published in full rather than summarised.</p>
@@ -21,11 +28,21 @@
     <li><code>monero-clsag</code> for CLSAG ring signatures and key images</li>
     <li><code>monero-bulletproofs</code> for Bulletproofs+ range proofs</li>
     <li><code>monero-primitives</code> and <code>monero-generators</code> for commitments and generators</li>
-    <li><code>curve25519-dalek</code> for the underlying group arithmetic</li>
+    <li><code>curve25519-dalek</code> for the ring pool's group arithmetic</li>
+    <li><code>orchard</code> for the shielded pool: the Halo 2 Action circuit, note encryption,
+        nullifiers and ZIP-32 key derivation</li>
+    <li><code>incrementalmerkletree</code> for the note-commitment tree, at the same version
+        <code>orchard</code> itself uses</li>
     <li>RandomX for proof of work, via the reference C++ implementation</li>
   </ul>
   <p>Hashing is original Keccak-256, not NIST SHA-3. That is the same choice Monero made, and a
      distinction that silently breaks compatibility if you get it wrong.</p>
+  <p>Two things about the shielded side are worth naming. <b>There is no trusted setup:</b> Halo 2
+     needs no ceremony whose participants have to be believed, unlike the Groth16 construction
+     Sapling uses. And the circuit is pinned to the fixed post-NU6 version — every
+     <code>orchard</code> release up to 0.13.1 is withdrawn because the original Action circuit was
+     unsound, and the wire format carries no circuit field at all, so a transaction cannot ask for
+     a different one.</p>
 </div></section>
 
 <section class="reveal"><div class="wrap">
@@ -37,6 +54,12 @@
     <li><b>Not network-level anonymity.</b> Transactions relay over Dandelion++, which frustrates
         naive origin tracing but is not Tor. Run over Tor if that is your threat model.</li>
     <li><b>Not immune to global timing analysis</b> by an observer who can watch the whole network.</li>
+    <li><b>Not equal privacy in both pools.</b> A ring of sixteen is a ring of sixteen; a
+        note-commitment tree grows. Early in a chain's life the shielded pool's anonymity set is
+        small, and a pool with three notes in it hides very little however good the proof is.</li>
+    <li><b>Not private about crossings.</b> Moving value between the pools publishes the amount.
+        That is inherent to the two pools committing to value in different groups, not an
+        implementation shortcut.</li>
   </ul>
 </div></section>
 
