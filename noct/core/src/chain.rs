@@ -2581,6 +2581,66 @@ pub(crate) mod tests {
         assert!(chain.validate_tx(&mut OsRng, &tx2).is_ok());
     }
 
+    /// **A miner really can mine into the shielded pool.** The block the node
+    /// would build is built here by the same function a node calls, mined, and
+    /// handed to `add_block` — so the proof, the sighash and the turnstile are all
+    /// checked by consensus rather than by this test restating them.
+    ///
+    /// The other tests here construct their shielded coinbases from a test helper.
+    /// This one goes through `Coinbase::create_shielded`, which is what a node and a
+    /// pool will actually use, because a shape only the tests can build is a shape
+    /// nobody can mine.
+    #[test]
+    fn a_block_whose_reward_is_a_note_is_accepted() {
+        use crate::address::{Network, ShieldedAddress};
+        let mut chain = Blockchain::with_maturity(KeccakPow, 5);
+        warm_up(&mut chain, 3, 1_000);
+
+        // A recipient derived from a fixed key, as a wallet would derive it.
+        let sk = orchard::keys::SpendingKey::from_bytes([11u8; 32]).unwrap();
+        let fvk = orchard::keys::FullViewingKey::from(&sk);
+        let miner = ShieldedAddress::new(
+            Network::Mainnet,
+            fvk.address_at(0u32, orchard::keys::Scope::External),
+        );
+
+        let height = chain.height();
+        let prev_id = chain.tip_id();
+        let subsidy = base_reward(chain.emitted());
+        let coinbase =
+            Coinbase::create_shielded(&mut OsRng, height, &prev_id, &miner, subsidy)
+                .expect("a shielded reward builds");
+        assert!(coinbase.is_shielded());
+        assert_eq!(coinbase.total(), Some(subsidy), "it is worth the subsidy");
+
+        let mut block = Block {
+            header: BlockHeader {
+                major_version: 1,
+                minor_version: 0,
+                timestamp: crate::block::GENESIS_TIMESTAMP + 1_000 + 3 * 130,
+                prev_id,
+                nonce: 0,
+            },
+            coinbase,
+            tx_hashes: Vec::new(),
+        };
+        block.mine(&KeccakPow, chain.next_difficulty());
+
+        let shielded_before = chain.shielded().totals().shielded();
+        chain.add_block(&mut OsRng, &block, &[]).expect("consensus accepts a shielded reward");
+        assert_eq!(
+            chain.shielded().totals().shielded(),
+            shielded_before + subsidy,
+            "and the subsidy was minted into the shielded pool, not the ring one"
+        );
+        assert_eq!(chain.shielded().totals().ring(), chain.emitted() - subsidy);
+
+        // Bound to its parent: the same coinbase under a different one is refused.
+        let mut elsewhere = prev_id;
+        elsewhere[0] ^= 1;
+        assert!(!block.coinbase.is_valid(subsidy, &elsewhere));
+    }
+
     /// **The two reward shapes must mature on the same block.** A ring output
     /// becomes spendable when it is `maturity` blocks deep; a shielded note has no
     /// spend that names it, so instead it is withheld from the commitment tree

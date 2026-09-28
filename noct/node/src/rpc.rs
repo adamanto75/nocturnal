@@ -20,7 +20,7 @@ use std::thread;
 use noct_tls::{Acceptor, Stream};
 use std::time::{Duration, Instant};
 
-use noct_core::address::Address;
+use noct_core::address::AnyAddress;
 use noct_core::block::Block;
 use noct_core::p2p::Wire;
 use noct_core::tx::Transaction;
@@ -513,8 +513,11 @@ fn handle_client(
         // /submitblock once it meets `difficulty`.
         ("GET", "/getblocktemplate") => {
             let address_param = query.split('&').find_map(|kv| kv.strip_prefix("address="));
+            // Either kind. A shielded address here is how a miner asks for its
+            // reward as a note, and the pool it names is the pool the coinbase
+            // mints into.
             let address = match address_param {
-                Some(a) => match Address::decode(a) {
+                Some(a) => match AnyAddress::decode(a) {
                     Ok(addr) => Some(addr),
                     Err(_) => {
                         return respond(reader.get_mut(), "400 Bad Request", "{\"error\":\"invalid address\"}")
@@ -524,9 +527,27 @@ fn handle_client(
             };
             let job = {
                 let mut node = state.lock().unwrap();
-                match &address {
-                    Some(addr) => node.build_block_template_for(&mut OsRng, addr),
-                    None => node.build_block_template(&mut OsRng),
+                let built = match &address {
+                    Some(addr) => node.try_build_block_template_for(&mut OsRng, addr),
+                    None => {
+                        let own = node.miner_address;
+                        node.try_build_block_template_for(&mut OsRng, &own)
+                    }
+                };
+                match built {
+                    Ok(job) => job,
+                    // Only a shielded reward can fail, and then serving nothing is
+                    // the right answer: falling back to a ring coinbase would pay
+                    // the miner into a pool it did not ask for, and it would find
+                    // that out from its wallet rather than from here.
+                    Err(e) => {
+                        drop(node);
+                        return respond(
+                            reader.get_mut(),
+                            "503 Service Unavailable",
+                            &format!("{{\"error\":\"{e}\"}}"),
+                        );
+                    }
                 }
             };
             let height = job.block.coinbase.height;

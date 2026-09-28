@@ -27,3 +27,8 @@ noct-randomx = { path = "../randomx", optional = true }
 [features]
 # Build the node on real RandomX instead of the Keccak placeholder.
 randomx = ["dep:noct-randomx"]
+
+[dev-dependencies]
+# Only to derive a real shielded address in a test, rather than assert against a
+# plausible-looking string. Same version core pins.
+orchard = "0.15.5"

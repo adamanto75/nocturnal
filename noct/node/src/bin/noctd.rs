@@ -8,11 +8,18 @@
 //! is given, the node mines to `miner.key` in its data directory, creating that
 //! file (owner-only) on first start. With no `--data-dir` nothing persists, so it
 //! mines to a throwaway address instead and says so.
+//!
+//! `--miner-address` takes **either kind** of address, and that choice decides
+//! which pool this node's rewards are created in: a ring address gets a ring
+//! output, a shielded one gets an Orchard note. A shielded reward costs a
+//! zero-knowledge proof, paid once per block template rather than once per nonce.
+//! The generated default is a ring address, because the key file it writes is a
+//! ring spend secret.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use noct_core::address::{Address, Network};
+use noct_core::address::{Address, AnyAddress, Network};
 use noct_core::keys::Account;
 use noct_node::{run, Config};
 use rand_core::OsRng;
@@ -41,7 +48,7 @@ fn main() {
     let mut use_default_seeds = true;
     let mut ephemeral = false;
     let mut mine = false;
-    let mut miner_address: Option<Address> = None;
+    let mut miner_address: Option<AnyAddress> = None;
     let mut rpc_token: Option<String> = None;
     let mut rpc_rate_limit: u32 = noct_node::rpc::DEFAULT_RPC_RATE;
     let mut rpc_tls_cert: Option<std::path::PathBuf> = None;
@@ -140,8 +147,11 @@ fn main() {
             "--miner-address" => {
                 i += 1;
                 let s = args.get(i).unwrap_or_else(|| fail("--miner-address needs a value"));
+                // Either kind: a shielded address means every block this node
+                // finds mints its reward as an Orchard note instead of a ring
+                // output. It costs a proof per block template, not per nonce.
                 miner_address = Some(
-                    Address::decode(s).unwrap_or_else(|_| fail("invalid --miner-address")),
+                    AnyAddress::decode(s).unwrap_or_else(|_| fail("invalid --miner-address")),
                 );
             }
             "-h" | "--help" => {
@@ -154,7 +164,12 @@ fn main() {
     }
 
     // Addresses are per-network, or the node refuses to start.
-    let miner_address = miner_address.unwrap_or_else(|| match &data_dir {
+    // The default stays a **ring** address. A generated default should be one the
+    // node can also tell the operator how to spend, and the generated key file is a
+    // ring spend secret; deriving a shielded address from it as well would be
+    // right, but printing only one of the two would be misleading about what was
+    // just created. An operator who wants notes says so with `--miner-address`.
+    let miner_address = miner_address.unwrap_or_else(|| AnyAddress::Ring(match &data_dir {
         // Whatever this node mines is spendable only with this key, so it is
         // kept in the data directory rather than printed to the log.
         Some(dir) => {
@@ -182,7 +197,7 @@ fn main() {
             eprintln!("  anything mined to it CANNOT be spent later — pass --miner-address to keep it");
             address
         }
-    });
+    }));
 
     // Fold in the baked-in seed nodes (unless opted out), resolving any hostnames.
     if use_default_seeds {
@@ -279,8 +294,12 @@ fn parse_addr(args: &[String], i: usize, flag: &str) -> SocketAddr {
 
 fn print_help() {
     eprintln!(
-        "noctd [--network mainnet|testnet] [--p2p ADDR] [--rpc ADDR] [--peer ADDR]... [--seed ADDR]... [--no-default-seeds] [--ephemeral] [--max-outbound N] [--mine] [--mine-threads N] [--mine-interval-ms N] [--miner-address B58] [--data-dir DIR] [--rpc-token TOKEN | --rpc-token-file PATH] [--rpc-rate-limit N] [--rpc-tls-cert PATH --rpc-tls-key PATH]"
+        "noctd [--network mainnet|testnet] [--p2p ADDR] [--rpc ADDR] [--peer ADDR]... [--seed ADDR]... [--no-default-seeds] [--ephemeral] [--max-outbound N] [--mine] [--mine-threads N] [--mine-interval-ms N] [--miner-address ADDR] [--data-dir DIR] [--rpc-token TOKEN | --rpc-token-file PATH] [--rpc-rate-limit N] [--rpc-tls-cert PATH --rpc-tls-key PATH]"
     );
+    eprintln!();
+    eprintln!("--miner-address takes a ring address or a shielded one. That choice decides which");
+    eprintln!("pool this node's rewards are created in; a shielded reward is an Orchard note and");
+    eprintln!("costs a proof per block template. The generated default is a ring address.");
 }
 
 fn fail(msg: &str) -> ! {

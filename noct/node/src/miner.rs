@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn parallel_grind_solves_a_block_and_counts_hashes() {
-        let mut node = NodeState::new(miner_address());
+        let mut node = NodeState::new(noct_core::address::AnyAddress::Ring(miner_address()));
         let job = node.build_block_template(&mut OsRng);
         let pow = node.pow();
         let control = MiningControl::new(true, 4);
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn grind_stops_when_mining_is_switched_off() {
-        let mut node = NodeState::new(miner_address());
+        let mut node = NodeState::new(noct_core::address::AnyAddress::Ring(miner_address()));
         let job = node.build_block_template(&mut OsRng);
         let pow = node.pow();
         // Inactive control: every worker breaks immediately, so no block is found.

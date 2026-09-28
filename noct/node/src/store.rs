@@ -261,7 +261,7 @@ mod tests {
     // Mine `n` blocks on a fresh node, returning them.
     pub(super) fn mined(n: usize) -> Vec<(Block, Vec<Transaction>)> {
         let w = Wallet::random(&mut OsRng, Network::Mainnet);
-        let mut node = NodeState::new(w.address());
+        let mut node = NodeState::new(noct_core::address::AnyAddress::Ring(w.address()));
         (0..n).map(|_| node.mine_block(&mut OsRng).unwrap()).collect()
     }
 

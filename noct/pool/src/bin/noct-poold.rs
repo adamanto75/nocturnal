@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use noct_core::address::{Address, AnyAddress, Network};
+use noct_core::address::{AnyAddress, Network};
 use noct_core::chain::COINBASE_MATURITY;
 use noct_core::p2p::Wire;
 use noct_core::pow::Difficulty;
@@ -315,18 +315,14 @@ fn main() {
     // so the chain the pool is working on is by definition the one this address
     // belongs to. Taking the network from here rather than from a separate flag
     // means the two cannot disagree — there is no second value to set wrong.
-    let pool_network = match Address::decode(pool_address_str.trim()) {
-        Ok(a) => a.network,
-        // A shielded address is a valid Noct address and still cannot be used
-        // here, so say which of the two it is. The node's block template only
-        // knows how to build a ring coinbase, so a pool mining to a shielded
-        // address would find blocks it could not be paid for — and the operator
-        // would learn that from an empty ledger, not from this message.
-        Err(_) if noct_core::address::ShieldedAddress::decode(pool_address_str.trim()).is_ok() => {
-            fail(
-                "--address is a shielded address. The pool's own mining address must be a ring                  address for now: block templates cannot yet pay a coinbase into the shielded                  pool. Miners may still be *paid* at shielded addresses.",
-            )
-        }
+    // Either kind. A shielded address here means the pool's own rewards are notes,
+    // and then paying a shielded miner crosses nothing at all — the payout spends
+    // notes and creates notes. Paying a *ring* miner from a shielded-only pool is
+    // the case that does not work, because an unshield needs a ring input for its
+    // outputs' masks to cancel against, so a pool that does both should keep some
+    // ring income.
+    let pool_network = match AnyAddress::decode(pool_address_str.trim()) {
+        Ok(a) => a.network(),
         Err(_) => fail("invalid --address (must be a Noct address the pool controls)"),
     };
     let share_difficulty = flag(&args, "--share-difficulty")
@@ -2162,12 +2158,27 @@ mod attribution_tests {
     #[test]
     fn an_undecodable_address_never_becomes_a_paid_identity() {
         let from = ip(9);
-        // What the registration path now allows into the map.
-        let admit = |addr: &str| Address::decode(addr.trim()).is_ok();
+        // Exactly what the registration path allows into the map — the same
+        // function, not a copy of it, so widening one cannot quietly widen past
+        // the other.
+        let admit = |addr: &str| AnyAddress::decode(addr.trim()).is_ok();
         for junk in ["x", "", "   ", "not-an-address", &"z".repeat(95)] {
             assert!(!admit(junk), "{junk:?} must never be registered");
         }
-        assert!(admit(ALICE), "a real address must still be accepted");
+        assert!(admit(ALICE), "a real ring address must still be accepted");
+
+        // And a shielded one, which is how a miner asks to be paid a note. It was
+        // refused before this was `AnyAddress`, which would have shut every such
+        // miner out at registration.
+        let shielded = noct_core::address::ShieldedAddress::new(
+            noct_core::address::Network::Mainnet,
+            orchard::keys::FullViewingKey::from(
+                &orchard::keys::SpendingKey::from_bytes([5u8; 32]).unwrap(),
+            )
+            .address_at(0u32, orchard::keys::Scope::External),
+        )
+        .encode();
+        assert!(admit(&shielded), "a shielded payout address must be accepted");
 
         // With nothing valid ever registered, work falls back to the source IP —
         // visible to the operator in /stats, and not mistakable for a payee.
@@ -2304,15 +2315,31 @@ mod vardiff_daemon_tests {
 /// booked 53 NOCT to two miners and sent nothing.
 #[cfg(test)]
 mod payout_network_tests {
-    use noct_core::address::{Address, Network};
+    use noct_core::address::{AnyAddress, Network, ShieldedAddress};
     use noct_wallet::Wallet;
     use rand_core::OsRng;
 
     /// The property that makes the bug unrepresentable: the network is read off
     /// the pool's own payout address, so it cannot disagree with the chain whose
     /// rewards are being paid to that address.
+    ///
+    /// The same call the daemon makes, not a copy of it — the address may now be of
+    /// either kind, and a test that only knew about one would stop covering the
+    /// path it claims to pin.
     fn network_of(addr: &str) -> Network {
-        Address::decode(addr.trim()).expect("valid address").network
+        AnyAddress::decode(addr.trim()).expect("valid address").network()
+    }
+
+    /// A shielded pool address, for a pool that mines its rewards into notes.
+    fn shielded(network: Network, seed: u8) -> String {
+        ShieldedAddress::new(
+            network,
+            orchard::keys::FullViewingKey::from(
+                &orchard::keys::SpendingKey::from_bytes([seed; 32]).unwrap(),
+            )
+            .address_at(0u32, orchard::keys::Scope::External),
+        )
+        .encode()
     }
 
     #[test]
@@ -2326,6 +2353,11 @@ mod payout_network_tests {
             Network::Testnet,
             "a testnet pool must resolve to Testnet; resolving to Mainnet is the payout bug"
         );
+
+        // And for a pool whose own rewards are notes, which is the other thing
+        // `--address` may now be.
+        assert_eq!(network_of(&shielded(Network::Mainnet, 1)), Network::Mainnet);
+        assert_eq!(network_of(&shielded(Network::Testnet, 1)), Network::Testnet);
     }
 
     /// The tags stay distinguishable across many keys. If they ever collided,

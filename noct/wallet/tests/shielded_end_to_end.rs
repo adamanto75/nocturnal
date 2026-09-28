@@ -83,6 +83,47 @@ impl Fixture {
         }
     }
 
+    /// Mine one block whose **reward is a note** for `miner`, through the same
+    /// function a node's block template calls.
+    fn mine_shielded(
+        &mut self,
+        miner: &noct_core::address::ShieldedAddress,
+        txs: &[Transaction],
+        ring: &mut [&mut Wallet],
+        shielded: &mut [&mut ShieldedWallet],
+    ) {
+        let subsidy = base_reward(self.chain.emitted());
+        let fees: u64 = txs.iter().map(|t| t.fee).sum();
+        let height = self.chain.height();
+        let prev_id = self.chain.tip_id();
+        let coinbase =
+            Coinbase::create_shielded(&mut OsRng, height, &prev_id, miner, subsidy + fees)
+                .expect("a shielded reward builds");
+        let mut block = Block {
+            header: BlockHeader {
+                major_version: 1,
+                minor_version: 0,
+                timestamp: noct_core::block::GENESIS_TIMESTAMP + self.ts,
+                prev_id,
+                nonce: 0,
+            },
+            coinbase,
+            tx_hashes: txs.iter().map(|t| t.hash()).collect(),
+        };
+        block.mine(&KeccakPow, self.chain.next_difficulty());
+
+        let before: ShieldedState = self.chain.shielded().clone();
+        self.chain.add_block(&mut OsRng, &block, txs).expect("a valid shielded-reward block");
+        self.ts += 130;
+        for w in ring.iter_mut() {
+            w.scan_block(&block, txs);
+        }
+        for w in shielded.iter_mut() {
+            w.scan_block(&block, txs, &before, self.chain.shielded(), MATURITY)
+                .expect("the wallet's tree must agree with the chain's");
+        }
+    }
+
     /// Blocks paying nobody in particular, so there are decoys to sign against.
     fn warm_up(&mut self, n: usize, ring: &mut [&mut Wallet], shielded: &mut [&mut ShieldedWallet]) {
         let filler = address(&Account::random(&mut OsRng));
@@ -616,5 +657,120 @@ fn a_pool_holding_notes_pays_shielded_miners_without_crossing() {
         f.chain.shielded().totals().shielded(),
         pool_shielded_before,
         "the pool's total did not move: nothing entered or left it"
+    );
+}
+
+/// **A miner mines into the shielded pool, and can spend what it mined.** The
+/// whole loop: the reward is created as a note, withheld from the commitment tree
+/// until it matures, found by the wallet in the block that made it, and spent once
+/// an anchor contains it.
+///
+/// This is the case the delayed-insertion rule exists for, and the only one where a
+/// wallet has to hold a note it cannot yet spend. Maturity is 1 here so the test is
+/// about the mechanism rather than about waiting.
+#[test]
+fn a_reward_mined_as_a_note_is_pending_then_spendable() {
+    let mut f = Fixture::new();
+    let mut sh = shielded_wallet(30);
+    let mut payee = shielded_wallet(31);
+    let miner_addr = sh.address();
+
+    // Enough history that the chain is past genesis, with nothing shielded in it.
+    f.warm_up(3, &mut [], &mut [&mut sh, &mut payee]);
+    assert_eq!(sh.balance(), 0);
+
+    let subsidy = base_reward(f.chain.emitted());
+    f.mine_shielded(&miner_addr, &[], &mut [], &mut [&mut sh, &mut payee]);
+
+    // Found, but withheld: the note exists and no anchor can reach it, so it is
+    // pending rather than spendable. A balance that included it would be promising
+    // money that cannot move.
+    assert_eq!(sh.pending_balance(), subsidy, "the reward is found and waiting");
+    assert_eq!(sh.balance(), 0, "and is not spendable yet");
+    assert_eq!(
+        f.chain.shielded().totals().shielded(),
+        subsidy,
+        "though the supply already counts it: emitted, not yet spendable"
+    );
+    assert_eq!(payee.balance(), 0, "and nobody else sees it at all");
+
+    // Maturity 1: it enters the tree on the next block, and the block after that
+    // publishes an anchor containing it.
+    f.warm_up(2, &mut [], &mut [&mut sh, &mut payee]);
+    assert_eq!(sh.pending_balance(), 0, "no longer waiting");
+    assert_eq!(sh.balance(), subsidy, "and now spendable");
+
+    // Spend it: a payment entirely inside the pool, with no ring side at all.
+    let fee = 10;
+    let plan = sh
+        .plan_transfer(&payee.address(), subsidy - fee, fee, f.chain.shielded())
+        .expect("the mined note can be spent");
+    let tx = Transaction::build_with_shielded(
+        &mut OsRng,
+        &[],
+        &[],
+        fee,
+        &noct_core::stealth::TxKeypair::random(&mut OsRng),
+        plan.cross(),
+        Some(|sighash: &[u8; 32]| {
+            plan.authorize(sighash).map_err(|_| noct_core::tx::TxError::BundleUnavailable)
+        }),
+    )
+    .expect("builds");
+    f.chain.validate_tx(&mut OsRng, &tx).expect("the chain accepts it");
+
+    f.mine_shielded(&miner_addr, &[tx], &mut [], &mut [&mut sh, &mut payee]);
+    f.warm_up(2, &mut [], &mut [&mut sh, &mut payee]);
+
+    assert_eq!(payee.balance(), subsidy - fee, "paid out of a mined reward");
+    assert!(sh.notes().iter().any(|n| n.spent), "and the mined note is spent");
+    assert!(sh.notes().iter().any(|n| n.coinbase), "recorded as a reward");
+}
+
+/// A pool whose own rewards are notes pays shielded miners with **nothing
+/// crossing** beyond the fee. This is the design's §10 premise actually holding
+/// rather than being assumed.
+#[test]
+fn a_pool_mining_into_the_pool_pays_shielded_miners_privately() {
+    let mut f = Fixture::new();
+    let mut pool_sh = shielded_wallet(32);
+    let mut note_miner = shielded_wallet(33);
+    let pool_addr = pool_sh.address();
+
+    f.warm_up(3, &mut [], &mut [&mut pool_sh, &mut note_miner]);
+    let subsidy = base_reward(f.chain.emitted());
+    f.mine_shielded(&pool_addr, &[], &mut [], &mut [&mut pool_sh, &mut note_miner]);
+    f.warm_up(2, &mut [], &mut [&mut pool_sh, &mut note_miner]);
+    assert_eq!(pool_sh.spendable_value(), subsidy, "the pool's income is a note");
+
+    // Pay a shielded miner straight out of it. There is no ring side, so the fee
+    // crosses out of the pool: the one public number in the whole transaction.
+    let payout = subsidy / 2;
+    let fee = 10;
+    let plan = pool_sh
+        .plan_transfer(&note_miner.address(), payout, fee, f.chain.shielded())
+        .expect("plans");
+    assert_eq!(plan.cross(), -(fee as i64), "only the fee leaves the pool");
+    let tx = Transaction::build_with_shielded(
+        &mut OsRng,
+        &[],
+        &[],
+        fee,
+        &noct_core::stealth::TxKeypair::random(&mut OsRng),
+        plan.cross(),
+        Some(|sighash: &[u8; 32]| {
+            plan.authorize(sighash).map_err(|_| noct_core::tx::TxError::BundleUnavailable)
+        }),
+    )
+    .expect("builds");
+    f.chain.validate_tx(&mut OsRng, &tx).expect("accepted");
+
+    f.mine_shielded(&pool_addr, &[tx], &mut [], &mut [&mut pool_sh, &mut note_miner]);
+    f.warm_up(2, &mut [], &mut [&mut pool_sh, &mut note_miner]);
+    assert_eq!(note_miner.balance(), payout, "the miner was paid a note");
+    assert_eq!(
+        f.chain.shielded().totals().ring() + f.chain.shielded().totals().shielded(),
+        f.chain.emitted(),
+        "and the turnstile still adds up: ring + shielded == emitted"
     );
 }

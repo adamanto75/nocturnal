@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use noct_core::address::Address;
-use noct_core::block::{Block, BlockHeader, Coinbase};
+use noct_core::address::AnyAddress;
+use noct_core::block::{Block, BlockHeader, Coinbase, CoinbaseError};
 use noct_core::chain::{Blockchain, ChainError};
 use noct_core::emission::base_reward;
 use noct_core::mempool::Mempool;
@@ -154,8 +154,10 @@ pub struct Config {
     /// runner, a one-shot probe. Without it, every such node leaves a permanent
     /// dead entry in the address book of every peer it touches.
     pub ephemeral: bool,
-    /// Where coinbase rewards are paid.
-    pub miner_address: Address,
+    /// Where coinbase rewards are paid, and therefore **which pool they are
+    /// created in**: a shielded address mints every reward this node finds as an
+    /// Orchard note rather than a ring output.
+    pub miner_address: AnyAddress,
     /// Run even though this build's proof-of-work is not the one the network
     /// requires. For local development against a Keccak network only; ignored
     /// on mainnet.
@@ -218,13 +220,13 @@ pub fn run(config: Config) -> std::io::Result<()> {
     // The miner address must belong to this network, or every block mined would
     // pay an address nobody on this chain can use — and on a testnet it would
     // quietly look like a mainnet payout.
-    if config.miner_address.network != config.network {
+    if config.miner_address.network() != config.network {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "the miner address is a {:?} address, but this node is running on {:?}.\n\
                  Use an address for this network (noct-cli new --network {}).",
-                config.miner_address.network,
+                config.miner_address.network(),
                 config.network,
                 match config.network {
                     noct_core::address::Network::Mainnet => "mainnet",
@@ -536,7 +538,10 @@ pub struct Reaction {
 pub struct NodeState {
     pub chain: Blockchain<NodePow>,
     pub mempool: Mempool,
-    pub miner_address: Address,
+    /// Where this node's own mined rewards go, and therefore **which pool** they
+    /// are created in. A shielded address means every block it finds mints its
+    /// reward as a note.
+    pub miner_address: AnyAddress,
     pub fluff_probability: f64,
     pow: NodePow,
     seen_txs: BoundedSet,
@@ -582,11 +587,39 @@ pub struct NodeState {
     sync: HashMap<usize, Collect>,
     /// Live-tunable mining state, shared with the miner threads and RPC.
     mining: Arc<MiningControl>,
+    /// The last shielded coinbase built, kept so a miner polling for templates
+    /// does not pay for a proof per poll.
+    ///
+    /// **Why a cache is correct here and not merely faster.** A shielded reward
+    /// costs a zero-knowledge proof, and nothing in it depends on the nonce or the
+    /// timestamp — only on the height, the parent, the reward and the recipient.
+    /// So two requests with those four the same deserve the same coinbase, and
+    /// giving the same one back is better than giving an equivalent one: a miner
+    /// that polls again keeps the work it had in flight, because the Merkle root
+    /// it was grinding has not moved.
+    ///
+    /// It invalidates itself by key comparison rather than by time. A new block
+    /// changes the height and the parent; an accepted transaction changes the
+    /// reward. Either way the next request reproves, which is once per template
+    /// and not once per poll.
+    shielded_coinbase: Option<CachedCoinbase>,
+}
+
+/// A built shielded coinbase and the four things it is a function of.
+struct CachedCoinbase {
+    height: u64,
+    prev_id: [u8; 32],
+    reward: u64,
+    /// The recipient's raw Orchard address bytes. Compared rather than trusted:
+    /// `/getblocktemplate` takes an address per request, so two miners polling one
+    /// node must not be handed each other's reward.
+    recipient: [u8; 43],
+    coinbase: Coinbase,
 }
 
 impl NodeState {
     /// A fresh node mining to `miner_address`, on mainnet.
-    pub fn new(miner_address: Address) -> Self {
+    pub fn new(miner_address: AnyAddress) -> Self {
         Self::for_network(noct_core::address::Network::Mainnet, miner_address)
     }
 
@@ -596,7 +629,7 @@ impl NodeState {
     /// make two networks unable to merge: a peer presenting the wrong magic is
     /// dropped before anything else is read, and one presenting the right magic
     /// but a foreign genesis is dropped on the handshake.
-    pub fn for_network(network: noct_core::address::Network, miner_address: Address) -> Self {
+    pub fn for_network(network: noct_core::address::Network, miner_address: AnyAddress) -> Self {
         let pow = new_pow();
         NodeState {
             chain: Blockchain::for_network(network, pow.clone()),
@@ -613,6 +646,7 @@ impl NodeState {
             collect_attempt_best: HashMap::new(),
             store: None,
             sync: HashMap::new(),
+            shielded_coinbase: None,
             mining: MiningControl::new(false, 1),
         }
     }
@@ -1268,16 +1302,66 @@ impl NodeState {
     /// instead of the node's own. This is what the `/getblocktemplate` RPC uses
     /// so an **external** miner (or a pool) can mine to its own address against
     /// this node.
+    ///
+    /// The address decides **which pool the reward is created in**: a ring address
+    /// gets a ring output as always, a shielded one gets an Orchard note. That
+    /// costs a proof, so it is built once per template and cached — see
+    /// [`Coinbase::create_shielded`] and `shielded_coinbase`.
+    ///
+    /// A shielded reward that cannot be built is not a reason to serve no
+    /// template. It falls back to nothing being mineable rather than to a *ring*
+    /// coinbase, because silently paying a miner into the other pool would be
+    /// worse than telling it no: the miner asked for a note.
     pub fn build_block_template_for<R: rand_core::RngCore + rand_core::CryptoRng>(
         &mut self,
         rng: &mut R,
-        miner_address: &Address,
+        miner_address: &AnyAddress,
     ) -> MiningJob {
+        self.try_build_block_template_for(rng, miner_address)
+            .expect("a ring template cannot fail to build")
+    }
+
+    /// As [`Self::build_block_template_for`], reporting why a **shielded** reward
+    /// could not be built instead of panicking. A ring template never fails, so
+    /// this only ever returns `Err` for the shielded case.
+    pub fn try_build_block_template_for<R: rand_core::RngCore + rand_core::CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        miner_address: &AnyAddress,
+    ) -> Result<MiningJob, CoinbaseError> {
         let txs = self.mempool.select(MAX_BLOCK_TXS);
         let fees: u64 = txs.iter().map(|t| t.fee).sum();
         let subsidy = base_reward(self.chain.emitted());
         let reward = subsidy.saturating_add(fees);
-        let coinbase = Coinbase::create(rng, self.chain.height(), miner_address, reward);
+        let height = self.chain.height();
+        let prev_id = self.chain.tip_id();
+        let coinbase = match miner_address {
+            AnyAddress::Ring(addr) => Coinbase::create(rng, height, addr, reward),
+            AnyAddress::Shielded(addr) => {
+                let recipient = addr.inner().to_raw_address_bytes();
+                let hit = self.shielded_coinbase.as_ref().filter(|c| {
+                    c.height == height
+                        && c.prev_id == prev_id
+                        && c.reward == reward
+                        && c.recipient == recipient
+                });
+                match hit {
+                    Some(cached) => cached.coinbase.clone(),
+                    None => {
+                        let built =
+                            Coinbase::create_shielded(rng, height, &prev_id, addr, reward)?;
+                        self.shielded_coinbase = Some(CachedCoinbase {
+                            height,
+                            prev_id,
+                            reward,
+                            recipient,
+                            coinbase: built.clone(),
+                        });
+                        built
+                    }
+                }
+            }
+        };
         let timestamp = now_secs().max(self.chain.median_time_past() + 1);
         let block = Block {
             header: BlockHeader {
@@ -1290,12 +1374,12 @@ impl NodeState {
             coinbase,
             tx_hashes: txs.iter().map(|t| t.hash()).collect(),
         };
-        MiningJob {
+        Ok(MiningJob {
             block,
             txs,
             difficulty: self.chain.next_difficulty(),
             seed: self.chain.seed_for_height(self.chain.height()),
-        }
+        })
     }
 
     /// Attach a freshly-mined block, if it still builds on the current tip (the
@@ -1611,7 +1695,7 @@ mod tests {
     // freshly-mined coins without mining a full maturity window (production uses
     // `COINBASE_MATURITY`).
     pub(super) fn test_node(miner_address: noct_core::address::Address) -> NodeState {
-        let mut node = NodeState::new(miner_address);
+        let mut node = NodeState::new(AnyAddress::Ring(miner_address));
         node.chain = noct_core::chain::Blockchain::with_maturity(node.pow.clone(), 1);
         node
     }
@@ -1727,6 +1811,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A shielded address in a template.
+    ///
+    /// **The cache is the point of this test**, not the proof. A shielded reward
+    /// costs a zero-knowledge proof, and a miner polls `/getblocktemplate` on a
+    /// loop; if each poll reproved, the node would burn hundreds of milliseconds
+    /// per poll and hand back a different Merkle root each time, throwing away
+    /// whatever the miner had in flight. So two polls with nothing changed must
+    /// return the *same* coinbase, and a changed reward must not.
+    #[test]
+    fn a_shielded_template_is_proved_once_and_reused() {
+        use noct_core::address::ShieldedAddress;
+        let mut node = test_node(wallet().address());
+
+        let fvk = orchard::keys::FullViewingKey::from(
+            &orchard::keys::SpendingKey::from_bytes([13u8; 32]).unwrap(),
+        );
+        let miner = AnyAddress::Shielded(ShieldedAddress::new(
+            noct_core::address::Network::Mainnet,
+            fvk.address_at(0u32, orchard::keys::Scope::External),
+        ));
+
+        let first = node.build_block_template_for(&mut OsRng, &miner);
+        assert!(first.block.coinbase.is_shielded(), "the reward is a note");
+        let second = node.build_block_template_for(&mut OsRng, &miner);
+        assert_eq!(
+            first.block.coinbase.hash(),
+            second.block.coinbase.hash(),
+            "polling again must not reprove, and must not move the miner's Merkle root"
+        );
+
+        // A different recipient is a different reward, so it must not be served
+        // the cached one — two miners polling one node would otherwise be handed
+        // each other's money.
+        let other = AnyAddress::Shielded(ShieldedAddress::new(
+            noct_core::address::Network::Mainnet,
+            fvk.address_at(7u32, orchard::keys::Scope::External),
+        ));
+        let third = node.build_block_template_for(&mut OsRng, &other);
+        assert_ne!(first.block.coinbase.hash(), third.block.coinbase.hash());
+
+        // And it is mineable: the node accepts its own shielded template back.
+        let mut job = node.build_block_template_for(&mut OsRng, &miner);
+        let pow = node.pow();
+        pow.reseed(&job.seed);
+        job.block.mine(&pow, job.difficulty);
+        assert!(
+            node.submit_mined_block(&mut OsRng, job.block.clone(), job.txs.clone()).is_some(),
+            "a block whose reward is a note must validate like any other"
+        );
+        assert_eq!(
+            node.chain.shielded().totals().shielded(),
+            job.block.coinbase.total().unwrap(),
+            "and the reward was minted into the shielded pool"
+        );
+
+        // The tip moved, so the next template is for a new height: the cache must
+        // miss rather than serve a coinbase for the block already mined.
+        let after = node.build_block_template_for(&mut OsRng, &miner);
+        assert_ne!(after.block.coinbase.height, job.block.coinbase.height);
+        assert_ne!(after.block.coinbase.hash(), job.block.coinbase.hash());
+    }
+
     #[test]
     fn external_miner_can_mine_via_template_to_its_own_address() {
         // The node mines to its own address by default, but an external miner
@@ -1734,7 +1880,8 @@ mod tests {
         let mut node = test_node(wallet().address());
         let mut ext = wallet();
 
-        let mut job = node.build_block_template_for(&mut OsRng, &ext.address());
+        let mut job =
+            node.build_block_template_for(&mut OsRng, &AnyAddress::Ring(ext.address()));
         // Grind the nonce with a PoW keyed to the template's seed (Keccak in
         // tests — trivial). This is exactly what an external miner does.
         let pow = node.pow();

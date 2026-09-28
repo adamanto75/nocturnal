@@ -30,8 +30,32 @@ use crate::keys::{Account, PrivateKey, PublicKey};
 use crate::pow::{check_hash, Difficulty, ProofOfWork};
 use crate::ring::{KeyImage, RingMember};
 use crate::shielded::ShieldedBundle;
+use orchard::Anchor;
 use crate::stealth::{self, TxKeypair};
 use crate::tx::ReceivedOutput;
+
+/// Why a shielded coinbase could not be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoinbaseError {
+    /// The bundle builder or the prover refused. Not reachable for a well-formed
+    /// reward: the shape is fixed by [`Coinbase::create_shielded`] and the only
+    /// variable is the amount.
+    Build,
+    /// The finished bundle was refused by [`crate::shielded`], which means it was
+    /// built for a circuit this chain does not verify against.
+    Shielded(crate::shielded::ShieldedError),
+}
+
+impl std::fmt::Display for CoinbaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoinbaseError::Build => f.write_str("coinbase: the shielded reward could not be built"),
+            CoinbaseError::Shielded(e) => write!(f, "coinbase: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CoinbaseError {}
 
 /// What a shielded coinbase's bundle signs over.
 ///
@@ -110,6 +134,73 @@ impl Coinbase {
             }],
             shielded: None,
         }
+    }
+
+    /// Create a coinbase paying the whole `reward` into the **shielded** pool, as
+    /// a note for `miner`.
+    ///
+    /// This is the miner's other choice (see [`Coinbase::shielded`]). It lives here
+    /// rather than in a miner or a wallet because the shape is consensus: spends
+    /// disabled, exactly the reward as the bundle's value balance, and the sighash
+    /// of [`coinbase_sighash`]. Two implementations of that would be two block
+    /// templates, one of which the network rejects.
+    ///
+    /// **It costs a proof** — a few hundred milliseconds — so it belongs on the
+    /// path that builds a *template*, once, and not on the path that tries a nonce.
+    /// Nothing here depends on the nonce or the timestamp, which is what makes
+    /// caching it per template correct rather than merely convenient.
+    ///
+    /// `prev_id` is the parent this coinbase will sit under. It has to be, or the
+    /// bundle could be lifted into another block; see [`coinbase_sighash`].
+    pub fn create_shielded<R: rand_core::RngCore + rand_core::CryptoRng>(
+        rng: &mut R,
+        height: u64,
+        prev_id: &[u8; 32],
+        miner: &crate::address::ShieldedAddress,
+        reward: u64,
+    ) -> Result<Coinbase, CoinbaseError> {
+        use orchard::builder::{Builder, BundleType};
+        use orchard::bundle::Flags;
+        use orchard::value::NoteValue;
+
+        // `SPENDS_DISABLED` is not a precaution, it is what a coinbase *is*: there
+        // is nothing to spend, and a coinbase that could spend would be a coinbase
+        // that could take somebody else's note. `BundleType::Coinbase` refuses to
+        // build one with spends enabled, so the two agree by construction.
+        let mut builder = Builder::new(
+            BundleType::Coinbase,
+            crate::shielded::bundle_version(),
+            Flags::SPENDS_DISABLED,
+            Anchor::empty_tree(),
+        )
+        .map_err(|_| CoinbaseError::Build)?;
+        builder
+            .add_output(None, miner.inner(), NoteValue::from_raw(reward), [0u8; 512])
+            .map_err(|_| CoinbaseError::Build)?;
+
+        let sighash = coinbase_sighash(height, prev_id);
+        let bundle = builder
+            .build::<i64>(&mut *rng)
+            .map_err(|_| CoinbaseError::Build)?
+            .ok_or(CoinbaseError::Build)?
+            .0
+            .create_proof(crate::shielded::proving_key(), &mut *rng)
+            .map_err(|_| CoinbaseError::Build)?
+            // No spend authorizing key is passed: with spends disabled every spend
+            // is a dummy, and `prepare` signs those itself. The binding signature,
+            // which is the one that ties the reward to the note, is made here.
+            .apply_signatures(&mut *rng, sighash, &[])
+            .map_err(|_| CoinbaseError::Build)?;
+        let bundle = crate::shielded::ShieldedBundle::new(bundle).map_err(CoinbaseError::Shielded)?;
+
+        Ok(Coinbase {
+            height,
+            // A shielded reward pays nobody on the ring side, but the field is part
+            // of the encoding, so it carries a fresh throwaway key.
+            tx_public: TxKeypair::random(rng).public,
+            outputs: Vec::new(),
+            shielded: Some(bundle),
+        })
     }
 
     /// Total amount claimed by this coinbase, or `None` if the amounts overflow

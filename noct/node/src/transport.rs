@@ -1869,7 +1869,7 @@ mod dial_reservation_tests {
         );
         let state = Arc::new(Mutex::new(NodeState::for_network(
             noct_core::address::Network::Testnet,
-            miner,
+            noct_core::address::AnyAddress::Ring(miner),
         )));
         let peers = Peers::default();
         let result = register_connection(accepted, &state, &peers, &d, Some(addr));
@@ -2198,7 +2198,10 @@ mod adversarial_tests {
     fn victim() -> SocketAddr {
         let acct = noct_core::keys::Account::random(&mut OsRng);
         let miner = Address::new(Network::Testnet, acct.spend_public, acct.view_public);
-        let state = Arc::new(Mutex::new(NodeState::for_network(Network::Testnet, miner)));
+        let state = Arc::new(Mutex::new(NodeState::for_network(
+            Network::Testnet,
+            noct_core::address::AnyAddress::Ring(miner),
+        )));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
         let genesis = { state.lock().unwrap().chain.genesis_id() };

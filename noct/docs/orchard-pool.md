@@ -483,13 +483,6 @@ sync in one pass over the blocks rather than two, since the shielded side needs 
 chain's shielded state from *both sides of each block* and a second pass could not
 supply the earlier one without rewinding.
 
-**What the pool cannot do yet, and why.** Its income is still a ring coinbase: the
-node's template builder only knows how to make one, so §10's opening sentence — "the
-pool mines into an Orchard address" — is not true yet. Making it true means the
-template proving a coinbase bundle on the block-production path, cached per template
-so a miner polling `/getblocktemplate` does not pay for a proof per poll. That is
-miner-side work, and it is what remains of §10.
-
 Two consequences worth recording, both found by building this rather than by
 reasoning about it:
 
@@ -503,6 +496,49 @@ reasoning about it:
   start at genesis — the same rule the ring side has for global output indices. It
   is now its own error (`BehindTheChain`) rather than being reported as a diverged
   tree, because it is a different mistake with a different remedy.
+
+
+### The shielded coinbase, and where the proof goes
+
+**Built.** `--miner-address` and `/getblocktemplate?address=` both take either kind
+of address, and that choice decides which pool the reward is created in. §10's
+opening sentence is now true: a pool can mine into an Orchard address and its
+income is notes.
+
+*The shape is consensus, so it lives in core.* `Coinbase::create_shielded` is the
+only thing that builds one: spends disabled, exactly the reward as the bundle's
+value balance, and the sighash of `coinbase_sighash`. Two implementations of that
+would be two block templates, one of which the network rejects.
+
+*The proof is cached per template, and that is correctness rather than speed.* A
+shielded reward costs a zero-knowledge proof, and a miner polls
+`/getblocktemplate` on a loop. Nothing in the coinbase depends on the nonce or the
+timestamp — only on the height, the parent, the reward and the recipient — so two
+requests with those four the same get the *same* coinbase back, not an equivalent
+one. Handing back an equivalent one would move the Merkle root the miner was
+grinding and throw away whatever it had in flight. The cache invalidates by key
+comparison, not by time: a new block changes the height and the parent, an accepted
+transaction changes the reward, and either way the next request reproves. Once per
+template, not once per poll. The recipient is part of the key because the address
+arrives per request, so two miners polling one node must not be handed each other's
+reward. A test mines through this path and fails if the cache is removed.
+
+*A shielded reward that cannot be built serves no template.* It does not fall back
+to a ring coinbase: that would pay a miner into a pool it did not ask for, and it
+would find out from its wallet rather than from the RPC. `/getblocktemplate`
+answers 503 with the reason.
+
+*The generated default stays a ring address.* `noctd` writes a `miner.key` holding
+a ring spend secret, and deriving a shielded address from it as well would be
+right — but printing only one of the two would misdescribe what was just created.
+An operator who wants notes says so.
+
+**What this closes.** The loop the delayed-insertion rule exists for now runs end
+to end and is tested as one thing: a reward is created as a note, withheld from the
+commitment tree until it matures, found by the wallet in the block that made it,
+reported as *pending* rather than as balance, and spent once an anchor contains it.
+A pool mining into the pool then pays shielded miners with nothing crossing but the
+fee.
 
 ---
 
@@ -538,6 +574,19 @@ Each step ends with tests and leaves the chain in a state that still works.
 6. **`pool`**: Orchard payouts.
 7. **Adversarial pass** (§13), then a testnet reset — every node stopped before
    any node is wiped — then a release.
+
+**Status: 1–6 are done.** What is left is step 7, and it is the step that decides
+whether any of this should be deployed:
+
+- The **adversarial pass** of §13, against a running node.
+- Two things found while building and deliberately left: there is **no minimum-fee
+  floor** in the mempool (open question 1), which matters more now that a
+  zero-fee transaction can cost verifiers a proof per action; and the **premine is
+  still a ring output**, because changing genesis changes the chain id and that
+  belongs with the reset rather than before it.
+- Then the testnet reset. This is a consensus change from end to end — a new
+  transaction version, a second coinbase shape, a tree in the chain state — so
+  nothing about it is compatible with the running fleet.
 
 ---
 
