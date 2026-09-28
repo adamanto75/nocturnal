@@ -203,6 +203,25 @@ impl ShieldedState {
         self.anchors.iter().any(|a| a == anchor)
     }
 
+    /// Roots a spend may currently prove against, oldest first.
+    ///
+    /// Test-only: consensus asks [`Self::accepts_anchor`] rather than reading the
+    /// set, and a caller that could see the whole set might be tempted to reason
+    /// about its contents instead.
+    #[cfg(test)]
+    pub(crate) fn accepted_anchors_for_test(&self) -> Vec<[u8; 32]> {
+        self.anchors.clone()
+    }
+
+    /// Put `amount` into `pool` without a block having created it.
+    ///
+    /// Test-only, and the only way to set up an attack that needs a pool to already
+    /// hold something. Nothing in consensus mints except a coinbase.
+    #[cfg(test)]
+    pub(crate) fn credit_for_test(&mut self, pool: Pool, amount: u64) {
+        self.totals.mint(pool, amount).expect("a test fixture must be representable");
+    }
+
     /// Whether this nullifier has already been spent.
     pub fn is_spent(&self, nullifier: &[u8; 32]) -> bool {
         self.nullifiers.contains(nullifier)

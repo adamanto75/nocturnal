@@ -247,6 +247,16 @@ impl Coinbase {
                 self.outputs.is_empty()
                     && !bundle.spends_enabled()
                     && bundle.outputs_enabled()
+                    // **Exactly one note.** Not a tidiness rule: `credit` queues
+                    // one note and `total` counts the bundle's whole value
+                    // balance, so a two-note reward would mint the lot into the
+                    // supply and deliver only the first note into the tree — the
+                    // rest counted as emitted and spendable by nobody. Fixing it
+                    // here rather than by queueing several notes keeps the
+                    // pending queue correct by construction, and costs a miner
+                    // nothing: a coinbase's amount is public anyway, so there is
+                    // no padding to buy by splitting it.
+                    && bundle.actions() == 1
                     && bundle.cross() == Ok(allowed_reward as i64)
                     // And the bundle must actually be worth what it says. The
                     // claim above is a number beside the proof, not inside it;

@@ -233,6 +233,12 @@ impl ShieldedBundle {
         self.verify_proof()
     }
 
+    /// Which Orchard circuit this bundle was built for. Always [`CIRCUIT`] for a
+    /// bundle that exists — `new` refuses any other — which is the point.
+    pub fn circuit(&self) -> OrchardCircuitVersion {
+        self.0.bundle_version().circuit_version()
+    }
+
     /// The wrapped bundle, for code that needs the crate's own type.
     pub fn inner(&self) -> &Bundle<Authorized, i64> {
         &self.0
@@ -510,6 +516,39 @@ pub(crate) mod tests {
     /// ring pool, and a block reward minted straight into the shielded pool.
     pub(crate) fn built_bundle(value: u64, coinbase: bool) -> Bundle<Authorized, i64> {
         built_bundle_signed(value, coinbase, [0u8; 32])
+    }
+
+    /// A coinbase bundle paying `values` — one note each — signed over `sighash`.
+    ///
+    /// Exists so the adversarial tests can build the shape consensus must refuse:
+    /// a reward split across more than one note.
+    pub(crate) fn built_coinbase_notes(
+        values: &[u64],
+        sighash: [u8; 32],
+    ) -> Bundle<Authorized, i64> {
+        let mut rng = OsRng;
+        let version = BundleVersion::orchard_v2();
+        let fvk = FullViewingKey::from(&spending_key());
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        let mut builder =
+            Builder::new(BundleType::Coinbase, version, Flags::SPENDS_DISABLED, Anchor::empty_tree())
+                .expect("coinbase flags are valid");
+        for value in values {
+            builder
+                .add_output(None, recipient, NoteValue::from_raw(*value), [0u8; 512])
+                .expect("an outputs-only bundle accepts an output");
+        }
+        builder
+            .build::<i64>(&mut rng)
+            .expect("bundle builds")
+            .expect("a bundle is produced")
+            .0
+            .create_proof(proving_key(), &mut rng)
+            .expect("proving succeeds")
+            .prepare(rng, sighash)
+            .finalize()
+            .expect("binding signature")
     }
 
     /// As [`built_bundle`], but signed over a chosen sighash — what a real

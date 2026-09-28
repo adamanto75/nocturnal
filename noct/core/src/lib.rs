@@ -20,6 +20,8 @@
 //!
 //! "noct" is a placeholder name.
 
+#[cfg(test)]
+mod adversarial;
 pub mod address;
 pub mod amounts;
 pub mod block;
