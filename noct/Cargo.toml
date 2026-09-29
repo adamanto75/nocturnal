@@ -2,6 +2,29 @@
 resolver = "2"
 members = ["core", "tls", "wallet", "node", "pool", "swap", "web"]
 
+# Directories inside this one that are **not** workspace members.
+#
+# Only `fuzz`, which holds the cargo-fuzz targets: libFuzzer needs a nightly
+# toolchain while this workspace is pinned to a stable one.
+#
+# **This list used to say `["randomx", "fuzz"]` and to live under
+# `[workspace.package]`**, a few lines below, where `exclude` is a different
+# field entirely: the files left out when *packaging* a crate. It therefore
+# excluded nothing from the workspace, and `cargo fuzz` failed from any clean
+# checkout with "current package believes it's in a workspace when it's not".
+# Nobody saw it because CI died one step earlier installing the tool, so the
+# fuzz targets had never actually run.
+#
+# **`randomx` is deliberately not in this list**, though the old one named it.
+# `noct-node` path-depends on it, and a path dependency of a member is an
+# implicit member — so its tests have been running under `cargo test --workspace`
+# all along, and excluding it here would silently stop seven of them without
+# failing anything. The misplaced key was, by accident, the only thing keeping
+# them alive. If it ever does need excluding — a machine without cmake and a C++
+# toolchain cannot build it — that is a deliberate trade to make with its tests
+# in view, not a side effect of tidying a manifest.
+exclude = ["fuzz"]
+
 # The oldest toolchain this workspace builds on, which is also the one it is
 # released with (see rust-toolchain.toml). Declared so Cargo's MSRV-aware
 # resolver refuses dependency versions that need a newer rustc, instead of
@@ -12,13 +35,6 @@ members = ["core", "tls", "wallet", "node", "pool", "swap", "web"]
 # `randomx-rs` — the proof-of-work — in the same sweep.
 [workspace.package]
 rust-version = "1.85.1"
-# `randomx` builds the RandomX C++ library (needs cmake + a C++ toolchain), so it
-# is excluded from the default workspace: `cargo test` and the three binaries all
-# build in a plain shell. Build it explicitly from an MSVC/cmake environment.
-# `fuzz` holds the cargo-fuzz (libFuzzer) targets, which require a **nightly**
-# toolchain; excluded so the stable 1.82 build and `cargo test` are unaffected.
-#
 # `swap` used to be excluded too (experimental cross-group DLEQ). It is a member
 # again: nothing depends on it, so exclusion meant it was never compiled and
 # could rot unnoticed — the worse failure of the two.
-exclude = ["randomx", "fuzz"]

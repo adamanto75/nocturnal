@@ -4,9 +4,9 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-# cargo-fuzz targets. This crate is EXCLUDED from the workspace (see the root
-# Cargo.toml) because libFuzzer requires a nightly toolchain, while the project
-# itself is pinned to stable 1.82.
+# cargo-fuzz targets. This crate is excluded from the workspace by `exclude` in
+# the root Cargo.toml, because libFuzzer requires a nightly toolchain while the
+# project itself is pinned to a stable one (see rust-toolchain.toml).
 [package.metadata]
 cargo-fuzz = true
 

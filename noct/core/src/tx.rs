@@ -1287,7 +1287,7 @@ mod cross_balance_tests {
 }
 
 #[cfg(test)]
-mod shielded_tx_tests {
+pub(crate) mod shielded_tx_tests {
     use super::tests::{account, address, fabricate_input};
     use super::*;
     use crate::shielded::tests::{built_bundle, built_bundle_signed};
@@ -1298,14 +1298,14 @@ mod shielded_tx_tests {
     /// Authorize a bundle worth `value` over whatever sighash the builder hands
     /// us — what a wallet will do, and the only way to get a bundle that
     /// verifies.
-    fn authorizing(value: u64) -> impl FnOnce(&[u8; 32]) -> Result<ShieldedBundle, TxError> {
+    pub(crate) fn authorizing(value: u64) -> impl FnOnce(&[u8; 32]) -> Result<ShieldedBundle, TxError> {
         move |sighash| {
             ShieldedBundle::new(built_bundle_signed(value, false, *sighash))
                 .map_err(TxError::Shielded)
         }
     }
 
-    fn shielding_tx() -> Transaction {
+    pub(crate) fn shielding_tx() -> Transaction {
         let recipient = account();
         let payments = vec![Payment { destination: address(&recipient), amount: 30 }];
         let inputs = vec![fabricate_input(100, 4, 1)];

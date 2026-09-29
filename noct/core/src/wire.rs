@@ -877,18 +877,85 @@ mod tests {
     #[ignore = "writes a seed corpus for cargo-fuzz; run explicitly"]
     fn generate_fuzz_corpus() {
         let (tx, block) = sample_tx();
+
+        // The shielded shapes. Without these the corpus reaches none of the
+        // version 2 decode paths — no bundle, no crossing, no optional range
+        // proof, no shielded coinbase — and the fuzzer spends its whole budget
+        // mutating version 1 bytes. Seeds that cannot reach the new code are the
+        // difference between fuzzing a format and appearing to.
+        let shielding = crate::tx::shielded_tx_tests::shielding_tx();
+
+        // A transaction with no ring side at all: no inputs, no outputs, and
+        // therefore no range proof. What the corpus wants from it is that byte
+        // *shape*, so the amounts are zero — a real shielded-to-shielded payment
+        // crosses its fee out of the pool, which needs a bundle that spends a
+        // note, and the seed would encode identically either way.
+        let bare = Transaction::build_with_shielded(
+            &mut OsRng,
+            &[],
+            &[],
+            0,
+            &TxKeypair::random(&mut OsRng),
+            0,
+            Some(|sighash: &[u8; 32]| {
+                crate::shielded::ShieldedBundle::new(
+                    crate::shielded::tests::built_bundle_signed(0, false, *sighash),
+                )
+                .map_err(crate::tx::TxError::Shielded)
+            }),
+        )
+        .expect("a transaction with no ring side builds");
+        assert!(bare.range_proof.is_none(), "that is the shape this seed is for");
+
+        // A block whose reward is a note, so the coinbase's own tag and bundle
+        // are in the corpus as well as a transaction's.
+        let mut shielded_block = block.clone();
+        shielded_block.coinbase = Coinbase::create_shielded(
+            &mut OsRng,
+            block.coinbase.height,
+            &block.header.prev_id,
+            &crate::address::ShieldedAddress::new(
+                crate::address::Network::Mainnet,
+                orchard::keys::FullViewingKey::from(
+                    &orchard::keys::SpendingKey::from_bytes([42u8; 32]).unwrap(),
+                )
+                .address_at(0u32, orchard::keys::Scope::External),
+            ),
+            block.coinbase.total().expect("the sample reward fits"),
+        )
+        .expect("a shielded reward builds");
+
         let samples: Vec<(&str, Vec<u8>)> = vec![
             ("tx", encode_transaction(&tx)),
             ("block", encode_block(&block)),
+            ("tx_shielding", encode_transaction(&shielding)),
+            ("tx_no_ring_side", encode_transaction(&bare)),
+            ("block_shielded_coinbase", encode_block(&shielded_block)),
             ("msg_tx_stem", encode_message(&Wire::Tx(tx.clone(), Phase::Stem))),
             ("msg_tx_fluff", encode_message(&Wire::Tx(tx.clone(), Phase::Fluff))),
+            ("msg_tx_shielded", encode_message(&Wire::Tx(shielding.clone(), Phase::Fluff))),
             ("msg_block", encode_message(&Wire::Block(block, vec![tx]))),
+            (
+                "msg_block_shielded",
+                encode_message(&Wire::Block(shielded_block, vec![shielding, bare])),
+            ),
             ("msg_gettip", encode_message(&Wire::GetTip)),
             ("msg_getblock", encode_message(&Wire::GetBlock(1))),
             ("msg_version", encode_message(&Wire::Version(0x4E4F4354, [0u8; 32], 9333, 1))),
             ("msg_getpeers", encode_message(&Wire::GetPeers)),
             ("msg_peers", encode_message(&Wire::Peers(vec!["1.2.3.4:9333".parse().unwrap()]))),
         ];
+
+        // Every seed must decode, or it is not a seed for this format — it is a
+        // mistake that will look like a fuzzing result later.
+        for (name, bytes) in &samples {
+            assert!(
+                decode_message(bytes).is_ok()
+                    || decode_transaction(bytes).is_ok()
+                    || decode_block(bytes).is_ok(),
+                "corpus seed {name} does not decode as anything"
+            );
+        }
 
         for target in ["wire_decode", "wire_roundtrip"] {
             let dir = std::path::Path::new("../fuzz/corpus").join(target);

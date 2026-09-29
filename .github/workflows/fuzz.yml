@@ -34,7 +34,13 @@ jobs:
           set -euo pipefail
           rustup toolchain install nightly --profile minimal
           rustup component add --toolchain nightly rust-src
-          cargo install cargo-fuzz --locked
+          # `+nightly` is load-bearing. This step runs inside `noct/`, so
+          # `rust-toolchain.toml` pins it to stable, and cargo-fuzz's own
+          # dependencies need newer than that — the job failed here on every
+          # push with "rustc 1.85.1 is not supported by cargo-platform@0.3.3
+          # requires rustc 1.91", never reaching a fuzz target. Build the tool
+          # with the same toolchain that runs it.
+          cargo +nightly install cargo-fuzz --locked
 
       - name: Fuzz the wire decoders
         env:
