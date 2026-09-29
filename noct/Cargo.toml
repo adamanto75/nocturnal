@@ -38,3 +38,17 @@ rust-version = "1.85.1"
 # `swap` used to be excluded too (experimental cross-group DLEQ). It is a member
 # again: nothing depends on it, so exclusion meant it was never compiled and
 # could rot unnoticed — the worse failure of the two.
+
+# Dependencies are optimised even in debug builds, because one of them is Halo 2.
+#
+# Proving an Orchard bundle at `opt-level = 0` is not slow, it is pathological:
+# the test suite went from minutes to over forty on CI's runners, which is where
+# its timeout is, so the shielded-pool tests could not finish at all. This leaves
+# **our** crates unoptimised and keeps their debug assertions — which several
+# tests depend on — while the curve and circuit arithmetic underneath runs at
+# full speed.
+#
+# It does not touch `--release`, so released binaries and their hashes are
+# unaffected.
+[profile.dev.package."*"]
+opt-level = 3
