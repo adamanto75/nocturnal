@@ -17,18 +17,19 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.1-testnet</b> — the <b>shielded pool</b> (added in v0.3.0), plus the pool totals
-     published on <code>/info</code> so the supply invariant can be checked from outside.
-     v0.3.0 changed consensus: a node older than that cannot follow the current testnet
-     chain, so if you are running v0.2.x or earlier, update or you will simply stop
-     syncing.</p>
+  <p><b>v0.3.2-testnet</b> — <b>shielded sends from the command line</b>. The pool has been
+     live since v0.3.0; this is the release in which <code>noct-cli</code> can actually move
+     value into and out of it. Only <code>noct-cli</code> changed, so if you are already on
+     v0.3.1 your node does not need restarting. v0.3.0 changed consensus: a node older than
+     that cannot follow the current testnet chain, so if you are running v0.2.x or earlier,
+     update or you will simply stop syncing.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.1-testnet/nocturnal-v0.3.1-testnet-linux-x64.tar.gz">nocturnal-v0.3.1-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.2-testnet/nocturnal-v0.3.2-testnet-linux-x64.tar.gz">nocturnal-v0.3.2-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.1-testnet/nocturnal-v0.3.1-testnet-windows-x64.zip">nocturnal-v0.3.1-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.2-testnet/nocturnal-v0.3.2-testnet-windows-x64.zip">nocturnal-v0.3.2-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.1-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.1-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.2-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.2-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The desktop wallet installer is not part of this release.</b> The newest
@@ -44,7 +45,7 @@
 
 <section class="reveal"><div class="wrap">
   <h2>Build from source</h2>
-  <p>Rust is pinned to <b>1.82</b>. The <code>randomx</code> feature needs <code>cmake</code> and a
+  <p>Rust is pinned to <b>1.85.1</b> — the shielded pool’s <code>orchard</code> dependency requires it. The <code>randomx</code> feature needs <code>cmake</code> and a
      C++ toolchain.</p>
 <pre>git clone https://github.com/adamanto75/nocturnal
 cd nocturnal/noct
