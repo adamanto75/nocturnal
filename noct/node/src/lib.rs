@@ -719,6 +719,34 @@ impl NodeState {
         self.chain.tip_id()
     }
 
+    /// What each pool holds, and how many notes the shielded one has.
+    ///
+    /// Published because the turnstile's guarantee is only worth what somebody
+    /// can check: `ring + shielded == emitted` at every height is the whole
+    /// argument for two pools rather than one, and until this was exposed it
+    /// could not be verified by an operator, an explorer, or anyone auditing
+    /// the supply. An invariant nobody can observe is an invariant nobody will
+    /// notice breaking.
+    pub fn pool_totals(&self) -> noct_core::pools::PoolTotals {
+        self.chain.shielded().totals()
+    }
+
+    /// How many notes are in the commitment tree.
+    ///
+    /// The shielded pool's anonymity set, in one number. It is also the figure
+    /// that makes the pool's privacy claim honest early on: a pool holding three
+    /// notes hides very little, and this is how anyone sees that for themselves.
+    pub fn shielded_notes(&self) -> u64 {
+        self.chain.shielded().notes()
+    }
+
+    /// The current note-commitment tree root — the anchor a fresh spend proves
+    /// against. Two nodes that disagree here have forked the shielded pool, which
+    /// a height comparison alone would not reveal.
+    pub fn shielded_root(&self) -> [u8; 32] {
+        self.chain.shielded().root()
+    }
+
     // --- message handling (no I/O) ---------------------------------------
 
     /// Submit a locally-created transaction: validate and enter the stem phase.
@@ -1809,6 +1837,82 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The turnstile, as an operator can see it.**
+    ///
+    /// `ring + shielded == emitted` is the whole argument for carrying two pools
+    /// rather than one: a counterfeiting flaw in either pool's cryptography cannot
+    /// mint coins in the other, because the totals are checked against each other.
+    /// That guarantee is worth exactly what somebody can verify, and until these
+    /// fields existed nobody outside the process could.
+    ///
+    /// So this asserts the *relationship*, not the presence of three numbers. A
+    /// test that only checked the fields were there would pass while `/info`
+    /// reported two totals that did not add up — which is the failure worth
+    /// catching, since it means value was created or destroyed somewhere.
+    ///
+    /// Mining into both pools in turn, because a rule that holds for one kind of
+    /// reward and not the other is exactly how the two would drift apart.
+    #[test]
+    fn info_reports_pool_totals_that_add_up_to_the_emitted_supply() {
+        use noct_core::address::{AnyAddress, Network, ShieldedAddress};
+
+        let ring_miner = wallet().address();
+        let mut node = test_node(ring_miner);
+
+        let fvk = orchard::keys::FullViewingKey::from(
+            &orchard::keys::SpendingKey::from_bytes([77u8; 32]).unwrap(),
+        );
+        let shielded_miner = AnyAddress::Shielded(ShieldedAddress::new(
+            Network::Mainnet,
+            fvk.address_at(0u32, orchard::keys::Scope::External),
+        ));
+
+        // Genesis alone: the premine is a ring output, so everything emitted is on
+        // the ring side and the shielded pool is empty.
+        let t = node.pool_totals();
+        assert_eq!(t.ring(), node.emitted(), "the premine is ring value");
+        assert_eq!(t.shielded(), 0);
+        assert_eq!(t.total(), Some(node.emitted()), "ring + shielded == emitted");
+        assert_eq!(node.shielded_notes(), 0, "and no notes exist yet");
+
+        // A ring-rewarded block: the ring total grows by exactly the subsidy.
+        node.mine_block(&mut OsRng).expect("mines");
+        let t = node.pool_totals();
+        assert_eq!(t.total(), Some(node.emitted()), "still adds up after a ring reward");
+        assert_eq!(t.shielded(), 0, "a ring reward mints nothing into the shielded pool");
+
+        // A shielded-rewarded block, mined through the template a real miner uses.
+        let before_ring = node.pool_totals().ring();
+        let mut job = node.build_block_template_for(&mut OsRng, &shielded_miner);
+        let reward = job.block.coinbase.total().expect("a reward fits");
+        let pow = node.pow();
+        pow.reseed(&job.seed);
+        job.block.mine(&pow, job.difficulty);
+        assert!(
+            node.submit_mined_block(&mut OsRng, job.block, job.txs).is_some(),
+            "a block whose reward is a note must be accepted"
+        );
+
+        let t = node.pool_totals();
+        assert_eq!(
+            t.total(),
+            Some(node.emitted()),
+            "the invariant must hold across a shielded reward too"
+        );
+        assert_eq!(t.shielded(), reward, "the reward landed in the shielded pool");
+        assert_eq!(t.ring(), before_ring, "and took nothing from the ring pool");
+
+        // The note is minted but withheld from the tree until it matures, so the
+        // anonymity set has not grown yet. Reporting otherwise would overstate the
+        // pool's privacy at exactly the moment it is weakest.
+        assert_eq!(node.shielded_notes(), 0, "a fresh coinbase note is not in the tree");
+        assert_eq!(
+            node.shielded_root(),
+            noct_core::shielded_state::ShieldedState::new().root(),
+            "so the anchor is still the empty-tree root"
+        );
     }
 
     /// A shielded address in a template.

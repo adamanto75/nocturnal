@@ -379,11 +379,27 @@ fn handle_client(
         ("GET", "/info") | ("GET", "/") => {
             let peer_count = peers.count();
             let node = state.lock().unwrap();
+            let totals = node.pool_totals();
             let json = format!(
-                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
+                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"ring\":{},\"shielded\":{},\"notes\":{},\"anchor\":\"{}\",\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
                 node.height(),
                 node.num_outputs(),
                 node.emitted(),
+                // What each pool holds. `ring + shielded` must equal `emitted` at
+                // every height — that is the turnstile, and it is the reason this
+                // chain carries two pools instead of one. It was unobservable from
+                // outside until these three fields existed, so the guarantee could
+                // not be checked by an operator, the explorer, or an auditor.
+                totals.ring(),
+                totals.shielded(),
+                // The shielded pool's anonymity set, in one number. Also what keeps
+                // its privacy claim honest while the chain is young: a pool holding
+                // three notes hides very little, however good the proof is.
+                node.shielded_notes(),
+                // The current tree root. Two nodes at the same height with different
+                // anchors have forked the shielded pool, which comparing heights
+                // and tips alone would not reveal.
+                hex::encode(node.shielded_root()),
                 node.cumulative_difficulty(),
                 node.mempool_len(),
                 peer_count,
