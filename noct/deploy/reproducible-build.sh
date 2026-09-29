@@ -27,7 +27,9 @@
 # different — not wrong — binary. Match the environment below or expect a
 # mismatch that means nothing.
 #
-#   Rust      1.82.0
+#   Rust      1.85.1  (see rust-toolchain.toml; `orchard` needs it, and every
+#                     release before 0.14.0 is yanked, so there is no build of the
+#                     shielded pool on anything older)
 #   OS        Debian 12 (bookworm), x86_64
 #   Also      cmake and a C++ toolchain, for RandomX
 set -euo pipefail
@@ -38,7 +40,10 @@ BUILD_ROOT="${BUILD_ROOT:-/build}"
 
 command -v cargo >/dev/null || { echo "cargo not found"; exit 1; }
 RUSTV="$(rustc --version | cut -d' ' -f2)"
-[ "$RUSTV" = "1.82.0" ] || echo "WARNING: rustc is $RUSTV, not 1.82.0 — hashes will differ"
+# Kept in step with rust-toolchain.toml by hand: this script clones the tag and
+# builds it, so it cannot read the pin before it has the source.
+PINNED_RUST=1.85.1
+[ "$RUSTV" = "$PINNED_RUST" ] || echo "WARNING: rustc is $RUSTV, not $PINNED_RUST — hashes will differ"
 
 # A fixed build path is half the trick: nothing to remap if it never varies.
 rm -rf "$BUILD_ROOT"

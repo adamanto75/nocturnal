@@ -25,14 +25,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned, not `stable`: this project builds on 1.82 and edition 2021, and
-      # a toolchain that moves on its own turns an unrelated release into a
-      # broken build on a morning nobody changed anything.
-      - name: Install Rust 1.82
+      # Pinned, not `stable`: a toolchain that moves on its own turns an
+      # unrelated release into a broken build on a morning nobody changed
+      # anything. Keep in step with noct/rust-toolchain.toml: release binaries
+      # are reproducible, so a published hash is the toolchain's as much as the
+      # source's.
+      - name: Install Rust 1.85.1
         run: |
           set -euo pipefail
-          rustup toolchain install 1.82 --profile minimal
-          rustup default 1.82
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
           rustc --version
 
       - name: Build
@@ -56,11 +58,11 @@ jobs:
       # must not require it. Excluded also means never compiled — the same trap
       # that was called out for `swap` — and the proof-of-work lives here, so it
       # gets its own job rather than no coverage at all.
-      - name: Install Rust 1.82
+      - name: Install Rust 1.85.1
         run: |
           set -euo pipefail
-          rustup toolchain install 1.82 --profile minimal
-          rustup default 1.82
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
 
       - name: Build tools
         run: |
