@@ -15,11 +15,15 @@
 //! spend, and is re-checked against the chain on load. `FILE.cache` keeps the
 //! validated blocks as a fallback for when that state cannot be used.
 
-use noct_core::address::{Address, Network};
+use noct_core::address::{Address, AnyAddress, Network};
 use noct_core::keys::Account;
 use noct_core::tx::Payment;
 use noct_tls::Endpoint;
-use noct_wallet::client::{self, format_noct, load_synced_wallet, parse_noct, rpc_token_from_args, NodeClient};
+use noct_wallet::client::{
+    self, format_noct, load_synced_wallet, load_synced_wallets, parse_noct, rpc_token_from_args,
+    NodeClient,
+};
+use noct_wallet::shielded::ShieldedKeys;
 use noct_wallet::{mnemonic, Direction, Wallet, DEFAULT_RING_SIZE};
 use rand_core::OsRng;
 
@@ -47,6 +51,8 @@ fn main() {
         "restore" => cmd_restore(&args, &wallet_path, network),
         "seed" => cmd_seed(&wallet_path),
         "address" => println!("{}", load(&wallet_path, network).address().encode()),
+        "shielded-address" => cmd_shielded_address(&wallet_path, network),
+        "unshield" => cmd_unshield(&args, &wallet_path, &node, &token, network),
         "subaddress" => cmd_subaddress(&args, &wallet_path, network),
         "balance" => cmd_balance(&wallet_path, &node, &token, network),
         "history" => cmd_history(&wallet_path, &node, &token, network),
@@ -64,11 +70,17 @@ fn help() {
     eprintln!("  reads the 24-word phrase from stdin; --dry-run only prints the address it opens");
     eprintln!("  (--mnemonic \"word1 ... word24\" also works, but is visible in the process list)");
     eprintln!("noct-cli seed      [--wallet FILE]   # show this wallet's seed phrase");
-    eprintln!("noct-cli address   [--wallet FILE]");
+    eprintln!("noct-cli address   [--wallet FILE]                 # your RING address");
+    eprintln!("noct-cli shielded-address [--wallet FILE]           # your SHIELDED address (offline)");
     eprintln!("noct-cli subaddress --index N [--account N] [--wallet FILE]  # a fresh receiving address");
     eprintln!("noct-cli balance   [--wallet FILE] [--node HOST:PORT]");
     eprintln!("noct-cli history   [--wallet FILE] [--node HOST:PORT]");
     eprintln!("noct-cli send --to ADDR --amount NOCT [--fee NOCT] [--wallet FILE] [--node HOST:PORT]");
+    eprintln!("  --to takes EITHER kind of address. A shielded one moves the value into the");
+    eprintln!("  shielded pool, and that amount is public; a payment inside one pool is not.");
+    eprintln!("noct-cli unshield --amount NOCT [--to RING_ADDR] [--fee NOCT] [--wallet FILE]");
+    eprintln!("  moves value out of the shielded pool. The amount is public. Defaults --to your");
+    eprintln!("  own ring address.");
     eprintln!("noct-cli premine-key-image --wallet FILE   # publishable proof-of-movement value");
     eprintln!("  offline. Prints ONLY the mainnet genesis premine output's key image.");
     eprintln!("  add --node-token TOKEN or --node-token-file PATH when the node's RPC is authenticated");
@@ -166,12 +178,31 @@ fn cmd_seed(path: &str) {
 
 fn cmd_balance(path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
     let account = load_account(path);
-    let (_chain, wallet, height) =
-        load_synced_wallet(&NodeClient::with_token(node.clone(), token.clone()), account, network, cache_path(path), &load_issued(path))
-            .unwrap_or_else(|e| fail(&e));
+    let (_chain, wallet, shielded, height) = load_synced_wallets(
+        &NodeClient::with_token(node.clone(), token.clone()),
+        account,
+        network,
+        cache_path(path),
+        &load_issued(path),
+    )
+    .unwrap_or_else(|e| fail(&e));
     println!("synced to height {height}");
-    println!("balance: {} NOCT", format_noct(wallet.balance()));
-    println!("outputs: {} ({} unspent)", wallet.outputs().len(), wallet.unspent().count());
+
+    // Both pools, always, and named — a single "balance" line would have to pick
+    // one pool to mean, and whichever it picked would be wrong for somebody.
+    let ring = wallet.balance();
+    let notes = shielded.balance();
+    println!("balance: {} NOCT", format_noct(ring + notes));
+    println!("  ring pool:     {} NOCT ({} unspent outputs)", format_noct(ring), wallet.unspent().count());
+    println!("  shielded pool: {} NOCT ({} unspent notes)", format_noct(notes), shielded.unspent().count());
+
+    // Value that exists and cannot be moved yet, reported separately rather than
+    // folded in. A balance that includes a note no anchor can reach is a balance
+    // that promises money the wallet cannot spend.
+    let pending = shielded.pending_balance();
+    if pending > 0 {
+        println!("  (plus {} NOCT of shielded rewards still maturing)", format_noct(pending));
+    }
 }
 
 /// Where the CLI records the subaddresses it has handed out.
@@ -268,20 +299,51 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
         .unwrap_or_else(|| fail("invalid --amount"));
     let fee = parse_noct(&flag(args, "--fee").unwrap_or_else(|| DEFAULT_FEE_NOCT.to_string()))
         .unwrap_or_else(|| fail("invalid --fee"));
-    let destination = Address::decode(&to).unwrap_or_else(|_| fail("invalid --to address"));
+    // **Either kind of address, one verb.** Which pool a payment lands in is the
+    // recipient's choice, expressed in the address they gave you, so the sender
+    // should not have to pick a different command for it — and could not, without
+    // knowing something about the recipient that the address already says.
+    let destination = AnyAddress::decode(&to).unwrap_or_else(|_| fail("invalid --to address"));
+    if destination.network() != network {
+        fail(&format!(
+            "that is a {:?} address and this wallet is on {network:?} — refusing to send",
+            destination.network()
+        ));
+    }
 
     let account = load_account(path);
     let client = NodeClient::with_token(node.clone(), token.clone());
-    let (chain, wallet, height) =
-        load_synced_wallet(&client, account, network, cache_path(path), &load_issued(path)).unwrap_or_else(|e| fail(&e));
-    println!("synced to height {height}; balance {} NOCT", format_noct(wallet.balance()));
+    let (chain, wallet, shielded, height) =
+        load_synced_wallets(&client, account, network, cache_path(path), &load_issued(path))
+            .unwrap_or_else(|e| fail(&e));
+    println!(
+        "synced to height {height}; ring {} NOCT, shielded {} NOCT",
+        format_noct(wallet.balance()),
+        format_noct(shielded.balance())
+    );
 
-    let payments = [Payment { destination, amount }];
     let tx = wallet
-        .build_transaction(&mut OsRng, &chain, &payments, fee, DEFAULT_RING_SIZE)
+        .build_payout(&mut OsRng, &chain, &shielded, &[(destination, amount)], fee, DEFAULT_RING_SIZE)
         .unwrap_or_else(|e| fail(&format!("building transaction: {e:?}")));
+
+    // Say what this publishes before it is sent, not after. A crossing's amount
+    // is the one thing the two-pool design cannot hide, and somebody shielding an
+    // unusual number should learn that from the tool rather than from a chain
+    // analyst later.
+    if tx.cross > 0 {
+        println!(
+            "note: this moves {} NOCT into the shielded pool, and that amount is PUBLIC.",
+            format_noct(tx.cross as u64)
+        );
+    }
+
     let reply = client.submit_tx(&tx).unwrap_or_else(|e| fail(&e));
-    println!("sent {} NOCT (fee {} NOCT)", format_noct(amount), format_noct(fee));
+    println!(
+        "sent {} NOCT to the {} pool (fee {} NOCT)",
+        format_noct(amount),
+        if destination.is_shielded() { "shielded" } else { "ring" },
+        format_noct(fee)
+    );
     println!("node replied: {}", reply.trim());
 }
 
@@ -369,6 +431,58 @@ fn fail(msg: &str) -> ! {
 /// It also refuses to run on a wallet that is not the founder: an unrelated
 /// wallet would silently produce a meaningless image, which someone might then
 /// publish as a commitment it cannot honour.
+/// The wallet's shielded receiving address.
+///
+/// Offline: it is derived from the same seed as the ring address, so there is
+/// nothing to sync and no node to ask.
+fn cmd_shielded_address(path: &str, network: Network) {
+    let account = load_account(path);
+    let keys = ShieldedKeys::for_account(&account, network)
+        .unwrap_or_else(|e| fail(&format!("deriving shielded keys: {e}")));
+    println!("{}", keys.address().encode());
+}
+
+/// Move value out of the shielded pool, onto the ring side.
+///
+/// The amount is public — that is what leaving the pool costs — and it is said
+/// plainly rather than discovered afterwards.
+fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
+    let amount = parse_noct(&flag(args, "--amount").unwrap_or_else(|| fail("unshield needs --amount NOCT")))
+        .unwrap_or_else(|| fail("invalid --amount"));
+    let fee = parse_noct(&flag(args, "--fee").unwrap_or_else(|| DEFAULT_FEE_NOCT.to_string()))
+        .unwrap_or_else(|| fail("invalid --fee"));
+
+    let account = load_account(path);
+    let client = NodeClient::with_token(node.clone(), token.clone());
+    let (chain, wallet, shielded, height) =
+        load_synced_wallets(&client, account, network, cache_path(path), &load_issued(path))
+            .unwrap_or_else(|e| fail(&e));
+
+    // Default to this wallet's own ring address: unshielding to somebody else in
+    // one step is expressible, but the common case is moving your own money
+    // across, and defaulting to a stranger's address would be a poor default.
+    let destination = match flag(args, "--to") {
+        Some(to) => Address::decode(&to).unwrap_or_else(|_| {
+            fail("invalid --to address — unshielding pays a RING address, not a shielded one")
+        }),
+        None => wallet.address(),
+    };
+
+    println!(
+        "synced to height {height}; shielded {} NOCT spendable",
+        format_noct(shielded.spendable_value())
+    );
+    println!("note: unshielding {} NOCT publishes that amount.", format_noct(amount));
+
+    let payments = [Payment { destination, amount }];
+    let tx = wallet
+        .build_unshielding(&mut OsRng, &chain, &shielded, &payments, amount, fee, DEFAULT_RING_SIZE)
+        .unwrap_or_else(|e| fail(&format!("building transaction: {e:?}")));
+    let reply = client.submit_tx(&tx).unwrap_or_else(|e| fail(&e));
+    println!("unshielded {} NOCT (fee {} NOCT)", format_noct(amount), format_noct(fee));
+    println!("node replied: {}", reply.trim());
+}
+
 fn cmd_premine_key_image(wallet_path: &str) {
     use noct_core::address::{Address, Network};
     use noct_core::block::{PREMINE_AMOUNT, PREMINE_SPEND_PUBLIC, PREMINE_VIEW_PUBLIC};
