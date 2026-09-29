@@ -1537,74 +1537,127 @@ mod slow_peer_tests {
         (peer, PeerLink::spawn(node_side).unwrap())
     }
 
-    /// The largest message the decoder accepts, so a few hundred of them
-    /// exceed any socket buffer and the silent peer really does stop absorbing
-    /// writes. It has to stay decodable: the live peer asserts on the content.
+    /// A peer that **drains** — the only thing that distinguishes it from the
+    /// silent one, and the thing this test used to get wrong.
+    ///
+    /// Returns a channel carrying every message it decodes, a handle yielding the
+    /// total it received before the connection closed, and the node-side link.
+    ///
+    /// The reader is a thread rather than reads on the test thread because a peer
+    /// that only reads when the test gets round to it is not a live peer. That is
+    /// exactly the bug described on the test below.
+    fn draining_peer(
+        listener: &TcpListener,
+    ) -> (mpsc::Receiver<Wire>, thread::JoinHandle<usize>, PeerWriter) {
+        let (mut peer, link) = silent_peer(listener);
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut received = 0usize;
+            let mut len_buf = [0u8; 4];
+            loop {
+                if peer.read_exact(&mut len_buf).is_err() {
+                    break;
+                }
+                let mut body = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+                if peer.read_exact(&mut body).is_err() {
+                    break;
+                }
+                received += 1;
+                if let Ok(msg) = wire::decode_message(&body) {
+                    let _ = tx.send(msg);
+                }
+            }
+            received
+        });
+        (rx, reader, link)
+    }
+
+    /// The largest message the decoder accepts, so a few dozen of them exceed any
+    /// socket buffer and the silent peer really does stop absorbing writes. It has
+    /// to stay decodable: the live peer asserts on the content.
     fn bulky_message(addr: SocketAddr) -> Wire {
         Wire::Peers(vec![addr; noct_core::wire::MAX_PEERS_PER_MESSAGE])
     }
 
     /// **The regression test for the p2p deadlock.**
     ///
-    /// One peer that completes a connection and then stops reading must not
-    /// delay delivery to any other peer. Before the per-peer queues, the flood
-    /// wrote to each peer in turn with a blocking `write_all` and no write
-    /// timeout, so the silent peer's full receive window stopped the loop dead
-    /// and every peer after it — and the calling thread — waited on the
-    /// kernel's TCP retransmission timeout, about fifteen minutes.
+    /// One peer that completes a connection and then stops reading must not delay
+    /// delivery to any other peer. Before the per-peer queues, the flood wrote to
+    /// each peer in turn with a blocking `write_all` and no write timeout, so the
+    /// silent peer's full receive window stopped the loop dead and every peer
+    /// after it — and the calling thread — waited on the kernel's TCP
+    /// retransmission timeout, about fifteen minutes.
     ///
-    /// Verified to bite: with the sends put back to blocking `write_all` and
-    /// the write timeout removed, this fails on the completion check after the
-    /// full 60s. That check is what actually detects a regression — the
-    /// delivery check ahead of it is a weaker signal, since peers are flooded
-    /// in `HashMap` order and the live one may simply be written to first.
+    /// Verified to bite: with the sends put back to blocking `write_all` and the
+    /// write timeout removed, the flood parks on the silent peer once its socket
+    /// buffer fills and the completion check fails.
+    ///
+    /// ## Why this test was flaky, and what it was really measuring
+    ///
+    /// It used to read from the "live" peer on the test thread, once, after
+    /// starting the flood — so that peer never drained either. It was a **second
+    /// silent peer**, and the node did to it exactly what it should: its queue
+    /// passed [`MAX_QUEUED_BYTES`] and `enqueue` closed the connection. Measured
+    /// before this was fixed, the live peer received exactly 30 frames of 400 and
+    /// then EOF.
+    ///
+    /// The test passed because it needed one frame and thirty arrived first. How
+    /// many arrive is decided by the operating system's socket buffer, not by
+    /// anything the test controls, so on a loaded machine it failed — and it
+    /// failed *fast*, with "live peer received nothing — a silent peer is blocking
+    /// the flood", which named the wrong cause entirely. The response at the time
+    /// was to raise the timeouts, which could not have helped: nothing was ever
+    /// timing out.
+    ///
+    /// Two things follow, and both are in the test now. The live peer drains on
+    /// its own thread, so it stays live and its link is never closed. And the
+    /// flood is sized to stay **under** the queue cap, so the silent peer is not
+    /// disconnected either: it remains a connected peer that is not reading,
+    /// which is the attack this test exists to describe. Draining it late would
+    /// have made the test pass while quietly testing a peer the node had already
+    /// given up on.
     #[test]
     fn a_silent_peer_cannot_stall_delivery_to_the_others() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let (_silent_peer, silent_link) = silent_peer(&listener);
-        let (mut live_peer, live_link) = silent_peer(&listener);
+        let (live_rx, live_reader, live_link) = draining_peer(&listener);
 
         let peers = Peers::new();
         peers.add(silent_link);
         peers.add(live_link);
 
-        // Enough traffic that the silent peer's socket buffer is long full.
-        const ROUNDS: usize = 400;
+        // Enough traffic that the silent peer's socket buffer is long full — it
+        // takes about thirty of these — and few enough that the backlog owed to it
+        // stays under `MAX_QUEUED_BYTES`, so the node keeps the connection and the
+        // flood has to cope with a peer that is stalled rather than gone.
+        let frame_len = encode_frame(&bulky_message(addr)).len();
+        let rounds = (MAX_QUEUED_BYTES / frame_len) - 1;
+        assert!(rounds > 60, "the flood must outlast any socket buffer: {rounds} frames");
+
         let (done_tx, done_rx) = mpsc::channel();
         let flooder = thread::spawn(move || {
-            for _ in 0..ROUNDS {
+            for _ in 0..rounds {
                 peers.flood(&bulky_message(addr));
             }
             let _ = done_tx.send(());
+            // Dropped here, which closes both links and lets the readers see EOF.
+            drop(peers);
         });
 
-        // The live peer must still get its messages. Read one full frame; that
-        // is enough to prove traffic flowed past the silent peer.
-        let mut len_buf = [0u8; 4];
-        // Same reasoning as the 60s below: a liveness bound, not a performance
-        // one. Raised from 30s after the workspace gained Halo 2 proving tests,
-        // which saturate every core — this test then failed in a full `cargo
-        // test` while passing in 0.03s on its own, which is what a starved
-        // scheduler looks like rather than a stalled sender. The property being
-        // asserted is "traffic flows past a silent peer at all".
-        live_peer.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
-        live_peer
-            .read_exact(&mut len_buf)
-            .expect("live peer received nothing — a silent peer is blocking the flood");
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut body = vec![0u8; len];
-        live_peer.read_exact(&mut body).expect("live peer got a truncated frame");
-        assert_eq!(
-            wire::decode_message(&body).map(|m| matches!(m, Wire::Peers(_))),
-            Ok(true)
-        );
+        // The live peer must still get its messages while the silent one is
+        // stalled. Seconds, not minutes: with the sends blocking on the silent
+        // peer this never arrives at all, so a generous bound only delays the
+        // report. It is a liveness bound, not a performance one.
+        let first = live_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("live peer received nothing while a silent peer was stalled");
+        assert!(matches!(first, Wire::Peers(_)), "live peer got something else: {first:?}");
 
-        // And the flood itself must have finished rather than parked on the
-        // silent peer. 180s is not a performance bound; it is "not fifteen
-        // minutes", generous enough never to be flaky on a loaded machine.
-        match done_rx.recv_timeout(Duration::from_secs(180)) {
+        // And the flood itself must have finished rather than parked on the silent
+        // peer. The failure it guards against was about fifteen minutes long.
+        match done_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(()) => {}
             Err(RecvTimeoutError::Timeout) => {
                 panic!("flood never finished — a silent peer stalled the sender")
@@ -1612,6 +1665,16 @@ mod slow_peer_tests {
             Err(RecvTimeoutError::Disconnected) => panic!("flood thread died"),
         }
         flooder.join().unwrap();
+
+        // **The strong claim**: the live peer was not merely reached, it lost
+        // nothing. A silent peer costs its neighbours no messages, not just no
+        // time. This is what the old test could not say — its live peer was being
+        // disconnected partway through every run.
+        let received = live_reader.join().unwrap();
+        assert_eq!(
+            received, rounds,
+            "live peer got {received} of {rounds} frames — a stalled peer cost it messages"
+        );
     }
 
     /// The queue is a bound, not a buffer. A peer that never drains must not
