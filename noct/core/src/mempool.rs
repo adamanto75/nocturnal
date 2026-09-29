@@ -32,6 +32,9 @@ pub enum MempoolError {
     /// The pool is full and this transaction does not pay enough to displace
     /// anything already in it.
     PoolFull,
+    /// The fee is below the relay floor. Carries what this transaction's size
+    /// required, so a wallet can be told the number instead of guessing it.
+    FeeTooLow { required: u64 },
 }
 
 /// Fee per byte, the measure of what a transaction is worth to a miner and so
@@ -39,6 +42,69 @@ pub enum MempoolError {
 /// small fees.
 fn fee_rate(fee: u64, size: usize) -> u64 {
     fee.saturating_mul(1000) / (size.max(1) as u64)
+}
+
+/// The least a transaction may pay per 1000 bytes and still be relayed or held.
+///
+/// **This is policy, not consensus.** A block carrying a transaction below this
+/// floor is perfectly valid and every node must accept it; all this does is stop
+/// a node relaying or storing one. That distinction is the whole reason the check
+/// lives here and not in [`Blockchain::validate_tx`] — putting a fee rule into
+/// validation would fork the chain the moment two nodes disagreed about the
+/// number, and the number is exactly the kind of thing that gets tuned.
+///
+/// **Why per byte, and only per byte.** The obvious alternative was to surcharge
+/// Orchard actions, on the theory that a proof costs more to check than the bytes
+/// it occupies. Measured, that theory is backwards. Warm verification cost per
+/// kilobyte, on the transactions the wallet actually builds:
+///
+/// | transaction | size | verify | µs/KB |
+/// |---|---|---|---|
+/// | ring, 1 recipient | 2,507 B | 4.7 ms | 1,876 |
+/// | ring, 8 recipients | 3,203 B | 17.7 ms | **5,540** |
+/// | shielding, 1 action | 10,035 B | 11.1 ms | 1,106 |
+/// | shielded-only, 2 actions | 9,205 B | 5.9 ms | 637 |
+/// | unshielding, 1 action | 8,503 B | 9.4 ms | 1,102 |
+///
+/// The shielded pool is the *cheapest* per byte to verify: Orchard proofs are
+/// large but fast. The expensive shape is a many-output ring transaction, where
+/// an aggregate Bulletproofs+ range proof costs 17.7 ms inside 3.2 KB. An
+/// action surcharge would have taxed the cheap case and left the dear one alone.
+///
+/// Bytes are also what this pool actually rations — [`MAX_MEMPOOL_BYTES`] is a
+/// byte cap, and [`fee_rate`] already prices eviction per 1000 bytes. Charging
+/// in the same unit means the floor and the eviction rule tell one story: the
+/// pool never holds anything below this rate, and under pressure it never gets
+/// cheaper than what is already in it.
+///
+/// **The value, and how it was chosen.** A floor is only safe if legitimate
+/// traffic is nowhere near it, so it is set from the *cheapest rate this
+/// software itself ever pays*, not from a round number.
+///
+/// That rate is not the small transaction — it is the big one. Every tool here
+/// sends a flat 0.01 NOCT, so the larger the transaction the lower its rate, and
+/// the largest the fleet builds is a pool payout to eight shielded recipients:
+/// **30,459 bytes**, eight Orchard actions, paying 0.01 NOCT — about 0.00033
+/// NOCT per 1000 bytes. Everything else pays several times more per byte; an
+/// ordinary ring send is 2.5 KB and pays 0.004 NOCT per 1000 bytes, twelve times
+/// that rate.
+///
+/// 0.00005 NOCT per 1000 bytes sits about six times below that worst case, which
+/// is the margin `wallet/tests/fee_floor.rs` asserts and prints. Filling the
+/// whole 32 MB pool costs about 1.6 NOCT, roughly two blocks of subsidy.
+///
+/// An earlier draft used 0.0002 and looked fine against every shape measured by
+/// hand — the eight-recipient shielded payout was estimated at 17 KB and is
+/// really 30 KB, which left the pool paying only 1.6× the floor. The test
+/// caught it; the estimate would not have.
+pub const MIN_FEE_PER_KB: u64 = 50_000_000;
+
+/// What a transaction of `size` bytes must pay to be relayed or pooled.
+///
+/// Rounded **up**, so that no size is free. Saturating rather than wrapping: a
+/// size absurd enough to overflow should price itself out, not wrap to nothing.
+pub fn min_fee(size: usize) -> u64 {
+    MIN_FEE_PER_KB.saturating_mul(size as u64).saturating_add(999) / 1000
 }
 
 /// Most bytes of transactions the pool will hold.
@@ -110,6 +176,21 @@ impl Mempool {
             return Err(MempoolError::PoolConflict);
         }
 
+        // The relay floor, checked BEFORE verification, for the same reason the
+        // key-image check above is: verification is the expensive part, and an
+        // attacker who can make us spend it for nothing has a free denial of
+        // service. The measurements in [`MIN_FEE_PER_KB`] put that between 4.7
+        // and 17.7 ms per transaction; encoding one to measure it costs
+        // microseconds. Refusing the cheap way round is the point.
+        //
+        // This is where the floor actually defends CPU. The size of the number
+        // rations bytes; the *position* of the check rations verification.
+        let size = crate::wire::encode_transaction(&tx).len();
+        let required = min_fee(size);
+        if tx.fee < required {
+            return Err(MempoolError::FeeTooLow { required });
+        }
+
         // Chain-level validity (also rejects images already spent on-chain).
         chain.validate_tx(rng, &tx).map_err(MempoolError::Invalid)?;
 
@@ -118,7 +199,6 @@ impl Mempool {
         // displaces. Without that condition an attacker refills the pool with
         // cheap transactions and evicts everyone else's, which is the same
         // denial of service wearing a different hat.
-        let size = crate::wire::encode_transaction(&tx).len();
         if size > MAX_MEMPOOL_BYTES {
             return Err(MempoolError::PoolFull);
         }
@@ -295,6 +375,106 @@ mod tests {
 
         // Re-adding is rejected as already-known.
         assert_eq!(pool.add(&mut OsRng, &chain, tx), Err(MempoolError::AlreadyKnown));
+    }
+
+    /// **The floor is relay policy, and the chain must not care about it.**
+    ///
+    /// This is the test that stops a future refactor from quietly forking the
+    /// network. A fee rule inside `validate_tx` would make every node's opinion
+    /// of a block depend on a number chosen for denial-of-service reasons and
+    /// tuned whenever traffic changes — two nodes on different builds would then
+    /// disagree about which chain exists. So the same transaction the pool
+    /// refuses has to validate, and a block carrying it has to be accepted.
+    #[test]
+    fn the_floor_is_policy_and_the_chain_ignores_it() {
+        let (mut chain, src, idx) = setup();
+        let bob = Account::random(&mut OsRng);
+        // Pays nothing at all — as far under any floor as a transaction can be.
+        let tx = spend(&chain, &src, idx, &bob, src.amount, 0);
+
+        let mut pool = Mempool::new();
+        assert!(
+            matches!(pool.add(&mut OsRng, &chain, tx.clone()), Err(MempoolError::FeeTooLow { .. })),
+            "the pool must refuse to relay or hold it"
+        );
+
+        // And the chain must take it anyway, both on its own and inside a block.
+        chain.validate_tx(&mut OsRng, &tx).expect("a zero-fee transaction is VALID");
+
+        let miner = Account::random(&mut OsRng);
+        let subsidy = base_reward(chain.emitted());
+        let cb = Coinbase::create(&mut OsRng, chain.height(), &address(&miner), subsidy);
+        let mut block = Block {
+            header: BlockHeader {
+                major_version: 1,
+                minor_version: 0,
+                timestamp: crate::block::GENESIS_TIMESTAMP + 5_000,
+                prev_id: chain.tip_id(),
+                nonce: 0,
+            },
+            coinbase: cb,
+            tx_hashes: vec![tx.hash()],
+        };
+        block.mine(&KeccakPow, chain.next_difficulty());
+        chain
+            .add_block(&mut OsRng, &block, &[tx])
+            .expect("a block carrying a zero-fee transaction is VALID");
+    }
+
+    /// Refusal has to carry the number, because the only thing the sender can do
+    /// about it is pay a different fee, and they cannot guess which one.
+    #[test]
+    fn a_transaction_below_the_floor_is_told_what_it_needed() {
+        let (chain, src, idx) = setup();
+        let bob = Account::random(&mut OsRng);
+        let tx = spend(&chain, &src, idx, &bob, src.amount - 1, 1);
+        let size = crate::wire::encode_transaction(&tx).len();
+
+        let mut pool = Mempool::new();
+        assert_eq!(
+            pool.add(&mut OsRng, &chain, tx),
+            Err(MempoolError::FeeTooLow { required: min_fee(size) }),
+        );
+        assert!(pool.is_empty());
+    }
+
+    /// **Refused before it is verified** — the same argument as
+    /// [`a_conflicting_transaction_is_refused_before_it_is_verified`], and the
+    /// reason the floor defends CPU at all. Verification is 4.7–17.7 ms a
+    /// transaction; if an underpaying one reached it, a sender who never intends
+    /// to pay could buy that work indefinitely.
+    ///
+    /// The transaction here is *both* underpaying and unverifiable. Verifying
+    /// first would report `Invalid`; checking the fee first reports `FeeTooLow`,
+    /// which is what pins the order.
+    #[test]
+    fn an_underpaying_transaction_is_refused_before_it_is_verified() {
+        let (chain, src, idx) = setup();
+        let bob = Account::random(&mut OsRng);
+        let mut tx = spend(&chain, &src, idx, &bob, src.amount - 1, 1);
+        tx.outputs[0].commitment = Opening::random(1, &mut OsRng).commit();
+
+        let mut pool = Mempool::new();
+        assert!(
+            matches!(
+                pool.add(&mut OsRng, &chain, tx),
+                Err(MempoolError::FeeTooLow { .. })
+            ),
+            "the fee must be judged before any signature or range proof is touched"
+        );
+    }
+
+    /// Rounded up, so that no size is free and a flood of tiny transactions
+    /// cannot slip under the rate by being small.
+    #[test]
+    fn no_size_is_free() {
+        assert_eq!(min_fee(0), 0, "nothing is nothing");
+        assert!(min_fee(1) > 0, "one byte still costs something");
+        assert_eq!(min_fee(1000), MIN_FEE_PER_KB, "the rate is per 1000 bytes");
+        assert!(min_fee(1001) > MIN_FEE_PER_KB, "and the next byte costs more");
+        // The same unit eviction already prices in, so the floor and the
+        // eviction rule cannot drift apart.
+        assert!(fee_rate(min_fee(4096), 4096) >= MIN_FEE_PER_KB - 1);
     }
 
     #[test]

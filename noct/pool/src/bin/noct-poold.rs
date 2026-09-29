@@ -1491,6 +1491,29 @@ fn run_payouts(
             return;
         }
     };
+    // Refuse a payout the network will not relay, before it is sent.
+    //
+    // The node would reject it and the balances would come back, but the pool
+    // would then rebuild the same too-cheap transaction on the next round and
+    // every round after: an operator whose `--payout-fee` is under the floor
+    // gets a payout loop that never terminates and never pays. Catching it here
+    // costs one comparison and names the setting to change.
+    let tx_size = noct_core::wire::encode_transaction(&tx).len();
+    let required = noct_core::mempool::min_fee(tx_size);
+    if tx.fee < required {
+        eprintln!(
+            "payout NOT sent: --payout-fee {} NOCT is below the relay floor for this              {tx_size}-byte transaction, which needs {} NOCT. Balances returned;              restart with --payout-fee {} or higher.",
+            format_noct(tx.fee),
+            format_noct(required),
+            format_noct(required),
+        );
+        let mut s = shared.lock().unwrap();
+        for id in ids {
+            let _ = s.ledger.fail_payment(id);
+        }
+        return;
+    }
+
     let txid = hex::encode(tx.hash());
 
     match client.submit_tx(&tx) {

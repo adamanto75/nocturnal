@@ -579,11 +579,26 @@ Each step ends with tests and leaves the chain in a state that still works.
 whether any of this should be deployed:
 
 - The **adversarial pass** of §13, against a running node.
-- Two things found while building and deliberately left: there is **no minimum-fee
-  floor** in the mempool (open question 1), which matters more now that a
-  zero-fee transaction can cost verifiers a proof per action; and the **premine is
-  still a ring output**, because changing genesis changes the chain id and that
-  belongs with the reset rather than before it.
+- **CLOSED — the minimum-fee floor** (open question 1). `MIN_FEE_PER_KB` is a
+  mempool *policy* rule: a transaction below it is neither relayed nor pooled,
+  and is still perfectly valid to the chain, so nodes that disagree about the
+  number cannot fork.
+
+  It was added on the theory that a zero-fee transaction costs verifiers a proof
+  per action, so shielded traffic needed a per-action surcharge. **Measured, that
+  theory is backwards.** Warm verification, per kilobyte: a ring payment to eight
+  recipients costs 5,540 µs/KB, a shielding 1,106, a shielded-only transfer 637.
+  Orchard proofs are large but fast; the expensive shape is an aggregate
+  Bulletproofs+ range proof over many ring outputs. A per-action surcharge would
+  have taxed the cheap case and left the dear one alone, so the floor is per byte
+  only — the unit the mempool's byte cap and its eviction rule already use.
+
+  What actually defends CPU is not the size of the number but the *position of
+  the check*: the fee is judged before verification and before relay, in both the
+  mempool and the node's gossip path. A low fee earns **no misbehaviour points**,
+  since it is our policy rather than the sender's dishonesty.
+- Still open: the **premine is a ring output**, because changing genesis changes
+  the chain id and that belongs with the reset rather than before it.
 - Then the testnet reset. This is a consensus change from end to end — a new
   transaction version, a second coinbase shape, a tree in the chain state — so
   nothing about it is compatible with the running fleet.

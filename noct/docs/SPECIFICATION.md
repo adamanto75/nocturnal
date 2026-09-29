@@ -541,6 +541,18 @@ node `transport.rs`):
   subscriber is routinely handed an entire /64 and banning a single address out
   of it would achieve nothing. Loopback is scored per-port so local multi-node
   testing is unaffected.
+- **Relay fee floor** — a transaction paying less than `MIN_FEE_PER_KB` per 1000
+  encoded bytes (currently 0.00005 NOCT) is neither relayed nor pooled. This is
+  **policy, not consensus**: a block containing such a transaction is valid and
+  every node accepts it, so nodes running different floors cannot fork. The check
+  runs *before* signature and proof verification and before any relay decision,
+  which is what makes it a defence rather than a preference — verification is
+  4.7–17.7 ms per transaction and encoding one to measure it costs microseconds.
+  A low fee earns **no misbehaviour points**, because the verdict reflects the
+  receiving node's policy rather than the sender's honesty, and scoring it would
+  ban peers on older builds. Nodes publish their own floor as `min_fee_per_kb` on
+  `/info`, and `/submit_tx` answers a refusal with the `required_fee` for that
+  transaction's size.
 
 ---
 
@@ -715,7 +727,18 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
    that is out of scope, nor assumes it is absent from the tree. Shipping swaps
    would make that dependency a launch decision in its own right.
 
-9. **OPEN — node memory holds the whole chain.** Every block is retained with its
+9. **CLOSED — minimum relay fee.** The mempool accepted transactions at any fee,
+   including zero, so an unbounded stream of valid-but-free transactions could
+   occupy the pool and buy verification work for nothing. `MIN_FEE_PER_KB` (§15)
+   now floors it. Two points an auditor should check rather than assume: the rule
+   is **not** in `validate_tx` or block validation — a cheap transaction is
+   consensus-valid, and a test asserts a block carrying a zero-fee transaction is
+   accepted — and the check is ordered *before* verification, which is where its
+   denial-of-service value lies. The per-byte unit was chosen against measured
+   verification cost: contrary to expectation, Orchard bundles are the cheapest
+   shape per byte and many-output ring transactions the dearest, so no per-action
+   surcharge is applied.
+10. **OPEN — node memory holds the whole chain.** Every block is retained with its
    decoded transactions, so resident memory grows with chain length (~23 KB per
    block measured on testnet). The validation state proper — the output set and
    spent key images — is a small fraction of it. Serving blocks from the on-disk
@@ -759,12 +782,14 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
 | `RANDOMX_EPOCH_LAG` | 64 | `pow.rs` |
 | `MTP_WINDOW` | 11 | `chain.rs` |
 | `FUTURE_TIME_LIMIT` | 2 h | `chain.rs` |
-| `COINBASE_MATURITY` | 60 blocks | `chain.rs` |
+| `COINBASE_MATURITY` | 100 blocks | `chain.rs` |
 | `MAX_REORG_DEPTH` | 100 | `node` |
 | `TX_VERSION` | 1 | `tx.rs` |
 | `RING_SIZE` | 16, **exact** (1 + 15 decoys) | `chain.rs` |
 | `DEFAULT_RING_SIZE` | re-export of `RING_SIZE` | `wallet` |
 | `SUBADDRESS_LOOKAHEAD` | 200 | `wallet` |
+| `MAX_MEMPOOL_BYTES` | 32 MiB | `mempool.rs` |
+| `MIN_FEE_PER_KB` | 0.00005 NOCT / 1000 B *(relay policy)* | `mempool.rs` |
 | `NETWORK_ID` | 0x4E4F4354 | `p2p.rs` |
 | Address tags | 0x13/0x14 main, 0x35/0x36 test | `address.rs` |
 

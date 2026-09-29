@@ -381,7 +381,7 @@ fn handle_client(
             let node = state.lock().unwrap();
             let totals = node.pool_totals();
             let json = format!(
-                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"ring\":{},\"shielded\":{},\"notes\":{},\"anchor\":\"{}\",\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
+                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"ring\":{},\"shielded\":{},\"notes\":{},\"anchor\":\"{}\",\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"min_fee_per_kb\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
                 node.height(),
                 node.num_outputs(),
                 node.emitted(),
@@ -402,6 +402,12 @@ fn handle_client(
                 hex::encode(node.shielded_root()),
                 node.cumulative_difficulty(),
                 node.mempool_len(),
+                // The relay floor this node applies, so a wallet can ask what a
+                // transaction will need instead of hard-coding a number that has
+                // to match the node's build. It is policy, not consensus, so
+                // nodes may legitimately differ and a sender should read it from
+                // the node it is actually submitting to.
+                noct_core::mempool::MIN_FEE_PER_KB,
                 peer_count,
                 hex::encode(node.tip_id()),
                 // Which proof-of-work this binary was built with. A pool or miner
@@ -456,6 +462,30 @@ fn handle_client(
                 Err(_) => return respond(reader.get_mut(), "400 Bad Request", "{\"error\":\"invalid transaction\"}"),
             };
             let txid = hex::encode(tx.hash());
+
+            // The relay floor, answered with a number.
+            //
+            // The gossip path drops an underpaying transaction silently, which is
+            // right for a stranger's traffic. This is the local submission path:
+            // whoever called it is holding a wallet and a transaction they just
+            // paid to build, and "accepted: false" with no reason is how a user
+            // ends up re-sending the same too-cheap transaction all afternoon.
+            // They need the figure, so it is computed and returned.
+            // Re-encoded rather than `raw.len()`: the number quoted back has to
+            // be the one the mempool will apply, and a non-canonical encoding
+            // that decoded fine would otherwise quote a size nothing agrees with.
+            let required = noct_core::mempool::min_fee(wire::encode_transaction(&tx).len());
+            if tx.fee < required {
+                return respond(
+                    reader.get_mut(),
+                    "200 OK",
+                    &format!(
+                        "{{\"accepted\":false,\"txid\":\"{txid}\",\"error\":\"fee below the relay floor\",\"fee\":{},\"required_fee\":{required}}}",
+                        tx.fee
+                    ),
+                );
+            }
+
             // Fluff immediately (see transport.rs on deferred stem) so a locally
             // submitted transaction reliably reaches the network's mempools.
             let relay = {

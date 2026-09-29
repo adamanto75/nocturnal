@@ -27,6 +27,30 @@ use noct_wallet::shielded::ShieldedKeys;
 use noct_wallet::{mnemonic, Direction, Wallet, DEFAULT_RING_SIZE};
 use rand_core::OsRng;
 
+/// Refuse to send a transaction the network will not relay, and say by how much.
+///
+/// The node would answer this too — `/submit_tx` returns `required_fee` — but
+/// only after the transaction has been built, signed and handed over. Checking
+/// here means the refusal arrives before anything leaves the machine, and with
+/// the command to fix it rather than a JSON body to interpret.
+///
+/// The floor is the *local* binary's. A node may legitimately run a different
+/// one, and publishes it as `min_fee_per_kb` on `/info`; this catches the common
+/// case cheaply, and the node's own answer remains authoritative.
+fn refuse_below_the_floor(tx: &noct_core::tx::Transaction) {
+    let size = noct_core::wire::encode_transaction(tx).len();
+    let required = noct_core::mempool::min_fee(size);
+    if tx.fee < required {
+        fail(&format!(
+            "fee {} NOCT is below the relay floor for this {size}-byte transaction, which needs {} NOCT.
+Nothing was sent. Re-run with --fee {}",
+            format_noct(tx.fee),
+            format_noct(required),
+            format_noct(required),
+        ));
+    }
+}
+
 const DEFAULT_WALLET: &str = "noct-wallet.key";
 const DEFAULT_NODE: &str = "127.0.0.1:9334";
 const DEFAULT_FEE_NOCT: &str = "0.01";
@@ -81,6 +105,8 @@ fn help() {
     eprintln!("noct-cli unshield --amount NOCT [--to RING_ADDR] [--fee NOCT] [--wallet FILE]");
     eprintln!("  moves value out of the shielded pool. The amount is public. Defaults --to your");
     eprintln!("  own ring address.");
+    eprintln!("  --fee defaults to 0.01 NOCT. Nodes will not relay below a per-byte floor, so a");
+    eprintln!("  large transaction needs more; the exact figure is printed if yours is short.");
     eprintln!("noct-cli premine-key-image --wallet FILE   # publishable proof-of-movement value");
     eprintln!("  offline. Prints ONLY the mainnet genesis premine output's key image.");
     eprintln!("  add --node-token TOKEN or --node-token-file PATH when the node's RPC is authenticated");
@@ -337,6 +363,7 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
         );
     }
 
+    refuse_below_the_floor(&tx);
     let reply = client.submit_tx(&tx).unwrap_or_else(|e| fail(&e));
     println!(
         "sent {} NOCT to the {} pool (fee {} NOCT)",
@@ -478,6 +505,7 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
     let tx = wallet
         .build_unshielding(&mut OsRng, &chain, &shielded, &payments, amount, fee, DEFAULT_RING_SIZE)
         .unwrap_or_else(|e| fail(&format!("building transaction: {e:?}")));
+    refuse_below_the_floor(&tx);
     let reply = client.submit_tx(&tx).unwrap_or_else(|e| fail(&e));
     println!("unshielded {} NOCT (fee {} NOCT)", format_noct(amount), format_noct(fee));
     println!("node replied: {}", reply.trim());

@@ -798,6 +798,28 @@ impl NodeState {
         if !self.seen_txs.insert(tx.hash()) {
             return (Relay::Drop, 0); // already processed → stops gossip loops
         }
+
+        // The relay floor, before verification and before relay.
+        //
+        // Before verification because that is the expensive step (4.7–17.7 ms a
+        // transaction, measured — see `MIN_FEE_PER_KB`) and encoding one to
+        // measure its size costs microseconds. A flood of underpaying
+        // transactions should cost us a serialization each, not a signature.
+        //
+        // Before relay because the old code admitted to the mempool with
+        // `let _ = …` and flooded regardless of the answer. A transaction the
+        // pool refused would still have been forwarded to every peer — we would
+        // have been amplifying, for free, exactly the traffic we had just
+        // decided not to keep.
+        //
+        // **No misbehaviour points**, for the reason spelled out below for
+        // `UnknownRingMember`: this is our policy, not the sender's honesty. A
+        // peer on an older build, or one with a lower floor, relays these in
+        // perfectly good faith, and scoring them would ban our own seeds.
+        if tx.fee < noct_core::mempool::min_fee(noct_core::wire::encode_transaction(&tx).len()) {
+            return (Relay::Drop, 0);
+        }
+
         match self.chain.validate_tx(rng, &tx) {
             Ok(()) => {}
             // "We cannot tell yet" is not misbehaviour.
@@ -2533,6 +2555,78 @@ mod tests {
             }
             other => panic!("expected Tip(NETWORK_ID, 4, _, work), got {other:?}"),
         }
+    }
+
+    /// **An underpaying transaction is dropped, not forwarded, and costs the
+    /// sender nothing in reputation.**
+    ///
+    /// Three claims, and each was a real hazard:
+    ///
+    /// * **Not pooled** — the floor would be decorative otherwise.
+    /// * **Not relayed.** The previous code admitted with `let _ = …` and
+    ///   flooded whatever the pool said. A transaction we had just declined to
+    ///   store would have been pushed to every peer at our own expense: free
+    ///   amplification of exactly the traffic the floor exists to stop.
+    /// * **No misbehaviour points.** The floor is *our* policy. A peer running
+    ///   an older build, or one that set a lower floor, relays these in good
+    ///   faith. Scoring them bans our own seeds — the failure this codebase has
+    ///   already hit once, when a syncing node scored three peers to 100 each
+    ///   over transactions that were perfectly valid to everyone else.
+    #[test]
+    fn a_transaction_below_the_relay_floor_is_dropped_unrelayed_and_unpunished() {
+        let miner = wallet();
+        let mut node = test_node(miner.address());
+        let mut miner_view = miner;
+        mine_n(&mut node, &mut miner_view, 16);
+
+        let bob = wallet();
+        let spendable = miner_view.unspent().next().cloned().unwrap();
+        // One atomic unit: valid, signed, and far under any floor.
+        let fee = 1u64;
+        let payments = [noct_core::tx::Payment {
+            destination: bob.address(),
+            amount: spendable.amount() - fee,
+        }];
+        let tx = miner_view
+            .build_transaction(&mut OsRng, &node.chain, &payments, fee, DEFAULT_RING_SIZE)
+            .unwrap();
+
+        // It is a real transaction — the chain has no complaint about it.
+        node.chain.validate_tx(&mut OsRng, &tx).expect("valid, merely cheap");
+        assert!(
+            tx.fee < noct_core::mempool::min_fee(noct_core::wire::encode_transaction(&tx).len()),
+            "the fixture has to actually be under the floor"
+        );
+
+        let r = node.react(&mut OsRng, 0, Wire::Tx(tx.clone(), Phase::Fluff), true);
+        assert_eq!(r.misbehavior, 0, "a cheap transaction is not a hostile peer");
+        assert!(r.broadcast.is_empty(), "and must not be forwarded to anyone");
+        assert_eq!(node.mempool_len(), 0, "nor kept");
+
+        // Raise only the fee and the same transaction is welcome, which pins
+        // that the fee was the reason and nothing else about it was wrong.
+        let mut paid = tx;
+        paid.fee = noct_core::mempool::min_fee(
+            noct_core::wire::encode_transaction(&paid).len(),
+        );
+        // Re-sign for the new fee: the signature commits to it.
+        let paid = miner_view
+            .build_transaction(
+                &mut OsRng,
+                &node.chain,
+                &[noct_core::tx::Payment {
+                    destination: bob.address(),
+                    amount: spendable.amount() - paid.fee,
+                }],
+                paid.fee,
+                DEFAULT_RING_SIZE,
+            )
+            .unwrap();
+        assert!(matches!(
+            node.originate_tx(&mut OsRng, paid, false),
+            Relay::FloodToAll(_)
+        ));
+        assert_eq!(node.mempool_len(), 1, "the only thing wrong with it was the price");
     }
 
     /// Regression: a node with no peers must fluff a submitted transaction
