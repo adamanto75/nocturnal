@@ -337,6 +337,25 @@ index 0, derived with a baked-in genesis transaction key. The chain initializes
 baseline. The premine secret is the project's most sensitive key and is held
 offline (see project notes).
 
+**The premine is a transparent ring output, by decision rather than by default.**
+Minting it as an Orchard note inside genesis was considered and rejected, on three
+grounds. Genesis must be byte-identical on every node, and a shielded coinbase
+needs a Halo 2 proof built from an rng, so the bundle could not be computed at
+runtime — it would have to be a baked constant blob of some ten kilobytes,
+permanently uncorrectable, guarding 50% of supply. It would also lean on a
+capability Zcash itself no longer exercises in that position (from NU6.3 its
+consensus requires *zero* Orchard actions in a coinbase). And it would buy
+almost nothing: at genesis the shielded pool holds exactly one note, so spending
+it identifies it as the premine regardless.
+
+What the design preserves instead is **accountability**: the allocation is
+visible at a glance, and `noct-cli premine-key-image` lets the holder publish the
+key image a spend would reveal, so anyone can check the premine has not moved.
+The founder can move it into the shielded pool whenever they choose, with an
+ordinary shielding transaction — `wallet/tests/premine_shielding.rs` asserts
+exactly that against the real genesis under the real `COINBASE_MATURITY`, because
+a decision to leave genesis alone is only sound if that door is actually open.
+
 `GENESIS_TIMESTAMP = 1_750_000_000` (*placeholder*).
 
 ---

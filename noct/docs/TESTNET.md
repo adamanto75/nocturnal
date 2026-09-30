@@ -90,6 +90,30 @@ Restore it with:
 noct-cli restore --network testnet --mnemonic-stdin --wallet faucet.key
 ```
 
+### Moving the premine into the shielded pool
+
+The premine is a **transparent ring output**, on both networks and by decision
+rather than by default (the reasoning is in `SPECIFICATION.md` §9). It is not
+stuck there: one ordinary shielding transaction moves it across, and the same
+command works for the testnet faucet as for the mainnet founder.
+
+```bash
+# where it can go: derived from the same seed, so no new backup is needed
+noct-cli shielded-address --network testnet --wallet faucet.key
+
+# and the move itself, to that address
+noct-cli send --network testnet --wallet faucet.key --to <that shielded address> --amount 1000
+```
+
+Two things to expect. The premine is a coinbase output, so it is unspendable
+until it is `COINBASE_MATURITY` (100) blocks deep — before that the wallet reports
+insufficient funds, which is the rule working rather than a fault. And **the
+amount crossing between pools is public**: the command says so before it submits
+anything. What follows inside the pool is not.
+
+`wallet/tests/premine_shielding.rs` asserts this whole path against the real
+genesis under the real maturity depth, so it cannot quietly stop working.
+
 The genesis constants derived from that address are checked into `params.rs` and
 are reproducible — anyone can regenerate and compare them:
 

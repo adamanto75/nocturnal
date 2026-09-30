@@ -21,8 +21,9 @@ happens.
 Decision context: Noct keeps its ring pool (RingCT/CLSAG/Bulletproofs+) **and**
 gains a zk-SNARK shielded pool built on Zcash's Orchard. Both exist permanently,
 users pick a pool per transaction, and value moves between them in either
-direction. Block rewards and the genesis premine are created **inside** the
-Orchard pool. Proof of work stays RandomX; nothing about mining changes.
+direction. A miner chooses which pool its **block reward** is created in. The
+**genesis premine stays a transparent ring output** — see the decision at the end
+of §12. Proof of work stays RandomX; nothing about mining changes.
 
 ---
 
@@ -304,10 +305,15 @@ an executable claim rather than a paragraph.
 
 ## 7. Coinbase, the premine, and a maturity problem Zcash does not have
 
-The plan is that block rewards and the 500,000 NOCT genesis premine are created
-directly as shielded notes: `BundleType::Coinbase`, spends disabled,
-`value_balance = -reward`. The spike confirms the crate builds, proves and
-verifies exactly that.
+Block rewards can be created directly as shielded notes: `BundleType::Coinbase`,
+spends disabled, `value_balance = -reward`. The spike confirms the crate builds,
+proves and verifies exactly that, and the miner chooses per block template.
+
+**The genesis premine is the exception, and deliberately so** — it stays a
+transparent ring output. See the decision at the end of §12: a genesis bundle
+would have to be a baked constant that can never be corrected, and at genesis the
+pool holds one note, so shielding it there buys nothing the founder cannot get
+later with an ordinary transaction.
 
 **But coinbase maturity does not survive the move to a shielded pool.** Noct
 requires a coinbase to be buried 100 blocks before it can be spent: maturity
@@ -568,7 +574,7 @@ Each step ends with tests and leaves the chain in a state that still works.
 3. **`node`**: proof and signature verification in block validation, mempool
    rules, and the proving/verifying keys built once at startup (1.5 s / 0.9 s —
    startup cost, not per block).
-4. **Coinbase and premine** as Orchard notes, with the delayed-insertion maturity
+4. **Coinbase** as Orchard notes (the premine excepted — see below), with the delayed-insertion maturity
    rule.
 5. **`wallet`**: keys, scanning, witnesses, spending, pool choice.
 6. **`pool`**: Orchard payouts.
@@ -597,8 +603,29 @@ whether any of this should be deployed:
   the check*: the fee is judged before verification and before relay, in both the
   mempool and the node's gossip path. A low fee earns **no misbehaviour points**,
   since it is our policy rather than the sender's dishonesty.
-- Still open: the **premine is a ring output**, because changing genesis changes
-  the chain id and that belongs with the reset rather than before it.
+- **DECIDED, not open: the premine stays a transparent ring output.** §7 planned to
+  mint it as a note in genesis. Rejected on three grounds:
+
+  1. **It could never be corrected.** Genesis must be byte-identical on every node,
+     and a shielded coinbase needs a Halo 2 proof built from an rng, so the bundle
+     cannot be computed at runtime. It would be a baked ~10 KB constant, forever,
+     guarding 50% of supply; malformed, the premine is unspendable and the only
+     remedy is a new chain.
+  2. **It leans on an unexercised path.** §7 already notes that from NU6.3 Zcash
+     requires *zero* Orchard actions in a coinbase. Relying on that for a block
+     template is a calculated risk; baking it into the chain's axiom is not the
+     same bet.
+  3. **It buys almost nothing.** At genesis the shielded pool holds exactly one
+     note, so spending it identifies it as the premine anyway. The privacy accrues
+     as the pool grows — equally true if the founder shields it afterwards.
+
+  What the transparent output keeps is accountability: the allocation is visible,
+  and `premine-key-image` publishes the key image a spend would reveal, so anyone
+  can verify it has not moved. The founder shields it with an ordinary transaction
+  whenever they choose, and `wallet/tests/premine_shielding.rs` proves that works
+  against the real genesis under the real maturity rule — because leaving genesis
+  alone is only sound if that door is open, and a decision resting on an untested
+  claim is a guess.
 - Then the testnet reset. This is a consensus change from end to end — a new
   transaction version, a second coinbase shape, a tree in the chain state — so
   nothing about it is compatible with the running fleet.
