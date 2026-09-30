@@ -30,7 +30,7 @@ jobs:
       # chain", not "the chain is exactly this tall today". It must stay ABOVE
       # CHECK_HEIGHT, or the chain check below asks for a block the joiner has
       # not reached yet and fails for the wrong reason.
-      MIN_HEIGHT: 600
+      MIN_HEIGHT: 1400
       # A block on the canonical chain, and its hash as served by /block/.
       #
       # Height and peer count alone only prove the joiner reached *a* chain. On
@@ -44,14 +44,23 @@ jobs:
       # updated, and the failure says so.
       #
       # Pinned to the chain that arrived with the shielded pool (v0.3.0-testnet),
-      # which reset the testnet on 2026-09-29. Temporarily 600/500 while that
-      # chain is hours old — raise both once block 500 is well past
-      # MAX_REORG_DEPTH, as was done for the previous chain.
+      # which reset the testnet on 2026-09-29. Raised from 600/500 on 2026-09-30
+      # now that the chain is tall enough for a deeper checkpoint to be settled:
+      # block 1300 was 182 deep when this was taken, against a MAX_REORG_DEPTH of
+      # 100, so no reorg a node will accept can reach it. The shallow 600/500 pair
+      # was only ever meant to last while that chain was hours old.
       #
-      # Taken from two independent nodes that agreed, not from one: a single
-      # node can be the fork.
-      CHECK_HEIGHT: 500
-      CHECK_SHA256: 3627631be4847d567642481822a0190c6ebb3ba8f4220d34a827d3d1f0949890
+      # Deeper is strictly better here: this check exists to catch a joiner that
+      # synced a *fork*, and a fork diverges somewhere. The further in the pinned
+      # block sits, the more of the chain has to match before the check passes —
+      # 500 would not have caught a divergence at 800.
+      #
+      # Taken from FOUR independent nodes that agreed, on three separate hosts.
+      # One node can be the fork; that is the whole reason this field exists.
+      # It is `curl /block/N | sha256sum`, the hash of the RPC RESPONSE, not the
+      # block id — reading it as a block id will send you hunting a phantom.
+      CHECK_HEIGHT: 1300
+      CHECK_SHA256: 17cc6c6f3e798f54b34613d75850208c590c95fdf3ed795de22976084f1df79c
 
     steps:
       - name: Download the newest published release, as a stranger would
