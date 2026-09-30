@@ -17,24 +17,25 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.6-testnet</b> — the <b>desktop wallet understands the shielded pool</b>,
-     and the <b>Windows installer is back</b>. Until now it showed only your ring balance,
-     so shielding anything made the headline number fall with the difference nowhere on
-     screen; it could not pay a shielded address at all; and it called a payment sent
-     before the node had agreed. All three are fixed. Only <code>noct-walletd</code>
-     changed — if you run a node rather than the wallet, there is nothing here for you.
-     v0.3.0 changed consensus: a node older than that cannot follow the current testnet
-     chain, so if you are running v0.2.x or earlier, update or you will simply stop
-     syncing.</p>
+  <p><b>v0.3.7-testnet</b> — <b>you choose which pool your money comes from</b>.
+     Which pool a payment <i>lands</i> in has always been the recipient's choice, carried
+     in their address; the sender had none. Now <code>send --from ring|shielded|auto</code>,
+     and a <b>Spend from</b> selector in the desktop wallet that says what each choice
+     publishes before you make it. Paying a shielded address <i>from</i> shielded notes
+     is the most private shape this chain has — no ring inputs, outputs or range proof,
+     nothing public but the fee — and it was previously unreachable from either wallet.
+     <code>auto</code> remains the default and is unchanged. v0.3.0 changed consensus:
+     a node older than that cannot follow the current testnet chain, so if you are running
+     v0.2.x or earlier, update or you will simply stop syncing.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/Nocturnal-Wallet-Setup-0.3.6.exe">Nocturnal-Wallet-Setup-0.3.6.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.7-testnet/Nocturnal-Wallet-Setup-0.3.7.exe">Nocturnal-Wallet-Setup-0.3.7.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/nocturnal-v0.3.6-testnet-linux-x64.tar.gz">nocturnal-v0.3.6-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.7-testnet/nocturnal-v0.3.7-testnet-linux-x64.tar.gz">nocturnal-v0.3.7-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/nocturnal-v0.3.6-testnet-windows-x64.zip">nocturnal-v0.3.6-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.7-testnet/nocturnal-v0.3.7-testnet-windows-x64.zip">nocturnal-v0.3.7-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.7-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.7-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
