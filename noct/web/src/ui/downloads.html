@@ -17,26 +17,31 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.5-testnet</b> — <b>documentation and tests only; the binaries are
-     byte-identical to v0.3.4</b>, so if you are running that there is nothing to do.
-     It records the decision that the genesis <b>premine stays a transparent ring
-     output</b> rather than becoming a shielded note, with the reasoning, and adds the
-     test proving the founder can still move it into the shielded pool later — which
-     is what makes leaving genesis alone safe. v0.3.0 changed consensus: a node older
-     than that cannot follow the current testnet chain, so if you are running v0.2.x
-     or earlier, update or you will simply stop syncing.</p>
+  <p><b>v0.3.6-testnet</b> — the <b>desktop wallet understands the shielded pool</b>,
+     and the <b>Windows installer is back</b>. Until now it showed only your ring balance,
+     so shielding anything made the headline number fall with the difference nowhere on
+     screen; it could not pay a shielded address at all; and it called a payment sent
+     before the node had agreed. All three are fixed. Only <code>noct-walletd</code>
+     changed — if you run a node rather than the wallet, there is nothing here for you.
+     v0.3.0 changed consensus: a node older than that cannot follow the current testnet
+     chain, so if you are running v0.2.x or earlier, update or you will simply stop
+     syncing.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/nocturnal-v0.3.5-testnet-linux-x64.tar.gz">nocturnal-v0.3.5-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/Nocturnal-Wallet-Setup-0.3.6.exe">Nocturnal-Wallet-Setup-0.3.6.exe</a>
+        — <b>Windows desktop wallet</b> (installer)</li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/nocturnal-v0.3.6-testnet-linux-x64.tar.gz">nocturnal-v0.3.6-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/nocturnal-v0.3.5-testnet-windows-x64.zip">nocturnal-v0.3.5-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/nocturnal-v0.3.6-testnet-windows-x64.zip">nocturnal-v0.3.6-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.6-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
-  <p class="note"><b>The desktop wallet installer is not part of this release.</b> The newest
-     one on GitHub predates the shielded pool and will not follow the current chain, so it is
-     not linked here. Use the Windows command-line tools until it is rebuilt.</p>
+  <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
+     it is <b>not reproducible</b> — Electron packaging is not deterministic, so its
+     checksum proves only that your download arrived intact, not what is inside it. The
+     command-line binaries it bundles <i>are</i> reproducible, and are the same ones in
+     the archives above.</p>
   <p class="muted">The checksum proves the file arrived intact. Whether the binary matches the
      source is a separate question, and from <b>v0.1.4</b> you can answer it yourself for Linux:
      see <a href="https://github.com/adamanto75/nocturnal/blob/main/noct/docs/REPRODUCIBLE-BUILDS.md">reproducible
