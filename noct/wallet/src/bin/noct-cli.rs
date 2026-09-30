@@ -51,6 +51,69 @@ Nothing was sent. Re-run with --fee {}",
     }
 }
 
+/// Submit `tx` and report what the node actually decided.
+///
+/// **The reply has to be read before anything is called sent.** This used to print
+/// `sent N NOCT` and only then print the node's answer, so a refused transaction
+/// was announced as a success and contradicted on the next line. Worse, it exited
+/// zero, so a script could not tell the difference at all.
+///
+/// Three outcomes, and they are genuinely different:
+///
+/// * **Accepted** — say so, with the txid to look it up by.
+/// * **Refused** — the node answered, so the transaction is in nobody's mempool.
+///   Nothing was sent, said plainly, and the exit status is non-zero.
+/// * **No reply** — the one case that cannot be resolved here. The transaction may
+///   have been relayed before the connection broke, or may never have arrived.
+///   Calling it "not sent" would be a guess, and a guess that invites re-sending
+///   something already in flight, so it reports the txid and asks the caller to
+///   check the chain. `noct-poold` treats the same ambiguity the same way, holding
+///   such a payment as unresolved rather than refunding it.
+fn submit_and_report(client: &NodeClient, tx: &noct_core::tx::Transaction, success: &str) {
+    let txid = hex::encode(tx.hash());
+    match client.submit_tx(tx) {
+        Ok(reply) if reply.contains("\"accepted\":true") => {
+            println!("{success}");
+            println!("txid: {txid}");
+        }
+        Ok(reply) => {
+            eprintln!("NOT SENT — the node refused this transaction.");
+            eprintln!("  node replied: {}", reply.trim());
+            // A node may run a higher relay floor than this binary; it publishes
+            // its own as `min_fee_per_kb` on /info, and quotes the figure for THIS
+            // transaction when it refuses one. Repeat it as an actionable number
+            // rather than leaving the caller to read it out of the JSON.
+            if let Some(required) = field_u64(&reply, "required_fee") {
+                eprintln!(
+                    "  that node wants at least {} NOCT for this transaction — re-run with --fee {}",
+                    format_noct(required),
+                    format_noct(required),
+                );
+            }
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("OUTCOME UNKNOWN — no reply from the node ({e}).");
+            eprintln!("  It may or may not have been relayed, so this is NOT a refusal.");
+            eprintln!("  Check the chain for txid {txid} before sending it again.");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Pull an unquoted integer field out of the node's JSON reply.
+///
+/// Deliberately not a JSON parser: this reads one number out of one small reply
+/// whose shape the node controls, and taking on a dependency for that would be the
+/// tail wagging the dog. A missing or malformed field yields `None`, which the
+/// caller treats as "the node did not say".
+fn field_u64(reply: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\":");
+    let rest = &reply[reply.find(&needle)? + needle.len()..];
+    let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 const DEFAULT_WALLET: &str = "noct-wallet.key";
 const DEFAULT_NODE: &str = "127.0.0.1:9334";
 const DEFAULT_FEE_NOCT: &str = "0.01";
@@ -364,14 +427,16 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
     }
 
     refuse_below_the_floor(&tx);
-    let reply = client.submit_tx(&tx).unwrap_or_else(|e| fail(&e));
-    println!(
-        "sent {} NOCT to the {} pool (fee {} NOCT)",
-        format_noct(amount),
-        if destination.is_shielded() { "shielded" } else { "ring" },
-        format_noct(fee)
+    submit_and_report(
+        &client,
+        &tx,
+        &format!(
+            "sent {} NOCT to the {} pool (fee {} NOCT)",
+            format_noct(amount),
+            if destination.is_shielded() { "shielded" } else { "ring" },
+            format_noct(fee)
+        ),
     );
-    println!("node replied: {}", reply.trim());
 }
 
 fn load(path: &str, network: Network) -> Wallet {
@@ -506,9 +571,15 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
         .build_unshielding(&mut OsRng, &chain, &shielded, &payments, amount, fee, DEFAULT_RING_SIZE)
         .unwrap_or_else(|e| fail(&format!("building transaction: {e:?}")));
     refuse_below_the_floor(&tx);
-    let reply = client.submit_tx(&tx).unwrap_or_else(|e| fail(&e));
-    println!("unshielded {} NOCT (fee {} NOCT)", format_noct(amount), format_noct(fee));
-    println!("node replied: {}", reply.trim());
+    submit_and_report(
+        &client,
+        &tx,
+        &format!(
+            "unshielded {} NOCT (fee {} NOCT)",
+            format_noct(amount),
+            format_noct(fee)
+        ),
+    );
 }
 
 fn cmd_premine_key_image(wallet_path: &str) {
@@ -625,5 +696,51 @@ mod premine_key_image_tests {
             genesis.coinbase.scan(&stranger).is_none(),
             "only the premine wallet may open the genesis output"
         );
+    }
+}
+
+#[cfg(test)]
+mod submit_reply_tests {
+    use super::field_u64;
+
+    /// The node's reply is the only source of truth about whether a transaction
+    /// was sent, so the two answers must not be confusable. `"accepted":true` is
+    /// what [`submit_and_report`] keys on, and a refusal reply must not contain it
+    /// — including the refusal that carries the most fields.
+    #[test]
+    fn a_refusal_is_never_mistaken_for_an_acceptance() {
+        let accepted = r#"{"accepted":true,"txid":"ab12"}"#;
+        let refused = r#"{"accepted":false,"txid":"ab12"}"#;
+        let refused_fee = r#"{"accepted":false,"txid":"ab12","error":"fee below the relay floor","fee":100000,"required_fee":125350000}"#;
+
+        assert!(accepted.contains("\"accepted\":true"));
+        assert!(!refused.contains("\"accepted\":true"));
+        assert!(
+            !refused_fee.contains("\"accepted\":true"),
+            "the fee refusal carries the most fields and is the likeliest to be misread"
+        );
+    }
+
+    /// The figure quoted back to the user comes out of that reply, so reading the
+    /// wrong number would send them to a fee that still fails.
+    #[test]
+    fn the_required_fee_is_read_out_of_the_reply() {
+        let refused_fee = r#"{"accepted":false,"txid":"ab12","error":"fee below the relay floor","fee":100000,"required_fee":125350000}"#;
+        assert_eq!(field_u64(refused_fee, "required_fee"), Some(125_350_000));
+        // `fee` is a prefix of nothing here, but `required_fee` ENDS with `fee`:
+        // searching for the shorter key must not land inside the longer one.
+        assert_eq!(field_u64(refused_fee, "fee"), Some(100_000));
+    }
+
+    /// A field the node did not send means "it did not say", never a zero. A zero
+    /// would be printed as `re-run with --fee 0`, which is advice that cannot work.
+    #[test]
+    fn a_missing_or_malformed_field_says_nothing_rather_than_zero() {
+        assert_eq!(field_u64(r#"{"accepted":false}"#, "required_fee"), None);
+        assert_eq!(field_u64("", "required_fee"), None);
+        // Quoted, so not the unquoted integer this reads; better None than 0.
+        assert_eq!(field_u64(r#"{"required_fee":"125350000"}"#, "required_fee"), None);
+        // Truncated mid-reply, as a dropped connection would leave it.
+        assert_eq!(field_u64(r#"{"accepted":false,"required_fee":"#, "required_fee"), None);
     }
 }
