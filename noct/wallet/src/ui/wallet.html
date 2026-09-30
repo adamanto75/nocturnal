@@ -125,12 +125,24 @@
   <div class="card">
     <div class="label">Balance</div>
     <div class="balance"><span id="balance">—</span><span class="unit">NOCT</span></div>
-    <div class="sub"><span id="outputs">—</span> outputs · synced to height <span id="height">—</span></div>
-    <div class="label" style="margin-top:18px">Your address</div>
+    <!-- Both pools, always, and named. A single figure would have to mean one of
+         them, and whichever it meant would be wrong for somebody: the moment a
+         user shields anything, a ring-only headline falls and the difference is
+         nowhere on screen. -->
+    <div class="sub">ring <span id="ringBal">—</span> · shielded <span id="shBal">—</span></div>
+    <div class="sub" id="pendingRow" style="display:none">plus <span id="shPending">—</span> NOCT of shielded rewards still maturing</div>
+    <div class="sub"><span id="outputs">—</span> outputs · <span id="notes">—</span> <span id="notesWord">notes</span> · synced to height <span id="height">—</span></div>
+    <div class="label" style="margin-top:18px">Your ring address</div>
     <div class="addr-row">
       <div class="addr mono" id="address">—</div>
       <button id="copy" title="Copy">Copy</button>
     </div>
+    <div class="label" style="margin-top:14px">Your shielded address</div>
+    <div class="addr-row">
+      <div class="addr mono" id="shAddress">—</div>
+      <button id="copySh" title="Copy">Copy</button>
+    </div>
+    <div class="sub">Paying this one moves the value into the shielded pool, and <b>that amount is public</b>. A payment that stays inside one pool is not.</div>
     <div style="margin-top:12px; display:flex; align-items:center; gap:10px;">
       <button id="newSub">New subaddress</button>
       <span class="sub" id="subHint">a fresh, unlinkable receiving address</span>
@@ -257,9 +269,20 @@
         $('netbar').classList.remove('show');
       }
       $('address').textContent = s.address || '—';
+      $('shAddress').textContent = s.shielded_address || '—';
       if (s.ok) {
         $('balance').textContent = s.balance;
+        $('ringBal').textContent = (s.ring || '0') + ' NOCT';
+        $('shBal').textContent = (s.shielded || '0') + ' NOCT';
+        // Value that exists and cannot be moved yet, shown separately rather than
+        // folded in: a spendable figure that includes an unreachable note promises
+        // money the wallet cannot actually send.
+        var pend = s.shielded_pending || '0';
+        $('pendingRow').style.display = (pend !== '0') ? '' : 'none';
+        $('shPending').textContent = pend;
         $('outputs').textContent = s.outputs + ' (' + s.unspent + ' unspent)';
+        $('notes').textContent = (s.notes === undefined ? '—' : s.notes);
+        $('notesWord').textContent = (s.notes === 1 ? 'note' : 'notes');
         $('height').textContent = s.height;
         $('dot').classList.add('ok');
         $('status').textContent = 'synced';
@@ -380,6 +403,7 @@
   }
 
   $('copy').onclick = () => copyToButton($('copy'), $('address').textContent, 'Copy');
+  $('copySh').onclick = () => copyToButton($('copySh'), $('shAddress').textContent, 'Copy');
 
   $('newSub').onclick = async () => {
     $('newSub').disabled = true;

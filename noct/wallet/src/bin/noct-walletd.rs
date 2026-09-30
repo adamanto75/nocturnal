@@ -14,10 +14,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use noct_core::address::{Address, Network};
+use noct_core::address::{Address, AnyAddress, Network};
 use noct_core::chain::Blockchain;
 use noct_core::keys::Account;
-use noct_core::tx::Payment;
 use noct_tls::Endpoint;
 use noct_wallet::client::{
     format_noct, load_account, parse_noct, replay_cache, rpc_token_from_args, save_state, state_path,
@@ -307,17 +306,36 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
         Network::Mainnet => "mainnet",
         Network::Testnet => "testnet",
     };
+    let shielded_address = app.shielded.address().encode();
     match sync_app(&mut app) {
-        Ok(height) => format!(
-            "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"balance\":\"{}\",\"outputs\":{},\"unspent\":{},\"history\":{}}}",
-            net,
-            height,
-            address,
-            format_noct(app.wallet.balance()),
-            app.wallet.outputs().len(),
-            app.wallet.unspent().count(),
-            history_json(&app.wallet),
-        ),
+        Ok(height) => {
+            // **`balance` is both pools.** It used to be the ring balance alone,
+            // which meant that the moment a user shielded anything the headline
+            // number fell and the difference was nowhere on screen. A wallet that
+            // understates what somebody owns is the "my coins are gone" report
+            // this project has already had once, and it would have been right.
+            let ring = app.wallet.balance();
+            let shielded = app.shielded.balance();
+            let pending = app.shielded.pending_balance();
+            format!(
+                "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"shielded_address\":\"{}\",\"balance\":\"{}\",\"ring\":\"{}\",\"shielded\":\"{}\",\"shielded_pending\":\"{}\",\"notes\":{},\"outputs\":{},\"unspent\":{},\"history\":{}}}",
+                net,
+                height,
+                address,
+                shielded_address,
+                format_noct(ring + shielded),
+                format_noct(ring),
+                format_noct(shielded),
+                // Shielded rewards that exist but cannot be moved yet, kept out of
+                // the spendable figures rather than folded in: a balance including
+                // a note no anchor can reach promises money that cannot be spent.
+                format_noct(pending),
+                app.shielded.unspent().count(),
+                app.wallet.outputs().len(),
+                app.wallet.unspent().count(),
+                history_json(&app.wallet),
+            )
+        }
         Err(e) => format!("{{\"ok\":false,\"network\":\"{}\",\"address\":\"{}\",\"error\":\"{}\"}}", net, address, escape(&e)),
     }
 }
@@ -436,7 +454,13 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
     let amount_s = form.iter().find(|(k, _)| k == "amount").map(|(_, v)| v.clone()).unwrap_or_default();
     let fee_s = form.iter().find(|(k, _)| k == "fee").map(|(_, v)| v.clone()).unwrap_or_else(|| "0.01".into());
 
-    let destination = match Address::decode(to.trim()) {
+    // **Either kind of address.** Which pool a payment lands in is the
+    // recipient's choice, already expressed in the address they handed over, so
+    // the sender does not get a second button for it — and could not, without
+    // knowing something the address already says. Before this, pasting a
+    // shielded address here answered "invalid destination address", which is
+    // both wrong and the least helpful way to be wrong.
+    let destination = match AnyAddress::decode(to.trim()) {
         Ok(a) => a,
         Err(_) => return err_json("invalid destination address"),
     };
@@ -450,23 +474,85 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
     };
 
     let mut app = app.lock().unwrap();
+    if destination.network() != app.network {
+        return err_json(&format!(
+            "that address belongs to {:?} and this wallet is on {:?} — refusing to send",
+            destination.network(),
+            app.network
+        ));
+    }
     if let Err(e) = sync_app(&mut app) {
         return err_json(&format!("sync failed: {e}"));
     }
-    let payments = [Payment { destination, amount }];
-    let tx = match app.wallet.build_transaction(&mut OsRng, &app.chain, &payments, fee, DEFAULT_RING_SIZE) {
+
+    let App { wallet, shielded, chain, .. } = &mut *app;
+    let tx = match wallet.build_payout(
+        &mut OsRng,
+        chain,
+        shielded,
+        &[(destination, amount)],
+        fee,
+        DEFAULT_RING_SIZE,
+    ) {
         Ok(tx) => tx,
         Err(e) => return err_json(&format!("{e:?}")),
     };
+
+    // The relay floor, checked before anything is sent rather than after the
+    // node refuses. The node publishes its own as `min_fee_per_kb`; this catches
+    // the ordinary case and names the number to use.
+    let size = noct_core::wire::encode_transaction(&tx).len();
+    let required = noct_core::mempool::min_fee(size);
+    if tx.fee < required {
+        return err_json(&format!(
+            "fee {} NOCT is below the relay floor for this {size}-byte transaction, which needs {} NOCT. Nothing was sent.",
+            format_noct(tx.fee),
+            format_noct(required),
+        ));
+    }
+
+    // What this publishes, said before it is sent. A crossing's amount is the one
+    // thing the two-pool design cannot hide, and somebody shielding an unusual
+    // number should learn that from their wallet rather than from an analyst.
+    let crossing = if tx.cross > 0 {
+        format!(
+            " Note: {} NOCT moved into the shielded pool, and that amount is public.",
+            format_noct(tx.cross as u64)
+        )
+    } else {
+        String::new()
+    };
+    let pool = if destination.is_shielded() { "shielded" } else { "ring" };
+
     let txid = hex::encode(tx.hash());
+    // **The node's answer decides, not the transport's.** This used to report
+    // success whenever `submit_tx` returned `Ok`, which is true even when the
+    // node answered `accepted: false` — so a refused transaction was shown to
+    // the user as sent. See the same fix in `noct-cli`.
     match app.client.submit_tx(&tx) {
-        Ok(_) => format!(
-            "{{\"ok\":true,\"txid\":\"{}\",\"message\":\"sent {} NOCT (fee {} NOCT); it will confirm when a block is mined\"}}",
+        Ok(reply) if reply.contains("\"accepted\":true") => format!(
+            "{{\"ok\":true,\"txid\":\"{}\",\"message\":\"sent {} NOCT to the {} pool (fee {} NOCT); it will confirm when a block is mined.{}\"}}",
             txid,
             format_noct(amount),
-            format_noct(fee)
+            pool,
+            format_noct(fee),
+            crossing,
         ),
-        Err(e) => err_json(&format!("node rejected: {e}")),
+        Ok(reply) => {
+            let reason = reply
+                .split("\"reason\":\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| reply.trim().to_string());
+            err_json(&format!("not sent — the node refused it: {reason}"))
+        }
+        // No reply at all: it may have been relayed before the connection broke,
+        // or never have arrived. Calling it "not sent" would be a guess that
+        // invites sending it twice.
+        Err(e) => err_json(&format!(
+            "outcome unknown ({e}) — it may or may not have been relayed. Check the chain for {txid} before sending again"
+        )),
     }
 }
 
