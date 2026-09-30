@@ -17,21 +17,21 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.4-testnet</b> — <b>the node now reports what it did with your
-     transaction</b>. It used to answer "accepted" for a transaction no mempool would
-     keep — two sends in a row from one wallet both looked successful while only one
-     was real — and <code>noct-cli</code> printed "sent" before it had read the
-     node's reply. Both are fixed, and a refusal now exits non-zero with the reason.
-     Relay policy only, no consensus change, so update whenever suits. v0.3.0 <i>did</i>
-     change consensus: a node older than that cannot follow the current testnet chain,
-     so if you are running v0.2.x or earlier, update or you will simply stop syncing.</p>
+  <p><b>v0.3.5-testnet</b> — <b>documentation and tests only; the binaries are
+     byte-identical to v0.3.4</b>, so if you are running that there is nothing to do.
+     It records the decision that the genesis <b>premine stays a transparent ring
+     output</b> rather than becoming a shielded note, with the reasoning, and adds the
+     test proving the founder can still move it into the shielded pool later — which
+     is what makes leaving genesis alone safe. v0.3.0 changed consensus: a node older
+     than that cannot follow the current testnet chain, so if you are running v0.2.x
+     or earlier, update or you will simply stop syncing.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.4-testnet/nocturnal-v0.3.4-testnet-linux-x64.tar.gz">nocturnal-v0.3.4-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/nocturnal-v0.3.5-testnet-linux-x64.tar.gz">nocturnal-v0.3.5-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.4-testnet/nocturnal-v0.3.4-testnet-windows-x64.zip">nocturnal-v0.3.4-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/nocturnal-v0.3.5-testnet-windows-x64.zip">nocturnal-v0.3.5-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.4-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.4-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.5-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The desktop wallet installer is not part of this release.</b> The newest
