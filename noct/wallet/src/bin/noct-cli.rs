@@ -75,10 +75,23 @@ fn submit_and_report(client: &NodeClient, tx: &noct_core::tx::Transaction, succe
         Ok(reply) if reply.contains("\"accepted\":true") => {
             println!("{success}");
             println!("txid: {txid}");
+            // Accepted does not always mean the node kept it: a full mempool
+            // relays without storing. Worth saying, because it changes how likely
+            // the transaction is to be mined.
+            if reply.contains("\"outcome\":\"relayed-not-pooled\"") {
+                if let Some(reason) = field_str(&reply, "reason") {
+                    eprintln!("warning: {reason}");
+                }
+            }
         }
         Ok(reply) => {
             eprintln!("NOT SENT — the node refused this transaction.");
-            eprintln!("  node replied: {}", reply.trim());
+            // The node says why in one sentence; show that rather than a JSON
+            // body, and keep the raw reply only when it did not say.
+            match field_str(&reply, "reason") {
+                Some(reason) => eprintln!("  {reason}"),
+                None => eprintln!("  node replied: {}", reply.trim()),
+            }
             // A node may run a higher relay floor than this binary; it publishes
             // its own as `min_fee_per_kb` on /info, and quotes the figure for THIS
             // transaction when it refuses one. Repeat it as an actionable number
@@ -99,6 +112,16 @@ fn submit_and_report(client: &NodeClient, tx: &noct_core::tx::Transaction, succe
             std::process::exit(2);
         }
     }
+}
+
+/// Pull a quoted string field out of the node's JSON reply. See [`field_u64`] on
+/// why this is not a JSON parser. Returns `None` rather than an empty string when
+/// the field is absent, so the caller can fall back to showing the raw reply.
+fn field_str(reply: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let rest = &reply[reply.find(&needle)? + needle.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// Pull an unquoted integer field out of the node's JSON reply.

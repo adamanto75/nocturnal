@@ -463,42 +463,36 @@ fn handle_client(
             };
             let txid = hex::encode(tx.hash());
 
-            // The relay floor, answered with a number.
-            //
-            // The gossip path drops an underpaying transaction silently, which is
-            // right for a stranger's traffic. This is the local submission path:
-            // whoever called it is holding a wallet and a transaction they just
-            // paid to build, and "accepted: false" with no reason is how a user
-            // ends up re-sending the same too-cheap transaction all afternoon.
-            // They need the figure, so it is computed and returned.
-            // Re-encoded rather than `raw.len()`: the number quoted back has to
-            // be the one the mempool will apply, and a non-canonical encoding
-            // that decoded fine would otherwise quote a size nothing agrees with.
-            let required = noct_core::mempool::min_fee(wire::encode_transaction(&tx).len());
-            if tx.fee < required {
-                return respond(
-                    reader.get_mut(),
-                    "200 OK",
-                    &format!(
-                        "{{\"accepted\":false,\"txid\":\"{txid}\",\"error\":\"fee below the relay floor\",\"fee\":{},\"required_fee\":{required}}}",
-                        tx.fee
-                    ),
-                );
-            }
-
             // Fluff immediately (see transport.rs on deferred stem) so a locally
             // submitted transaction reliably reaches the network's mempools.
-            let relay = {
+            //
+            // The node's own verdict is what gets reported, rather than a guess
+            // derived from the relay decision. `accepted` used to be
+            // `!matches!(relay, Relay::Drop)`, which answered "did we forward it"
+            // when the caller was asking "is it going to get mined" — and those
+            // differ for an unconfirmed double-spend, which was forwarded and
+            // kept by nobody.
+            let (relay, outcome) = {
                 let mut node = state.lock().unwrap();
-                node.originate_tx(&mut OsRng, tx, false)
+                node.originate_tx_reported(&mut OsRng, tx, false)
             };
-            let accepted = !matches!(relay, crate::Relay::Drop);
             peers.execute(relay);
-            respond(
-                reader.get_mut(),
-                "200 OK",
-                &format!("{{\"accepted\":{accepted},\"txid\":\"{txid}\"}}"),
-            )
+
+            let mut json = format!(
+                "{{\"accepted\":{},\"txid\":\"{txid}\",\"outcome\":\"{}\"",
+                outcome.accepted(),
+                outcome.tag(),
+            );
+            if let Some(reason) = outcome.reason() {
+                json.push_str(&format!(",\"reason\":\"{reason}\""));
+            }
+            // The floor is per-node policy, so the figure this node wants is the
+            // one that matters — not whatever the sender's binary computed.
+            if let Some(required) = outcome.required_fee() {
+                json.push_str(&format!(",\"required_fee\":{required}"));
+            }
+            json.push('}');
+            respond(reader.get_mut(), "200 OK", &json)
         }
         // GET /mining — current miner state for the wallet UI.
         ("GET", "/mining") => {

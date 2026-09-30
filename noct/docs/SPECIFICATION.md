@@ -553,6 +553,21 @@ node `transport.rs`):
   ban peers on older builds. Nodes publish their own floor as `min_fee_per_kb` on
   `/info`, and `/submit_tx` answers a refusal with the `required_fee` for that
   transaction's size.
+- **Unconfirmed double-spends are not relayed.** A transaction whose key image
+  collides with one already in the pool is dropped rather than forwarded: every
+  pool holding the first copy would refuse the second for the same reason, so
+  relaying it only propagates a double-spend attempt. It earns **no misbehaviour
+  points** either, since it arrives through whichever peer forwarded it and that
+  peer cannot know the receiving node's pool contents.
+- **`/submit_tx` reports what the node did, not merely whether it forwarded.** The
+  reply carries `outcome` — `pooled`, `stemmed`, `relayed-not-pooled`, `duplicate`
+  or `refused` — plus a one-sentence `reason` when there is something to explain.
+  `accepted` means the network can be expected to have the transaction, which is
+  **not** the same as this node holding it: a full mempool relays without storing
+  (`relayed-not-pooled`), because one node's memory pressure should not censor
+  traffic for everyone downstream of it, and this protocol pushes whole
+  transactions rather than announcing them, so a peer never asks for a copy the
+  relayer does not have.
 
 ---
 
@@ -738,7 +753,17 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
    verification cost: contrary to expectation, Orchard bundles are the cheapest
    shape per byte and many-output ring transactions the dearest, so no per-action
    surcharge is applied.
-10. **OPEN — node memory holds the whole chain.** Every block is retained with its
+10. **CLOSED — the node reported transactions as accepted that it had not kept.**
+    `accept_tx_scored` admitted to the mempool with `let _ = …` and relayed
+    regardless, and `/submit_tx` derived `accepted` from the relay decision, so an
+    unconfirmed double-spend was answered `accepted: true` while no mempool on the
+    network kept it — `noct-cli` printed "sent" and exited zero for a transaction
+    that had gone nowhere. Reproduced against a running node. The node now uses the
+    pool's verdict and reports it (§15). Worth an auditor's attention: the fix has
+    to hold on *re-submission* too, since a refused transaction is already in
+    `seen_txs` and the duplicate path must not answer "accepted" for something the
+    node is not holding; a test pins that.
+11. **OPEN — node memory holds the whole chain.** Every block is retained with its
    decoded transactions, so resident memory grows with chain length (~23 KB per
    block measured on testnet). The validation state proper — the output set and
    spent key images — is a small fraction of it. Serving blocks from the on-disk

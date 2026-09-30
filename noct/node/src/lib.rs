@@ -20,7 +20,7 @@ use noct_core::address::AnyAddress;
 use noct_core::block::{Block, BlockHeader, Coinbase, CoinbaseError};
 use noct_core::chain::{Blockchain, ChainError};
 use noct_core::emission::base_reward;
-use noct_core::mempool::Mempool;
+use noct_core::mempool::{Mempool, MempoolError};
 use noct_core::p2p::{Phase, Wire};
 use noct_core::pow::ProofOfWork;
 use noct_core::tx::Transaction;
@@ -506,6 +506,125 @@ struct Collect {
     blocks: Vec<(Block, Vec<Transaction>)>,
 }
 
+/// What the node actually did with a transaction it was handed.
+///
+/// `POST /submit_tx` used to answer `accepted: !matches!(relay, Relay::Drop)`,
+/// which conflated two different questions: *did we relay it* and *are we
+/// holding it*. Those come apart. A transaction that collides with an
+/// unconfirmed one already in the pool was relayed and not kept, and the caller
+/// was told `accepted: true` for something no mempool on the network would
+/// keep — `noct-cli` printed "sent" and exited zero for a transaction that had
+/// gone nowhere.
+///
+/// So the node reports what it did, and the two questions are separate fields.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TxOutcome {
+    /// Verified, kept, and flooded. The ordinary success.
+    Pooled,
+    /// Verified and handed to exactly one peer without being kept — the
+    /// Dandelion++ stem phase, which deliberately does not pool. Local
+    /// submissions never land here: `/submit_tx` passes `can_stem = false`.
+    Stemmed,
+    /// Verified and flooded, but **not kept**: the pool is full and this did not
+    /// outbid what is in it.
+    ///
+    /// Relayed anyway, deliberately. The transaction is valid and pays a market
+    /// rate; our memory pressure is not the sender's problem, and other nodes
+    /// may have room. Dropping it would let one node with a full pool censor
+    /// traffic for everyone downstream of it. Nothing here depends on us
+    /// retaining it either — this protocol pushes whole transactions rather than
+    /// announcing them for peers to request, so a peer never asks us for a copy
+    /// we do not have.
+    RelayedNotPooled,
+    /// Seen before. `in_pool` says whether we are still holding it, which is the
+    /// difference between "yes, it is out there" and "we processed this earlier
+    /// and did not keep it".
+    Duplicate { in_pool: bool },
+    /// Refused, with why.
+    Refused(TxRefusal),
+}
+
+/// Why a transaction was refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TxRefusal {
+    /// Below this node's relay floor, with what this transaction's size needed.
+    /// Nodes may legitimately differ here, so the figure is worth returning.
+    FeeTooLow { required: u64 },
+    /// Collides with an unconfirmed transaction already in the pool: the same
+    /// key image, which means the same output, which means the same spender.
+    Conflict,
+    /// Failed verification, or spends something already spent on chain.
+    Invalid,
+    /// We cannot tell. A ring member we have not synced, or a coinbase that is
+    /// immature at *our* height — a verdict about us, not about the transaction.
+    Undecidable,
+}
+
+impl TxOutcome {
+    /// Whether the network can be expected to have this transaction. True when
+    /// we pooled it, when we relayed it without keeping it, and when we had
+    /// already taken it; false for every refusal.
+    pub fn accepted(&self) -> bool {
+        match self {
+            TxOutcome::Pooled | TxOutcome::Stemmed | TxOutcome::RelayedNotPooled => true,
+            TxOutcome::Duplicate { in_pool } => *in_pool,
+            TxOutcome::Refused(_) => false,
+        }
+    }
+
+    /// A short machine-readable tag for the `/submit_tx` reply.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            TxOutcome::Pooled => "pooled",
+            TxOutcome::Stemmed => "stemmed",
+            TxOutcome::RelayedNotPooled => "relayed-not-pooled",
+            TxOutcome::Duplicate { .. } => "duplicate",
+            TxOutcome::Refused(_) => "refused",
+        }
+    }
+
+    /// One sentence a person can act on, or `None` when there is nothing to
+    /// explain because it simply worked.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            TxOutcome::Pooled | TxOutcome::Stemmed => None,
+            TxOutcome::RelayedNotPooled => Some(
+                "relayed but not kept: this node's mempool is full and this transaction \
+                 did not outbid what is in it",
+            ),
+            TxOutcome::Duplicate { in_pool: true } => {
+                Some("already in this node's mempool")
+            }
+            TxOutcome::Duplicate { in_pool: false } => Some(
+                "already seen by this node and not in its mempool — it was refused \
+                 earlier, or has already been mined",
+            ),
+            TxOutcome::Refused(TxRefusal::FeeTooLow { .. }) => {
+                Some("fee below the relay floor")
+            }
+            TxOutcome::Refused(TxRefusal::Conflict) => Some(
+                "conflicts with an unconfirmed transaction already in the mempool — \
+                 the same output is already being spent",
+            ),
+            TxOutcome::Refused(TxRefusal::Invalid) => {
+                Some("failed validation against this node's chain")
+            }
+            TxOutcome::Refused(TxRefusal::Undecidable) => Some(
+                "this node cannot judge it yet: an unknown ring member or an immature \
+                 coinbase at this node's height. It may be perfectly valid elsewhere",
+            ),
+        }
+    }
+
+    /// The fee this node wanted, when that was the problem.
+    pub fn required_fee(&self) -> Option<u64> {
+        match self {
+            TxOutcome::Refused(TxRefusal::FeeTooLow { required }) => Some(*required),
+            _ => None,
+        }
+    }
+}
+
 /// What the transport should do with a message after [`NodeState`] processed it.
 #[derive(Clone, Debug)]
 pub enum Relay {
@@ -785,6 +904,22 @@ impl NodeState {
         self.accept_tx_scored(rng, tx, phase, can_stem).0
     }
 
+    /// Submit a locally-created transaction and learn what the node did with it.
+    ///
+    /// [`Self::originate_tx`] returns only the relay decision, which cannot
+    /// distinguish "kept and flooded" from "relayed but not kept" from "refused".
+    /// The RPC needs that distinction: it is answering somebody who just paid to
+    /// build this transaction and wants to know whether it is going anywhere.
+    pub fn originate_tx_reported<R: rand_core::RngCore + rand_core::CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        tx: Transaction,
+        can_stem: bool,
+    ) -> (Relay, TxOutcome) {
+        let (relay, _, outcome) = self.accept_tx_scored(rng, tx, Phase::Stem, can_stem);
+        (relay, outcome)
+    }
+
     /// Like [`Self::accept_tx`] but also reports misbehavior points: an invalid
     /// transaction from a peer earns [`MISBEHAVIOR_INVALID_TX`]; a duplicate
     /// (already-seen) earns nothing.
@@ -794,9 +929,16 @@ impl NodeState {
         tx: Transaction,
         phase: Phase,
         can_stem: bool,
-    ) -> (Relay, u32) {
-        if !self.seen_txs.insert(tx.hash()) {
-            return (Relay::Drop, 0); // already processed → stops gossip loops
+    ) -> (Relay, u32, TxOutcome) {
+        let hash = tx.hash();
+        if !self.seen_txs.insert(hash) {
+            // Already processed → stops gossip loops. Whether it is still ours to
+            // offer is a different question from whether we have seen it, and the
+            // caller needs the second one: "we took this earlier and are holding
+            // it" and "we processed this earlier and threw it away" look identical
+            // from here otherwise.
+            let in_pool = self.mempool.contains(&hash);
+            return (Relay::Drop, 0, TxOutcome::Duplicate { in_pool });
         }
 
         // The relay floor, before verification and before relay.
@@ -816,8 +958,9 @@ impl NodeState {
         // `UnknownRingMember`: this is our policy, not the sender's honesty. A
         // peer on an older build, or one with a lower floor, relays these in
         // perfectly good faith, and scoring them would ban our own seeds.
-        if tx.fee < noct_core::mempool::min_fee(noct_core::wire::encode_transaction(&tx).len()) {
-            return (Relay::Drop, 0);
+        let required = noct_core::mempool::min_fee(noct_core::wire::encode_transaction(&tx).len());
+        if tx.fee < required {
+            return (Relay::Drop, 0, TxOutcome::Refused(TxRefusal::FeeTooLow { required }));
         }
 
         match self.chain.validate_tx(rng, &tx) {
@@ -842,25 +985,82 @@ impl NodeState {
             // is dropped and never relayed — only the penalty goes. It is also
             // cheap to reject, being a hash lookup before any signature work.
             Err(ChainError::UnknownRingMember) | Err(ChainError::ImmatureCoinbase) => {
-                return (Relay::Drop, 0);
+                return (Relay::Drop, 0, TxOutcome::Refused(TxRefusal::Undecidable));
             }
             // Anything else is bad regardless of where we are: a failed
             // signature or range proof, a double spend of an image we already
             // have on chain.
-            Err(_) => return (Relay::Drop, MISBEHAVIOR_INVALID_TX),
+            Err(_) => {
+                return (
+                    Relay::Drop,
+                    MISBEHAVIOR_INVALID_TX,
+                    TxOutcome::Refused(TxRefusal::Invalid),
+                )
+            }
         }
         // Stay in the stem only if we can actually relay it onward; with no peer
         // to stem to we must fluff now, or the transaction is silently lost.
         let stem = can_stem
             && matches!(phase, Phase::Stem)
             && (rng.next_u64() as f64 / u64::MAX as f64) >= self.fluff_probability;
-        let relay = if stem {
-            Relay::StemToOne(Wire::Tx(tx, Phase::Stem))
-        } else {
-            let _ = self.mempool.add(rng, &self.chain, tx.clone());
-            Relay::FloodToAll(Wire::Tx(tx, Phase::Fluff))
-        };
-        (relay, 0)
+        if stem {
+            return (Relay::StemToOne(Wire::Tx(tx, Phase::Stem)), 0, TxOutcome::Stemmed);
+        }
+
+        // **Use the pool's answer.** This used to be `let _ = self.mempool.add(…)`
+        // followed by an unconditional flood, so whatever the pool decided was
+        // discarded — and `/submit_tx` derived "accepted" from the relay, which
+        // meant a transaction the pool had refused was reported as sent. The fee
+        // branch of that bug was fixed by checking the floor above; this is the
+        // rest of it.
+        match self.mempool.add(rng, &self.chain, tx.clone()) {
+            Ok(_) => (Relay::FloodToAll(Wire::Tx(tx, Phase::Fluff)), 0, TxOutcome::Pooled),
+
+            // An unconfirmed double-spend: same key image, so the same output,
+            // so the same spender. **Not relayed.** Forwarding it would
+            // propagate a double-spend attempt, and could not help anyone
+            // anyway, since every pool holding the first copy refuses this one
+            // for exactly the reason we just did.
+            //
+            // **No misbehaviour points.** Two honest users cannot spend one
+            // output, so this is either a sender's own mistake or a deliberate
+            // attempt — but it reaches us through whichever peer happened to
+            // forward it, and that peer cannot know our pool's contents. Scoring
+            // the messenger is how this codebase banned its own seeds once
+            // already; see `UnknownRingMember` above.
+            Err(MempoolError::PoolConflict) => {
+                (Relay::Drop, 0, TxOutcome::Refused(TxRefusal::Conflict))
+            }
+
+            // Valid and well-paying, but we have no room for it. Relayed anyway
+            // — see `TxOutcome::RelayedNotPooled` for why — and reported as not
+            // kept, so nobody is told we are holding something we are not.
+            Err(MempoolError::PoolFull) => (
+                Relay::FloodToAll(Wire::Tx(tx, Phase::Fluff)),
+                0,
+                TxOutcome::RelayedNotPooled,
+            ),
+
+            // We hold it already. `seen_txs` above normally catches this, so
+            // reaching here means the two sets disagree; either way the
+            // transaction is in our pool and relaying it is correct.
+            Err(MempoolError::AlreadyKnown) => (
+                Relay::FloodToAll(Wire::Tx(tx, Phase::Fluff)),
+                0,
+                TxOutcome::Duplicate { in_pool: true },
+            ),
+
+            // Both unreachable from here: the fee was checked before
+            // verification and validity immediately above. Mapped rather than
+            // ignored, so that reordering these checks later cannot turn a
+            // silent mismatch into a wrong answer to the caller.
+            Err(MempoolError::FeeTooLow { required }) => {
+                (Relay::Drop, 0, TxOutcome::Refused(TxRefusal::FeeTooLow { required }))
+            }
+            Err(MempoolError::Invalid(_)) => {
+                (Relay::Drop, MISBEHAVIOR_INVALID_TX, TxOutcome::Refused(TxRefusal::Invalid))
+            }
+        }
     }
 
     /// Handle an incoming block (with its transactions).
@@ -899,7 +1099,7 @@ impl NodeState {
         let mut out = Reaction::default();
         match msg {
             Wire::Tx(tx, phase) => {
-                let (relay, score) = self.accept_tx_scored(rng, tx, phase, can_stem);
+                let (relay, score, _) = self.accept_tx_scored(rng, tx, phase, can_stem);
                 out.misbehavior += score;
                 match relay {
                     Relay::Drop => {}
@@ -2555,6 +2755,110 @@ mod tests {
             }
             other => panic!("expected Tip(NETWORK_ID, 4, _, work), got {other:?}"),
         }
+    }
+
+    /// **A second transaction spending the same output is refused, not relayed,
+    /// and not reported as sent.**
+    ///
+    /// The bug this pins: `accept_tx_scored` used to call `let _ =
+    /// self.mempool.add(…)` and flood regardless, and `/submit_tx` derived
+    /// `accepted` from the relay decision. So sending twice from one wallet with
+    /// no block in between gave two `accepted: true` answers and two txids, while
+    /// the mempool held one transaction. `noct-cli` printed "sent" and exited zero
+    /// for a transaction no mempool on the network would keep. Reproduced against
+    /// a live node before this was fixed.
+    ///
+    /// Three claims, matching the relay-floor test above:
+    ///
+    /// * **Not pooled** — the pool already has a transaction spending that output.
+    /// * **Not relayed.** Forwarding a double-spend attempt helps nobody: every
+    ///   pool holding the first copy refuses the second for the same reason.
+    /// * **No misbehaviour points.** It arrives through whichever peer forwarded
+    ///   it, and that peer cannot know our pool's contents.
+    #[test]
+    fn a_second_spend_of_one_output_is_refused_unrelayed_and_unpunished() {
+        let miner = wallet();
+        let mut node = test_node(miner.address());
+        let mut miner_view = miner;
+        mine_n(&mut node, &mut miner_view, 16);
+
+        let bob = wallet();
+        let spendable = miner_view.unspent().next().cloned().unwrap();
+        let fee = noct_core::emission::ATOMIC_UNITS / 100;
+
+        // Two different transactions spending the SAME output, as a wallet
+        // building twice without seeing the first one confirmed would produce.
+        let build = |amount: u64, view: &noct_wallet::Wallet, chain: &_| {
+            view.build_transaction(
+                &mut OsRng,
+                chain,
+                &[noct_core::tx::Payment { destination: bob.address(), amount }],
+                fee,
+                DEFAULT_RING_SIZE,
+            )
+            .unwrap()
+        };
+        let first = build(spendable.amount() - fee, &miner_view, &node.chain);
+        let second = build(spendable.amount() - fee - 1, &miner_view, &node.chain);
+        assert_ne!(first.hash(), second.hash(), "two distinct transactions");
+        assert_eq!(
+            first.key_images(),
+            second.key_images(),
+            "spending the same output, which is what makes the second a conflict"
+        );
+
+        let (_, outcome) = node.originate_tx_reported(&mut OsRng, first, false);
+        assert_eq!(outcome, TxOutcome::Pooled, "the first one is ordinary");
+        assert!(outcome.accepted());
+        assert_eq!(node.mempool_len(), 1);
+
+        // The second: refused, and said so.
+        let r = node.react(&mut OsRng, 0, Wire::Tx(second.clone(), Phase::Fluff), true);
+        assert_eq!(r.misbehavior, 0, "a conflict is not a hostile peer");
+        assert!(r.broadcast.is_empty(), "and must not be forwarded");
+        assert!(r.stem.is_empty());
+        assert_eq!(node.mempool_len(), 1, "the pool still holds exactly the first");
+
+        // **Re-submitting it must not report success either.** This is the trap
+        // the fix could easily have walked into: the refused transaction is now
+        // in `seen_txs`, so a second attempt takes the duplicate path — and a
+        // duplicate that we are *not* holding is not a send. Answering "accepted"
+        // here would reintroduce the same lie one call later.
+        let (relay, outcome) = node.originate_tx_reported(&mut OsRng, second, false);
+        assert_eq!(outcome, TxOutcome::Duplicate { in_pool: false });
+        assert!(!outcome.accepted(), "seen before and not held is not a send");
+        assert!(matches!(relay, Relay::Drop));
+        assert_eq!(node.mempool_len(), 1);
+    }
+
+    /// `accepted` must mean "the network can be expected to have it", and the
+    /// outcomes where that is false must all say so. A single wrong arm here is
+    /// the whole bug coming back.
+    #[test]
+    fn only_outcomes_the_network_actually_has_count_as_accepted() {
+        assert!(TxOutcome::Pooled.accepted());
+        assert!(TxOutcome::Stemmed.accepted());
+        assert!(TxOutcome::RelayedNotPooled.accepted(), "relayed, so it is out there");
+        assert!(TxOutcome::Duplicate { in_pool: true }.accepted());
+        assert!(
+            !TxOutcome::Duplicate { in_pool: false }.accepted(),
+            "seen before and NOT held is not a send"
+        );
+        for r in [
+            TxRefusal::Conflict,
+            TxRefusal::Invalid,
+            TxRefusal::Undecidable,
+            TxRefusal::FeeTooLow { required: 1 },
+        ] {
+            assert!(!TxOutcome::Refused(r).accepted(), "{r:?} is not accepted");
+            assert!(TxOutcome::Refused(r).reason().is_some(), "{r:?} must explain itself");
+        }
+        assert_eq!(
+            TxOutcome::Refused(TxRefusal::FeeTooLow { required: 42 }).required_fee(),
+            Some(42),
+            "the actionable number has to survive"
+        );
+        assert_eq!(TxOutcome::Pooled.required_fee(), None);
     }
 
     /// **An underpaying transaction is dropped, not forwarded, and costs the
