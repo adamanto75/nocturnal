@@ -24,7 +24,7 @@ use noct_wallet::client::{
     NodeClient, TrustedPow,
 };
 use noct_wallet::shielded::ShieldedWallet;
-use noct_wallet::{Direction, Wallet, DEFAULT_RING_SIZE};
+use noct_wallet::{Direction, SpendFrom, Wallet, DEFAULT_RING_SIZE};
 use rand_core::OsRng;
 
 const INDEX_HTML: &str = include_str!("../ui/wallet.html");
@@ -472,6 +472,15 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
         Some(f) => f,
         None => return err_json("invalid fee"),
     };
+    // Which pool the money comes FROM — the sender's own choice, separate from
+    // the destination pool the address fixes. An unrecognised value is refused
+    // rather than treated as `auto`, because the difference between them is
+    // whether an amount gets published.
+    let from_s = form.iter().find(|(k, _)| k == "from").map(|(_, v)| v.clone()).unwrap_or_else(|| "auto".into());
+    let from = match SpendFrom::parse(&from_s) {
+        Some(f) => f,
+        None => return err_json("source pool must be ring, shielded or auto"),
+    };
 
     let mut app = app.lock().unwrap();
     if destination.network() != app.network {
@@ -486,13 +495,15 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
     }
 
     let App { wallet, shielded, chain, .. } = &mut *app;
-    let tx = match wallet.build_payout(
+    let tx = match wallet.build_send(
         &mut OsRng,
         chain,
         shielded,
-        &[(destination, amount)],
+        destination,
+        amount,
         fee,
         DEFAULT_RING_SIZE,
+        from,
     ) {
         Ok(tx) => tx,
         Err(e) => return err_json(&format!("{e:?}")),
@@ -519,8 +530,23 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
             " Note: {} NOCT moved into the shielded pool, and that amount is public.",
             format_noct(tx.cross as u64)
         )
+    } else if tx.cross < 0 && (-tx.cross) as u64 > tx.fee {
+        // Only when value is genuinely leaving: when the sole crossing IS the
+        // fee, calling it a disclosure is noise, and noise teaches people to
+        // ignore the warning that matters.
+        format!(
+            " Note: {} NOCT came out of the shielded pool, and that amount is public.",
+            format_noct((-tx.cross) as u64)
+        )
     } else {
         String::new()
+    };
+    // Worth saying when they got the private shape, because `auto` would not have
+    // built it: no ring inputs, outputs or range proof to correlate.
+    let shape = if tx.inputs.is_empty() && tx.outputs.is_empty() {
+        " This one stayed inside the shielded pool — no ring side at all, and only the fee is public."
+    } else {
+        ""
     };
     let pool = if destination.is_shielded() { "shielded" } else { "ring" };
 
@@ -536,7 +562,7 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
             format_noct(amount),
             pool,
             format_noct(fee),
-            crossing,
+            format!("{crossing}{shape}"),
         ),
         Ok(reply) => {
             let reason = reply

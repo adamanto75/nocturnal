@@ -120,6 +120,46 @@ impl OwnedOutput {
     }
 }
 
+/// Which pool a payment should be funded from.
+///
+/// The *destination* pool is the recipient's choice, already expressed in the
+/// address they handed over. This is the sender's own, separate choice, and it
+/// matters because it decides what the transaction publishes: a payment that
+/// stays inside one pool reveals only its fee, while one that crosses reveals
+/// the amount that crossed.
+///
+/// Until this existed the sender had no say. [`SpendFrom::Auto`] is that old
+/// behaviour, and it is still the default — but it can turn a private in-pool
+/// payment into a public crossing on its own, when the notes fall even one
+/// atomic unit short of the amount. Being told that is happening is better than
+/// not; being able to say "no, spend my notes" is better still.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SpendFrom {
+    /// Let the wallet decide. Ring destinations are paid from ring outputs;
+    /// a shielded destination is paid from notes when they cover it outright and
+    /// crosses from the ring side otherwise.
+    #[default]
+    Auto,
+    /// Fund it from ring outputs, crossing into the shielded pool if that is
+    /// where it is going.
+    Ring,
+    /// Fund it from shielded notes.
+    Shielded,
+}
+
+impl SpendFrom {
+    /// Parse a user-supplied `--from` value. `None` for anything else, so the
+    /// caller can reject it by name rather than silently choosing.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(SpendFrom::Auto),
+            "ring" => Some(SpendFrom::Ring),
+            "shielded" | "zk" => Some(SpendFrom::Shielded),
+            _ => None,
+        }
+    }
+}
+
 /// Errors from building a spend.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WalletError {
@@ -578,6 +618,95 @@ impl Wallet {
         build_authorized(rng, &inputs, &payments, fee, &tx_keys, cross, plan)
     }
 
+
+    /// Build a one-recipient payment, funded from the pool the sender chose.
+    ///
+    /// **This is the only place the four combinations are decided**, so that
+    /// `noct-cli` and the desktop wallet cannot drift into two different ideas of
+    /// what `--from shielded` means:
+    ///
+    /// | from | to | what it is |
+    /// |---|---|---|
+    /// | ring | ring | an ordinary ring payment |
+    /// | ring | shielded | a shielding: the amount crosses, and is public |
+    /// | shielded | shielded | a transfer **inside** the pool — no ring side at all |
+    /// | shielded | ring | an unshielding: the amount crosses, and is public |
+    ///
+    /// [`SpendFrom::Auto`] keeps the previous behaviour exactly, by deferring to
+    /// [`Wallet::build_payout`].
+    ///
+    /// **`Shielded` → `Shielded` is not merely `Auto` with the choice forced.**
+    /// `Auto` pays a shielded destination from notes only when they cover it, and
+    /// still raises the *fee* from a ring input, so the transaction has a ring
+    /// side. Choosing `Shielded` builds the pure in-pool form, where the fee
+    /// crosses out of the pool instead and there are no ring inputs, outputs or
+    /// range proof to correlate. That is the most private shape this chain has,
+    /// and it was previously unreachable from either wallet.
+    ///
+    /// **`Shielded` → `Ring` still needs one ring input**, which is not a
+    /// contradiction so much as a consequence of the balance rule: ring outputs'
+    /// masks have to cancel against a pseudo-out, and only a real input supplies
+    /// one. A wallet holding notes and no ring output at all therefore cannot pay
+    /// a ring address, and gets [`WalletError::InsufficientFunds`] saying so.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_send<P: ProofOfWork, R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        rng: &mut R,
+        chain: &Blockchain<P>,
+        shielded: &ShieldedWallet,
+        destination: AnyAddress,
+        amount: u64,
+        fee: u64,
+        ring_size: usize,
+        from: SpendFrom,
+    ) -> Result<Transaction, WalletError> {
+        match (from, destination) {
+            (SpendFrom::Auto, d) => {
+                self.build_payout(rng, chain, shielded, &[(d, amount)], fee, ring_size)
+            }
+
+            (SpendFrom::Ring, AnyAddress::Ring(a)) => {
+                let payments = [Payment { destination: a, amount }];
+                self.build_transaction(rng, chain, &payments, fee, ring_size)
+            }
+
+            // Change stays on the ring side: the sender asked to spend ring value,
+            // not to move all of it across. Sending the change into the pool as a
+            // second note would cross more than they asked for, and the crossing
+            // amount is public.
+            (SpendFrom::Ring, AnyAddress::Shielded(a)) => {
+                self.build_shielding(rng, chain, shielded, &a, amount, fee, ring_size, true)
+            }
+
+            (SpendFrom::Shielded, AnyAddress::Shielded(a)) => {
+                let plan = shielded
+                    .plan_transfer(&a, amount, fee, chain.shielded())
+                    .map_err(WalletError::Shielded)?;
+                let cross = plan.cross();
+                // The throwaway key is drawn first: `build_with_shielded` borrows
+                // the rng for the whole call, so taking it inline would be a
+                // second mutable borrow of the same generator.
+                let tx_keys = TxKeypair::random(&mut *rng);
+                Transaction::build_with_shielded(
+                    rng,
+                    &[],
+                    &[],
+                    fee,
+                    &tx_keys,
+                    cross,
+                    Some(|sighash: &[u8; 32]| {
+                        plan.authorize(sighash).map_err(|_| TxError::BundleUnavailable)
+                    }),
+                )
+                .map_err(WalletError::Tx)
+            }
+
+            (SpendFrom::Shielded, AnyAddress::Ring(a)) => {
+                let payments = [Payment { destination: a, amount }];
+                self.build_unshielding(rng, chain, shielded, &payments, amount, fee, ring_size)
+            }
+        }
+    }
 
     /// Pay a batch of destinations that may be in **either** pool, in one
     /// transaction.

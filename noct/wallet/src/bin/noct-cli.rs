@@ -4,7 +4,7 @@
 //! noct-cli new      [--wallet FILE]
 //! noct-cli address  [--wallet FILE]
 //! noct-cli balance  [--wallet FILE] [--node HOST:PORT]
-//! noct-cli send --to ADDR --amount NOCT [--fee NOCT] [--wallet FILE] [--node HOST:PORT]
+//! noct-cli send --to ADDR --amount NOCT [--from ring|shielded|auto] [--fee NOCT] [--wallet FILE] [--node HOST:PORT]
 //! ```
 //!
 //! Syncing downloads every block from the node and **validates** it locally into
@@ -24,7 +24,7 @@ use noct_wallet::client::{
     NodeClient,
 };
 use noct_wallet::shielded::ShieldedKeys;
-use noct_wallet::{mnemonic, Direction, Wallet, DEFAULT_RING_SIZE};
+use noct_wallet::{mnemonic, Direction, SpendFrom, Wallet, DEFAULT_RING_SIZE};
 use rand_core::OsRng;
 
 /// Refuse to send a transaction the network will not relay, and say by how much.
@@ -185,9 +185,11 @@ fn help() {
     eprintln!("noct-cli subaddress --index N [--account N] [--wallet FILE]  # a fresh receiving address");
     eprintln!("noct-cli balance   [--wallet FILE] [--node HOST:PORT]");
     eprintln!("noct-cli history   [--wallet FILE] [--node HOST:PORT]");
-    eprintln!("noct-cli send --to ADDR --amount NOCT [--fee NOCT] [--wallet FILE] [--node HOST:PORT]");
+    eprintln!("noct-cli send --to ADDR --amount NOCT [--from ring|shielded|auto] [--fee NOCT] [--wallet FILE] [--node HOST:PORT]");
     eprintln!("  --to takes EITHER kind of address. A shielded one moves the value into the");
     eprintln!("  shielded pool, and that amount is public; a payment inside one pool is not.");
+    eprintln!("  --from ring|shielded|auto picks which pool YOUR money comes from (default auto).");
+    eprintln!("  --from shielded --to <shielded addr> is the most private: no ring side at all.");
     eprintln!("noct-cli unshield --amount NOCT [--to RING_ADDR] [--fee NOCT] [--wallet FILE]");
     eprintln!("  moves value out of the shielded pool. The amount is public. Defaults --to your");
     eprintln!("  own ring address.");
@@ -416,6 +418,15 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
     // should not have to pick a different command for it — and could not, without
     // knowing something about the recipient that the address already says.
     let destination = AnyAddress::decode(&to).unwrap_or_else(|_| fail("invalid --to address"));
+    // **Which pool the money comes FROM** — the sender's own choice, separate
+    // from the destination pool the address already fixes. Refused by name when
+    // it is not understood: a typo that silently meant `auto` could publish an
+    // amount somebody was deliberately keeping inside the pool.
+    let from = match flag(args, "--from") {
+        Some(v) => SpendFrom::parse(&v)
+            .unwrap_or_else(|| fail(&format!("--from must be ring, shielded or auto (got {v:?})"))),
+        None => SpendFrom::Auto,
+    };
     if destination.network() != network {
         fail(&format!(
             "that is a {:?} address and this wallet is on {network:?} — refusing to send",
@@ -435,7 +446,16 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
     );
 
     let tx = wallet
-        .build_payout(&mut OsRng, &chain, &shielded, &[(destination, amount)], fee, DEFAULT_RING_SIZE)
+        .build_send(
+            &mut OsRng,
+            &chain,
+            &shielded,
+            destination,
+            amount,
+            fee,
+            DEFAULT_RING_SIZE,
+            from,
+        )
         .unwrap_or_else(|e| fail(&format!("building transaction: {e:?}")));
 
     // Say what this publishes before it is sent, not after. A crossing's amount
@@ -447,6 +467,21 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
             "note: this moves {} NOCT into the shielded pool, and that amount is PUBLIC.",
             format_noct(tx.cross as u64)
         );
+    } else if tx.cross < 0 && (-tx.cross) as u64 > tx.fee {
+        // Only when value is genuinely leaving. When the sole crossing IS the
+        // fee, calling it a public disclosure is noise: every fee is public on
+        // every chain, and dressing it as a leak teaches people to ignore the
+        // warning that matters.
+        println!(
+            "note: this takes {} NOCT out of the shielded pool, and that amount is PUBLIC.",
+            format_noct((-tx.cross) as u64)
+        );
+    }
+    // A payment with no ring side is the most private shape this chain has, and
+    // it is worth telling somebody they got it — particularly since `--from auto`
+    // would not have built it.
+    if tx.inputs.is_empty() && tx.outputs.is_empty() {
+        println!("this payment stays inside the shielded pool: no ring inputs, outputs or range proof, and only the fee is public.");
     }
 
     refuse_below_the_floor(&tx);

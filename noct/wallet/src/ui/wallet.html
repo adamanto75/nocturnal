@@ -197,6 +197,19 @@
         <input id="fee" inputmode="decimal" value="0.01">
       </div>
     </div>
+    <!-- Which pool YOUR money comes from. The destination pool is the
+         recipient's choice and is already fixed by their address; this is the
+         separate, sender-side decision, and it changes what the payment
+         publishes. -->
+    <div class="field">
+      <label for="from">Spend from</label>
+      <select id="from" class="mono">
+        <option value="auto">Automatic — let the wallet choose</option>
+        <option value="ring">Ring pool — ring signatures over 16 decoys</option>
+        <option value="shielded">Shielded pool — zero-knowledge proofs</option>
+      </select>
+      <div class="sub" id="fromHint">Automatic pays a shielded address from your notes when they cover it, and crosses from the ring side otherwise.</div>
+    </div>
     <button class="primary" id="send" style="width:100%">Send payment</button>
     <div class="msg" id="msg"></div>
   </div>
@@ -425,6 +438,15 @@
 
   $('copySub').onclick = () => copyToButton($('copySub'), $('subAddr').textContent, 'Copy');
 
+  // Say what each choice means before it is made, not after. The consequence is
+  // what gets published, and that cannot be undone once the transaction is out.
+  const FROM_HINTS = {
+    auto: 'Automatic pays a shielded address from your notes when they cover it, and crosses from the ring side otherwise.',
+    ring: 'Spends your ring outputs. Paying a shielded address from here publishes the amount that crosses.',
+    shielded: 'Spends your notes. Paying a shielded address this way stays entirely inside the pool — no ring side, nothing public but the fee.',
+  };
+  $('from').onchange = () => { $('fromHint').textContent = FROM_HINTS[$('from').value] || ''; };
+
   $('refresh').onclick = loadState;
 
   $('send').onclick = async () => {
@@ -434,7 +456,7 @@
     if (!to || !amount) { showMsg('Enter a destination and amount.', false); return; }
     $('send').disabled = true; $('send').textContent = 'Sending…';
     try {
-      const body = 'to=' + encodeURIComponent(to) + '&amount=' + encodeURIComponent(amount) + '&fee=' + encodeURIComponent(fee);
+      const body = 'to=' + encodeURIComponent(to) + '&amount=' + encodeURIComponent(amount) + '&fee=' + encodeURIComponent(fee) + '&from=' + encodeURIComponent($('from').value);
       const r = await fetch('/api/send', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
       const res = await r.json();
       if (res.ok) {
