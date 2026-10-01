@@ -17,7 +17,19 @@ jobs:
   workspace:
     name: workspace build + test
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # A guard against a hang, not a speed limit. 40 was set when the suite took
+    # about 14 minutes; by 2026-10-01 it takes 27, because the tests that pay for
+    # themselves most are the slow ones — they build and verify real Halo 2
+    # proofs. `fee_floor` alone is 128 s on a runner, and it caught a fee floor
+    # that was wrong by nearly 2x.
+    #
+    # Raised rather than trimmed, deliberately. **When this ceiling is hit the run
+    # reports as "cancelled", not as a timeout**, which reads like flaky infra and
+    # has twice sent somebody looking for a fault that was not there. The tell is
+    # `started` and `ended` differing by exactly the limit. Sixty restores the
+    # margin; if the suite ever approaches that, split the job rather than
+    # deleting the tests that keep finding things.
+    timeout-minutes: 60
     # The crates live in noct/, not at the repository root.
     defaults:
       run:
