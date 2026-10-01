@@ -63,13 +63,16 @@ Nothing was sent. Re-run with --fee {}",
 /// * **Accepted** — say so, with the txid to look it up by.
 /// * **Refused** — the node answered, so the transaction is in nobody's mempool.
 ///   Nothing was sent, said plainly, and the exit status is non-zero.
+/// Returns `true` when the node took it, so the caller can reserve the inputs
+/// against a second spend. The other arms exit the process.
+///
 /// * **No reply** — the one case that cannot be resolved here. The transaction may
 ///   have been relayed before the connection broke, or may never have arrived.
 ///   Calling it "not sent" would be a guess, and a guess that invites re-sending
 ///   something already in flight, so it reports the txid and asks the caller to
 ///   check the chain. `noct-poold` treats the same ambiguity the same way, holding
 ///   such a payment as unresolved rather than refunding it.
-fn submit_and_report(client: &NodeClient, tx: &noct_core::tx::Transaction, success: &str) {
+fn submit_and_report(client: &NodeClient, tx: &noct_core::tx::Transaction, success: &str) -> bool {
     let txid = hex::encode(tx.hash());
     match client.submit_tx(tx) {
         Ok(reply) if reply.contains("\"accepted\":true") => {
@@ -83,6 +86,7 @@ fn submit_and_report(client: &NodeClient, tx: &noct_core::tx::Transaction, succe
                     eprintln!("warning: {reason}");
                 }
             }
+            return true;
         }
         Ok(reply) => {
             eprintln!("NOT SENT — the node refused this transaction.");
@@ -407,6 +411,39 @@ fn cmd_history(path: &str, node: &Endpoint, token: &Option<String>, network: Net
     }
 }
 
+/// Reserve the inputs of a transaction the node accepted, and write that down.
+///
+/// **The writing down is the whole point.** Every `noct-cli` run is a new
+/// process that re-syncs from the chain, and the chain does not mark an output
+/// spent until the spending transaction is mined. Without this, a second send a
+/// minute later selects the same output and builds a double-spend of our own,
+/// which the node refuses. Keeping it in memory would help nobody: this process
+/// is about to exit.
+///
+/// A failure to save is a warning rather than an error. The transaction is
+/// already away, and saying nothing would leave the next run to rediscover the
+/// problem with no clue why.
+fn reserve_and_save(
+    accepted: bool,
+    wallet: &mut Wallet,
+    tx: &noct_core::tx::Transaction,
+    height: u64,
+    chain: &noct_core::chain::Blockchain<noct_wallet::client::TrustedPow>,
+    shielded: &noct_wallet::shielded::ShieldedWallet,
+    wallet_path: &str,
+) {
+    if !accepted {
+        return;
+    }
+    wallet.note_submitted(tx, height);
+    let state = client::state_path(std::path::Path::new(&cache_path(wallet_path)));
+    if let Err(e) = client::save_state(&state, chain, wallet, shielded) {
+        eprintln!("warning: could not record this spend as pending ({e}).");
+        eprintln!("         A send in the next few minutes may reuse the same output");
+        eprintln!("         and be refused as a double-spend; waiting for a block avoids it.");
+    }
+}
+
 fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
     let to = flag(args, "--to").unwrap_or_else(|| fail("send needs --to ADDR"));
     let amount = parse_noct(&flag(args, "--amount").unwrap_or_else(|| fail("send needs --amount NOCT")))
@@ -436,7 +473,7 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
 
     let account = load_account(path);
     let client = NodeClient::with_token(node.clone(), token.clone());
-    let (chain, wallet, shielded, height) =
+    let (chain, mut wallet, shielded, height) =
         load_synced_wallets(&client, account, network, cache_path(path), &load_issued(path))
             .unwrap_or_else(|e| fail(&e));
     println!(
@@ -485,7 +522,7 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
     }
 
     refuse_below_the_floor(&tx);
-    submit_and_report(
+    let accepted = submit_and_report(
         &client,
         &tx,
         &format!(
@@ -495,6 +532,7 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
             format_noct(fee)
         ),
     );
+    reserve_and_save(accepted, &mut wallet, &tx, height, &chain, &shielded, path);
 }
 
 fn load(path: &str, network: Network) -> Wallet {
@@ -604,7 +642,7 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
 
     let account = load_account(path);
     let client = NodeClient::with_token(node.clone(), token.clone());
-    let (chain, wallet, shielded, height) =
+    let (chain, mut wallet, shielded, height) =
         load_synced_wallets(&client, account, network, cache_path(path), &load_issued(path))
             .unwrap_or_else(|e| fail(&e));
 
@@ -629,7 +667,7 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
         .build_unshielding(&mut OsRng, &chain, &shielded, &payments, amount, fee, DEFAULT_RING_SIZE)
         .unwrap_or_else(|e| fail(&format!("building transaction: {e:?}")));
     refuse_below_the_floor(&tx);
-    submit_and_report(
+    let accepted = submit_and_report(
         &client,
         &tx,
         &format!(
@@ -638,6 +676,7 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
             format_noct(fee)
         ),
     );
+    reserve_and_save(accepted, &mut wallet, &tx, height, &chain, &shielded, path);
 }
 
 fn cmd_premine_key_image(wallet_path: &str) {

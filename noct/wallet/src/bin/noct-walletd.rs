@@ -556,14 +556,25 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
     // node answered `accepted: false` — so a refused transaction was shown to
     // the user as sent. See the same fix in `noct-cli`.
     match app.client.submit_tx(&tx) {
-        Ok(reply) if reply.contains("\"accepted\":true") => format!(
+        Ok(reply) if reply.contains("\"accepted\":true") => {
+            // Reserve the inputs so the next send does not select them again
+            // before this transaction is mined, and persist that: the chain will
+            // not mark them spent until it is, and a restart would otherwise
+            // forget. See `Wallet::note_submitted`.
+            let h = app.chain.height();
+            app.wallet.note_submitted(&tx, h);
+            if let Err(e) = save_state(&app.state_path, &app.chain, &app.wallet, &app.shielded) {
+                eprintln!("warning: could not record the pending spend: {e}");
+            }
+            format!(
             "{{\"ok\":true,\"txid\":\"{}\",\"message\":\"sent {} NOCT to the {} pool (fee {} NOCT); it will confirm when a block is mined.{}\"}}",
             txid,
             format_noct(amount),
             pool,
             format_noct(fee),
             format!("{crossing}{shape}"),
-        ),
+            )
+        }
         Ok(reply) => {
             let reason = reply
                 .split("\"reason\":\"")

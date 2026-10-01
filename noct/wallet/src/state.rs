@@ -65,8 +65,10 @@ use crate::{Direction, HistoryEntry, OutputSource, OwnedOutput, Wallet};
 const MAGIC: &[u8; 8] = b"NOCTWLST";
 /// Bumped whenever the layout changes. An older file is refused and rebuilt
 /// rather than misread. Version 2 added the trailing checksum; version 3 added
-/// the wallet's shielded half.
-const STATE_VERSION: u8 = 3;
+/// the wallet's shielded half; version 4 added the outputs reserved by
+/// submitted-but-unconfirmed spends, without which every fresh process
+/// re-selects an output it has already spent.
+const STATE_VERSION: u8 = 4;
 /// Trailing Keccak-256 over everything before it.
 const CHECKSUM: usize = 32;
 
@@ -162,6 +164,24 @@ pub fn encode<P: ProofOfWork>(
         o.push(u8::from(h.coinbase));
     }
 
+    // Outputs reserved by transactions we submitted and have not seen mined.
+    // This has to persist: each `noct-cli` run is a new process that re-syncs
+    // from the chain, and the chain does not know an output is spent until the
+    // spending transaction is in a block. Forgetting the reservation here is
+    // exactly how a wallet double-spends itself between two runs.
+    //
+    // Sorted, so the same wallet state always encodes to the same bytes — a
+    // HashMap's iteration order would otherwise make the file differ run to run
+    // for no reason.
+    let mut pending: Vec<(u64, u64)> =
+        wallet.pending_spends.iter().map(|(k, v)| (*k, *v)).collect();
+    pending.sort_unstable();
+    o.extend_from_slice(&(pending.len() as u64).to_le_bytes());
+    for (idx, at) in &pending {
+        o.extend_from_slice(&idx.to_le_bytes());
+        o.extend_from_slice(&at.to_le_bytes());
+    }
+
     // The shielded half, as its own module writes it. It goes in whole rather
     // than being interleaved, because what is safe to write down there is decided
     // by different reasoning — see `crate::shielded`.
@@ -209,6 +229,8 @@ pub fn decode<P: ProofOfWork>(
     let next_global_index = read_u64(&mut c)?;
     let owned_bytes = take_records(&mut c, OWNED_RECORD)?;
     let history_bytes = take_records(&mut c, HISTORY_RECORD)?;
+    // Reserved outputs, in the order the encoder wrote them (16 bytes each).
+    let pending_bytes = take_records(&mut c, 16)?.to_vec();
     let shielded_len = usize::try_from(read_u64(&mut c)?).map_err(|_| Malformed)?;
     let shielded_bytes = take(&mut c, shielded_len)?.to_vec();
     let chain_len = usize::try_from(read_u64(&mut c)?).map_err(|_| Malformed)?;
@@ -261,6 +283,21 @@ pub fn decode<P: ProofOfWork>(
             coinbase,
         });
     }
+    // Reservations are restored, but only the ones that still mean something: an
+    // entry older than the window would be reserving an output this very load is
+    // about to decide is free, and one at or beyond the tip was written by
+    // something that was not this wallet.
+    for r in pending_bytes.chunks_exact(16) {
+        let global_index = le_u64(&r[0..8]);
+        let at = le_u64(&r[8..16]);
+        if at > chain.height() {
+            return Err(Malformed);
+        }
+        if chain.height() < at.saturating_add(crate::PENDING_SPEND_BLOCKS) {
+            wallet.reserve_pending(global_index, at);
+        }
+    }
+
     // The shielded half is checked against the chain by its own loader: same
     // root, same leaf count, and every unspent note's witness must give a path to
     // that note under an anchor the chain still accepts. Its failures are folded

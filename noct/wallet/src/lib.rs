@@ -16,7 +16,7 @@
 //! This is the bookkeeping the earlier layers' tests did by hand. It stays pure
 //! Rust and `cargo test`-able; a node RPC and GUI build on top of it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use curve25519_dalek::scalar::Scalar;
 use noct_core::address::{Address, AnyAddress, Network, ShieldedAddress};
@@ -239,7 +239,35 @@ pub struct Wallet {
     /// (`D = B`, `m = 0`) so scanning is uniform. Used to detect which of the
     /// wallet's addresses an output was paid to.
     subaddresses: HashMap<[u8; 32], (SubaddressIndex, Scalar)>,
+    /// Outputs spent by transactions this wallet submitted and has **not yet
+    /// seen confirmed**: global index → the chain height the spend was built at.
+    ///
+    /// Without this a wallet double-spends itself. Nothing on chain marks an
+    /// output spent until the spending transaction is *mined*, so a second send
+    /// a minute later re-syncs, sees the output unspent, and selects it again.
+    /// The node refuses the second transaction — correctly — and the sender is
+    /// left wondering why. Observed on the testnet load bots: 1,352 refusals
+    /// against 108,732 accepted sends, about one in eighty, every one of them a
+    /// wallet spending something it had already spent.
+    pending_spends: HashMap<u64, u64>,
 }
+
+/// How long a submitted-but-unconfirmed spend keeps its output reserved.
+///
+/// It has to expire, or a transaction that never gets mined — evicted from every
+/// mempool, or simply outbid — strands its inputs for ever and the balance is
+/// unspendable with no way to recover it.
+///
+/// Twenty blocks is about forty minutes at the 120-second target: many chances
+/// for an ordinary fee-paying transaction to be included, and short enough that a
+/// dropped one does not cost the owner an afternoon.
+///
+/// Releasing too early is the safe direction, which is what makes a bound
+/// acceptable at all. If the transaction is somehow still live when the reserve
+/// lapses, the second spend is refused by the node — a visible, explained error
+/// since v0.3.4 — rather than silently accepted. The failure is a retry, not a
+/// lost coin.
+pub const PENDING_SPEND_BLOCKS: u64 = 20;
 
 impl Wallet {
     /// Create a wallet for `account` on `network`.
@@ -251,6 +279,7 @@ impl Wallet {
             owned: Vec::new(),
             history: Vec::new(),
             subaddresses: HashMap::new(),
+            pending_spends: HashMap::new(),
         };
         // Pre-derive the main address and a lookahead window of subaddresses so
         // funds sent to them are detected on the next scan without extra state.
@@ -404,6 +433,11 @@ impl Wallet {
                 });
             }
         }
+
+        // Scanning a block is the only moment the wallet learns that a submitted
+        // spend was mined, or that one has waited long enough to be written off.
+        // Both release the output, so both belong here.
+        self.prune_pending(height);
     }
 
     fn record(&mut self, base_index: u64, received: ReceivedOutput, source: OutputSource) {
@@ -431,6 +465,70 @@ impl Wallet {
     /// Confirmed transaction history, oldest first.
     pub fn history(&self) -> &[HistoryEntry] {
         &self.history
+    }
+
+    /// Record that `tx` was submitted at `height`, so its inputs are not spent
+    /// again before it confirms.
+    ///
+    /// Call this **after** the node accepts the transaction, not after building
+    /// it: a transaction that was built and refused has not spent anything, and
+    /// reserving its inputs would strand them for nothing.
+    ///
+    /// Matching is by key image, which is the only thing a built transaction and
+    /// an owned output are guaranteed to agree on — the ring hides *which* member
+    /// is real, so the input itself cannot be used to find the output.
+    pub fn note_submitted(&mut self, tx: &Transaction, height: u64) {
+        let images: HashSet<KeyImage> = tx.key_images().into_iter().collect();
+        for owned in &self.owned {
+            if images.contains(&owned.output.key_image) {
+                self.pending_spends.insert(owned.global_index, height);
+            }
+        }
+    }
+
+    /// Restore one reservation, for the state loader. Not public API beyond the
+    /// crate: outside it, reservations are only ever created by
+    /// [`Wallet::note_submitted`], which is the only place that knows a
+    /// transaction was actually accepted.
+    pub(crate) fn reserve_pending(&mut self, global_index: u64, at_height: u64) {
+        self.pending_spends.insert(global_index, at_height);
+    }
+
+    /// Whether this output is reserved by a submitted transaction that has not
+    /// confirmed, as of `height`.
+    ///
+    /// A pure function of the two heights: no pruning happens here, so selection
+    /// can stay `&self`. A lapsed entry simply stops reserving anything, and is
+    /// swept up the next time a block is scanned.
+    fn is_pending_at(&self, global_index: u64, height: u64) -> bool {
+        match self.pending_spends.get(&global_index) {
+            Some(&at) => height < at.saturating_add(PENDING_SPEND_BLOCKS),
+            None => false,
+        }
+    }
+
+    /// Outputs reserved by unconfirmed spends, and the value they hold.
+    ///
+    /// Reported separately rather than deducted from the balance: the money has
+    /// not left yet — the transaction could still be dropped — but it cannot be
+    /// spent again either, and a balance that ignored both facts would be wrong
+    /// in whichever direction the user cared about.
+    pub fn pending_spend_value(&self, height: u64) -> u64 {
+        self.owned
+            .iter()
+            .filter(|o| !o.spent && self.is_pending_at(o.global_index, height))
+            .map(|o| o.amount())
+            .sum()
+    }
+
+    /// Forget reservations that have lapsed, and any whose spend is now
+    /// confirmed. Called while scanning, which is the only place the wallet
+    /// learns either fact.
+    fn prune_pending(&mut self, height: u64) {
+        let confirmed: HashSet<u64> =
+            self.owned.iter().filter(|o| o.spent).map(|o| o.global_index).collect();
+        self.pending_spends
+            .retain(|idx, at| !confirmed.contains(idx) && height < at.saturating_add(PENDING_SPEND_BLOCKS));
     }
 
     /// Currently-unspent outputs.
@@ -478,40 +576,14 @@ impl Wallet {
             .and_then(|s| s.checked_add(fee))
             .ok_or(WalletError::Overflow)?;
 
-        // Greedy input selection over unspent outputs. Skip outputs that cannot
-        // be spent yet (immature coinbase) — including them would build a
-        // transaction the chain rejects with `ImmatureCoinbase`.
-        let mut selected: Vec<&OwnedOutput> = Vec::new();
-        let mut in_total: u64 = 0;
-        for owned in self.unspent() {
-            if in_total >= out_total {
-                break;
-            }
-            if !chain.spendable_now(owned.global_index) {
-                continue;
-            }
-            in_total = in_total.checked_add(owned.amount()).ok_or(WalletError::Overflow)?;
-            selected.push(owned);
-        }
-        if in_total < out_total {
-            return Err(WalletError::InsufficientFunds);
-        }
-
-        // Resolve each selected output into a ring of decoys from the chain.
-        //
-        // Recency-biased, not uniform. People overwhelmingly spend outputs they
-        // received recently, so uniform decoys are drawn from a population that
-        // looks nothing like the real spend: the newest member of the ring is
-        // the real one far more often than chance, and that is a statistical
-        // handle on every transaction the wallet makes. Matching the decoy ages
-        // to observed spending removes it.
-        let mut inputs: Vec<InputSecret> = Vec::with_capacity(selected.len());
-        for owned in &selected {
-            let (ring, signer_index) = chain
-                .select_ring_recency_biased(rng, ring_size, owned.global_index)
-                .ok_or(WalletError::NotEnoughDecoys)?;
-            inputs.push(owned.output.to_input(ring, signer_index));
-        }
+        // **One selection path, not two.** This used to carry its own copy of the
+        // loop in `select_ring_inputs`, identical line for line. They drifted the
+        // moment a rule was added to one of them: reserving the inputs of an
+        // unconfirmed spend went into `select_ring_inputs`, and this — the path
+        // an ordinary ring payment takes, and the one the load bots used — kept
+        // happily re-spending them. A test caught it; duplication is why it
+        // existed to catch.
+        let (inputs, in_total) = self.select_ring_inputs(rng, chain, out_total, ring_size)?;
 
         // Append a change output back to ourselves.
         let mut all_payments = payments.to_vec();
@@ -812,6 +884,20 @@ impl Wallet {
 
     /// Ring inputs worth at least `needed`, with decoy rings resolved, and their
     /// total. Shared by every builder so decoy selection happens in one place.
+    /// Choose inputs covering `needed`, and resolve each into a ring of decoys.
+    ///
+    /// **Every ring spend goes through here**, which is what makes it the one
+    /// place a selection rule has to be written. Outputs that cannot be spent yet
+    /// (an immature coinbase) are skipped, because including one builds a
+    /// transaction the chain rejects with `ImmatureCoinbase`; so are outputs
+    /// reserved by a submitted-but-unconfirmed spend of our own.
+    ///
+    /// Decoys are **recency-biased, not uniform**. People overwhelmingly spend
+    /// outputs they received recently, so uniform decoys are drawn from a
+    /// population that looks nothing like the real spend: the newest member of
+    /// the ring is the real one far more often than chance, and that is a
+    /// statistical handle on every transaction the wallet makes. Matching the
+    /// decoy ages to observed spending removes it.
     fn select_ring_inputs<P: ProofOfWork, R: rand_core::RngCore + rand_core::CryptoRng>(
         &self,
         rng: &mut R,
@@ -821,11 +907,18 @@ impl Wallet {
     ) -> Result<(Vec<InputSecret>, u64), WalletError> {
         let mut selected: Vec<&OwnedOutput> = Vec::new();
         let mut in_total: u64 = 0;
+        let height = chain.height();
         for owned in self.unspent() {
             if in_total >= needed {
                 break;
             }
             if !chain.spendable_now(owned.global_index) {
+                continue;
+            }
+            // Already spent by a transaction we submitted and have not seen
+            // mined. Selecting it again builds a double-spend of our own, which
+            // the node refuses — so skip it and use something else.
+            if self.is_pending_at(owned.global_index, height) {
                 continue;
             }
             in_total = in_total.checked_add(owned.amount()).ok_or(WalletError::Overflow)?;
