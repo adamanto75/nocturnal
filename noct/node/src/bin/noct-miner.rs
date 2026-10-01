@@ -62,6 +62,26 @@ const RATE_LIMITED: &str = "rate limited";
 /// How many times to re-attempt submitting a *solved* block before giving up.
 const SUBMIT_RETRIES: u32 = 3;
 
+/// How many consecutive rounds without usable work before this miner gives up and
+/// exits.
+///
+/// **A miner that cannot get work must not sit there looking healthy.** Every
+/// "retrying" path below sleeps two seconds and loops, for ever, with nothing to
+/// stop it: the process stays alive, `systemctl is-active` reports `active`, and
+/// the only place the trouble shows is the pool's own worker count — which nobody
+/// is watching at three in the morning. Seen on the live fleet: both rig units
+/// `active`, the pool reporting one worker, and the fix was restarting them.
+///
+/// Exiting non-zero is the remedy because the units carry `Restart=always` with a
+/// ten-second delay, so a fresh process re-resolves the address, makes a new
+/// connection and re-registers with the pool. Supervision already knows how to
+/// fix this; it was never told there was anything to fix.
+///
+/// 150 rounds at two seconds is about five minutes. A pool restarting, or briefly
+/// having no template after it finds a block, is seconds — so this does not fire
+/// for the ordinary interruptions it would be annoying to restart for.
+const MAX_IDLE_ROUNDS: u32 = 150;
+
 /// What we mine against, and how we verify it is really that.
 struct Node {
     endpoint: Endpoint,
@@ -104,13 +124,26 @@ fn main() {
     let mut current_seed = [0u8; 32];
     let mut seeded = false;
     let mut found: u64 = 0;
+    // Consecutive rounds that produced no template to mine. Reset the moment one
+    // does, so this only ever measures an unbroken run of trouble.
+    let mut idle_rounds: u32 = 0;
 
     loop {
+        if idle_rounds >= MAX_IDLE_ROUNDS {
+            fail(&format!(
+                "no usable work from {} for {} consecutive attempts (~{} seconds) — exiting so it can be restarted.
+A miner that cannot get work should stop, not sit there looking healthy while the pool counts it as gone.",
+                node.endpoint.display(),
+                MAX_IDLE_ROUNDS,
+                MAX_IDLE_ROUNDS * 2,
+            ));
+        }
         // 1. Fetch a template paying our address.
         let resp = match http_get(&node, &format!("/getblocktemplate?address={address}{worker}"), &token) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("template fetch failed: {e} (retrying)");
+                idle_rounds += 1;
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
@@ -143,6 +176,7 @@ fn main() {
             } else {
                 eprintln!("malformed template response (retrying)");
             }
+            idle_rounds += 1;
             std::thread::sleep(Duration::from_secs(2));
             continue;
         };
@@ -150,11 +184,18 @@ fn main() {
             Ok(Wire::Block(b, t)) => (b, t),
             _ => {
                 eprintln!("could not decode template (retrying)");
+                idle_rounds += 1;
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
         };
         let height = block.coinbase.height;
+        // Work again. Say so when there was a gap, so the log shows the outage and
+        // its end rather than a wall of identical "retrying" lines.
+        if idle_rounds > 0 {
+            eprintln!("work resumed after {idle_rounds} attempt(s) without any");
+            idle_rounds = 0;
+        }
 
         // 2. Key the PoW to this template's epoch seed. Only on change: RandomX
         //    rebuilds a VM here (~seconds); Keccak ignores the seed entirely.
