@@ -327,9 +327,21 @@
     const inbound = e.direction === 'received';
     const dir = inbound ? 'in' : 'out';
     const sign = inbound ? '+' : '−';
+    // Which pool, on every row. Two entries of the same size and direction can
+    // mean quite different things to somebody's privacy, and the pool is what
+    // tells them apart. Older payloads carry no `pool`, so those rows stay
+    // unlabelled rather than being labelled wrongly.
+    const pool = e.pool === 'shielded' ? 'shielded' : (e.pool === 'ring' ? 'ring' : '');
     let kind, meta = 'block ' + e.height;
+    if (pool) { meta = pool + ' · ' + meta; }
     if (e.coinbase) { kind = 'Mining reward'; }
     else if (inbound) { kind = 'Received'; }
+    else if (pool === 'shielded') {
+      // A whole note leaves; change returns as a separate arrival. Calling this
+      // "Sent 20 NOCT" when the payment was 5 would be a lie the ring side never
+      // has to tell.
+      kind = 'Note spent';
+    }
     else { kind = 'Sent'; meta += ' · fee ' + esc(e.fee); }
     return '<div class="tx-row">'
       + '<div class="tx-ico ' + dir + '">' + (inbound ? '↓' : '↑') + '</div>'

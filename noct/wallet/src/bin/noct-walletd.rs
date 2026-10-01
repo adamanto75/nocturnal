@@ -333,7 +333,7 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
                 app.shielded.unspent().count(),
                 app.wallet.outputs().len(),
                 app.wallet.unspent().count(),
-                history_json(&app.wallet),
+                history_json(&app.wallet, &app.shielded),
             )
         }
         Err(e) => format!("{{\"ok\":false,\"network\":\"{}\",\"address\":\"{}\",\"error\":\"{}\"}}", net, address, escape(&e)),
@@ -342,27 +342,51 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
 
 /// Render the wallet's transaction history as a JSON array, most recent first
 /// (capped so the payload stays small on long-lived wallets).
-fn history_json(wallet: &Wallet) -> String {
+fn history_json(wallet: &Wallet, shielded: &ShieldedWallet) -> String {
     const MAX_ENTRIES: usize = 200;
-    let entries: Vec<String> = wallet
-        .history()
-        .iter()
-        .rev()
-        .take(MAX_ENTRIES)
-        .map(|e| {
+
+    // **Both pools, merged.** Listing only the ring half meant a payment received
+    // into the shielded pool raised the balance with nothing on screen to explain
+    // it, and an in-pool payment — which has no ring side at all — never appeared.
+    // A wallet that cannot account for its own money is the complaint this whole
+    // release exists to answer.
+    //
+    // `pool` is a new field; anything already reading this list is unaffected.
+    let mut rows: Vec<(u64, bool, String)> = Vec::new();
+    for e in wallet.history() {
+        let received = matches!(e.direction, Direction::Received);
+        rows.push((
+            e.height,
+            received,
             format!(
-                "{{\"height\":{},\"direction\":\"{}\",\"amount\":\"{}\",\"fee\":\"{}\",\"coinbase\":{}}}",
+                "{{\"height\":{},\"pool\":\"ring\",\"direction\":\"{}\",\"amount\":\"{}\",\"fee\":\"{}\",\"coinbase\":{}}}",
                 e.height,
-                match e.direction {
-                    Direction::Received => "received",
-                    Direction::Sent => "sent",
-                },
+                if received { "received" } else { "sent" },
                 format_noct(e.amount),
                 format_noct(e.fee),
                 e.coinbase,
-            )
-        })
-        .collect();
+            ),
+        ));
+    }
+    for e in shielded.history() {
+        rows.push((
+            e.height,
+            e.received,
+            format!(
+                // No fee: a shielded spend's fee belongs to the transaction, not to
+                // any one note, so reporting one here would be inventing it.
+                "{{\"height\":{},\"pool\":\"shielded\",\"direction\":\"{}\",\"amount\":\"{}\",\"fee\":\"0\",\"coinbase\":{}}}",
+                e.height,
+                if e.received { "received" } else { "sent" },
+                format_noct(e.amount),
+                e.coinbase,
+            ),
+        ));
+    }
+    // Newest first, and an arrival before a spend inside one block: a note cannot
+    // leave before it arrives, and the other order reads like a bug.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let entries: Vec<String> = rows.into_iter().take(MAX_ENTRIES).map(|(_, _, j)| j).collect();
     format!("[{}]", entries.join(","))
 }
 

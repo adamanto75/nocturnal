@@ -389,3 +389,113 @@ fn without_the_reservation_the_same_note_is_picked_again() {
         "selection is largest-first, so without a reservation both spend the same note"
     );
 }
+
+/// **The pool must be able to account for itself.**
+///
+/// A payment received into the shielded pool raises the balance and, before this,
+/// appeared in no history at all — the ring half has nothing to show, because
+/// nothing of the ring was involved. The same for a payment sent inside the pool.
+/// The most private shape this chain produces was the one its owner could not
+/// reconcile.
+#[test]
+fn shielded_activity_appears_in_the_shielded_history() {
+    let (mut f, mut alice, mut alice_sh, bob_sh) = funded();
+    let filler = address(&Account::random(&mut OsRng));
+
+    // The fixture already shielded once, so an arrival must be on record.
+    let received: Vec<_> = alice_sh.history().into_iter().filter(|e| e.received).collect();
+    assert!(
+        !received.is_empty(),
+        "a note arrived during setup and the history has to show it"
+    );
+    let arrived = received.iter().map(|e| e.amount).sum::<u64>();
+    assert_eq!(
+        arrived,
+        alice_sh.balance(),
+        "and the arrivals must account for every NOCT the wallet says it holds"
+    );
+
+    // Now spend one, inside the pool, and let it confirm.
+    let before = alice_sh.history().len();
+    let amount = alice_sh.spendable_value() / 4;
+    let tx = alice
+        .build_send(
+            &mut OsRng,
+            &f.chain,
+            &alice_sh,
+            AnyAddress::Shielded(bob_sh.address()),
+            amount,
+            FEE,
+            DEFAULT_RING_SIZE,
+            SpendFrom::Shielded,
+        )
+        .expect("builds");
+    assert!(tx.inputs.is_empty(), "no ring side, so the ring history will show nothing");
+    f.mine(&filler, &[tx], &mut alice, &mut alice_sh);
+
+    let after = alice_sh.history();
+    assert!(
+        after.len() > before,
+        "spending a note has to appear somewhere, and the ring half is not somewhere"
+    );
+    let spends: Vec<_> = after.iter().filter(|e| !e.received).collect();
+    assert_eq!(spends.len(), 1, "exactly one note left");
+    assert_eq!(
+        spends[0].height,
+        f.chain.height() - 1,
+        "dated by the block its nullifier appeared in, not by when the note arrived"
+    );
+
+    // Newest first, so a UI can render it without re-sorting.
+    let heights: Vec<u64> = after.iter().map(|e| e.height).collect();
+    let mut sorted = heights.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(heights, sorted, "history must come back newest first");
+}
+
+/// The spend entry needs the height the note *left* at, which is the one thing a
+/// shielded history cannot derive from the notes alone. Without `spent_height` it
+/// would be dated by when the note arrived — plausible-looking and wrong.
+#[test]
+fn a_spend_is_dated_by_when_it_was_spent_not_when_it_arrived() {
+    let (mut f, mut alice, mut alice_sh, bob_sh) = funded();
+    let filler = address(&Account::random(&mut OsRng));
+
+    let arrival = alice_sh
+        .history()
+        .into_iter()
+        .filter(|e| e.received)
+        .map(|e| e.height)
+        .max()
+        .expect("a note arrived");
+
+    // Several blocks between arrival and spend, so the two heights cannot coincide.
+    for _ in 0..5 {
+        f.mine(&filler, &[], &mut alice, &mut alice_sh);
+    }
+    let tx = alice
+        .build_send(
+            &mut OsRng,
+            &f.chain,
+            &alice_sh,
+            AnyAddress::Shielded(bob_sh.address()),
+            alice_sh.spendable_value() / 4,
+            FEE,
+            DEFAULT_RING_SIZE,
+            SpendFrom::Shielded,
+        )
+        .expect("builds");
+    f.mine(&filler, &[tx], &mut alice, &mut alice_sh);
+
+    let spend = alice_sh
+        .history()
+        .into_iter()
+        .find(|e| !e.received)
+        .expect("the spend is on record");
+    assert!(
+        spend.height > arrival + 4,
+        "spent at {} but the note arrived at {} — a spend dated by arrival is the bug",
+        spend.height,
+        arrival
+    );
+}

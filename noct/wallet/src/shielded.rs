@@ -281,6 +281,12 @@ pub struct OwnedNote {
     pub height: u64,
     /// True once the note's nullifier has appeared on chain.
     pub spent: bool,
+    /// The height at which that nullifier appeared, when it has.
+    ///
+    /// Kept because it is the one thing a shielded history needs that cannot be
+    /// derived from the notes themselves: a note's own `height` says when it
+    /// *entered* the tree, which tells you nothing about when it left.
+    pub spent_height: Option<u64>,
     /// True if this note was a block reward. Kept because a wallet should be able
     /// to say where money came from, and because a reward is the one note whose
     /// arrival is delayed.
@@ -332,6 +338,25 @@ pub struct ShieldedWallet {
     /// The height of the last block scanned. Needed because reservations expire,
     /// and note selection — unlike the ring side's — has no chain to ask.
     synced_height: u64,
+}
+
+/// One thing that happened to a note: it arrived, or it was spent.
+///
+/// Deliberately not [`crate::HistoryEntry`]. That type carries a fee, which a
+/// note does not have on its own — a shielded spend's fee is a property of the
+/// transaction, not of any one note — and reusing it would mean inventing a
+/// value for a field that has no meaning here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ShieldedHistoryEntry {
+    /// Height the note entered the tree (received) or its nullifier appeared (spent).
+    pub height: u64,
+    /// True for an arrival, false for a spend.
+    pub received: bool,
+    /// The note's value. Not the payment's: a spend of a larger note returns
+    /// change as a second note, which appears as its own arrival.
+    pub amount: u64,
+    /// True when the arrival was a mined reward.
+    pub coinbase: bool,
 }
 
 /// A note found by decryption but not yet in the tree.
@@ -466,6 +491,7 @@ impl ShieldedWallet {
                 if let Some(position) = self.own_nullifiers.remove(&nullifier) {
                     if let Some(note) = self.notes.iter_mut().find(|n| n.position == position) {
                         note.spent = true;
+                        note.spent_height = Some(height);
                     }
                     self.witnesses.remove(&position);
                     // The spend is on chain: the reservation has done its job.
@@ -551,6 +577,7 @@ impl ShieldedWallet {
                 position,
                 height,
                 spent: false,
+                spent_height: None,
                 coinbase: pending.coinbase,
             });
         }
@@ -631,6 +658,50 @@ impl ShieldedWallet {
             .sum()
     }
 
+
+    /// What has happened to this wallet's notes, newest first.
+    ///
+    /// **Without this the pool is invisible to its own owner.** A payment received
+    /// into the shielded pool raises the balance and appears in no activity list;
+    /// a payment sent *inside* the pool has no ring side at all, so the ring
+    /// half's history has nothing to show either. The most private shape this
+    /// chain can produce was also the one its owner could not account for.
+    ///
+    /// Derived rather than stored, except for the spend heights: every note the
+    /// wallet holds already knows its value, when it entered the tree, and whether
+    /// it is a reward. Keeping a second copy of that would be two things to get
+    /// out of step.
+    ///
+    /// One honesty note on heights. A received entry is dated by when the note
+    /// **entered the tree**, which for an ordinary payment is the block carrying
+    /// it — but for a mined reward is `maturity` blocks after it was earned,
+    /// because that is when the note becomes real as far as any anchor is
+    /// concerned. The alternative would be to date it from a block the wallet does
+    /// not record, so this says which height it is rather than pretending.
+    pub fn history(&self) -> Vec<ShieldedHistoryEntry> {
+        let mut out: Vec<ShieldedHistoryEntry> = Vec::new();
+        for note in &self.notes {
+            out.push(ShieldedHistoryEntry {
+                height: note.height,
+                received: true,
+                amount: note.value(),
+                coinbase: note.coinbase,
+            });
+            if let (true, Some(height)) = (note.spent, note.spent_height) {
+                out.push(ShieldedHistoryEntry {
+                    height,
+                    received: false,
+                    amount: note.value(),
+                    coinbase: false,
+                });
+            }
+        }
+        // Newest first, and within a block the receipt before the spend: a note
+        // cannot leave before it arrives, and showing it the other way round reads
+        // like a mistake.
+        out.sort_by(|a, b| b.height.cmp(&a.height).then(a.received.cmp(&b.received)));
+        out
+    }
 
     /// Nullifiers of the notes this wallet owns and has not seen spent.
     ///
@@ -1023,7 +1094,7 @@ impl ShieldedWallet {
 // account, or an earlier point in this one.
 
 /// Layout version. An older file is refused and rescanned rather than misread.
-const SHIELDED_VERSION: u8 = 2;
+const SHIELDED_VERSION: u8 = 3;
 /// `recipient 43 ‖ value 8 ‖ rho 32 ‖ rseed 32 ‖ version 1`.
 const NOTE_BYTES: usize = 43 + 8 + 32 + 32 + 1;
 
@@ -1251,6 +1322,11 @@ impl ShieldedWallet {
                     }
                     None => out.push(0),
                 }
+            } else {
+                // Only a spent note needs this, and 0 stands for "we do not know"
+                // — a note cannot be spent in the genesis block, so the value is
+                // free to mean absent.
+                out.extend_from_slice(&note.spent_height.unwrap_or(0).to_le_bytes());
             }
         }
 
@@ -1324,7 +1400,18 @@ impl ShieldedWallet {
                     _ => return Err(ShieldedStateFileError::Malformed),
                 }
             }
-            notes.push(OwnedNote { note, position, height, spent, coinbase });
+            // A spent note carries the height it was spent at; an unspent one has
+            // nothing to say. Written only when `spent`, so the record stays the
+            // same size for the common case.
+            let spent_height = if spent {
+                match cur.u64()? {
+                    0 => None,
+                    h => Some(h),
+                }
+            } else {
+                None
+            };
+            notes.push(OwnedNote { note, position, height, spent, coinbase, spent_height });
         }
 
         let pending_count = cur.u32_len(NOTE_BYTES + 1)?;

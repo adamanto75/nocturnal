@@ -20,7 +20,7 @@ use noct_core::keys::Account;
 use noct_core::tx::Payment;
 use noct_tls::Endpoint;
 use noct_wallet::client::{
-    self, format_noct, load_synced_wallet, load_synced_wallets, parse_noct, rpc_token_from_args,
+    self, format_noct, load_synced_wallets, parse_noct, rpc_token_from_args,
     NodeClient,
 };
 use noct_wallet::shielded::ShieldedKeys;
@@ -387,26 +387,75 @@ fn cmd_subaddress(args: &[String], path: &str, network: Network) {
 
 fn cmd_history(path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
     let account = load_account(path);
-    let (_chain, wallet, height) =
-        load_synced_wallet(&NodeClient::with_token(node.clone(), token.clone()), account, network, cache_path(path), &load_issued(path))
-            .unwrap_or_else(|e| fail(&e));
+    let (_chain, wallet, shielded, height) = load_synced_wallets(
+        &NodeClient::with_token(node.clone(), token.clone()),
+        account,
+        network,
+        cache_path(path),
+        &load_issued(path),
+    )
+    .unwrap_or_else(|e| fail(&e));
     println!("synced to height {height}");
-    if wallet.history().is_empty() {
+
+    // **Both pools, merged by height.** A shielded receipt appears in no ring
+    // history, and an in-pool payment has no ring side at all, so listing only
+    // the ring half left the most private transactions unaccounted for by the
+    // person who made them.
+    enum Row {
+        Ring(noct_wallet::HistoryEntry),
+        Pool(noct_wallet::shielded::ShieldedHistoryEntry),
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    rows.extend(wallet.history().iter().copied().map(Row::Ring));
+    rows.extend(shielded.history().into_iter().map(Row::Pool));
+    if rows.is_empty() {
         println!("(no transactions yet)");
         return;
     }
-    for e in wallet.history() {
-        match e.direction {
-            Direction::Received => {
-                let kind = if e.coinbase { "reward " } else { "received" };
-                println!("  block {:>6}  {kind}  +{} NOCT", e.height, format_noct(e.amount));
+    // Newest first. `history()` on each half is already ordered; merging needs the
+    // sort again because the two halves interleave.
+    rows.sort_by_key(|r| match r {
+        Row::Ring(e) => std::cmp::Reverse(e.height),
+        Row::Pool(e) => std::cmp::Reverse(e.height),
+    });
+
+    for row in &rows {
+        match row {
+            Row::Ring(e) => match e.direction {
+                Direction::Received => {
+                    let kind = if e.coinbase { "reward  " } else { "received" };
+                    println!(
+                        "  block {:>6}  ring      {kind}  +{} NOCT",
+                        e.height,
+                        format_noct(e.amount)
+                    );
+                }
+                Direction::Sent => println!(
+                    "  block {:>6}  ring      sent      -{} NOCT  (fee {} NOCT)",
+                    e.height,
+                    format_noct(e.amount),
+                    format_noct(e.fee)
+                ),
+            },
+            Row::Pool(e) => {
+                if e.received {
+                    let kind = if e.coinbase { "reward  " } else { "received" };
+                    println!(
+                        "  block {:>6}  shielded  {kind}  +{} NOCT",
+                        e.height,
+                        format_noct(e.amount)
+                    );
+                } else {
+                    // A note's whole value leaves; what comes back as change is a
+                    // separate arrival, so this is not the payment amount and does
+                    // not pretend to be.
+                    println!(
+                        "  block {:>6}  shielded  note spent -{} NOCT",
+                        e.height,
+                        format_noct(e.amount)
+                    );
+                }
             }
-            Direction::Sent => println!(
-                "  block {:>6}  sent      -{} NOCT  (fee {} NOCT)",
-                e.height,
-                format_noct(e.amount),
-                format_noct(e.fee)
-            ),
         }
     }
 }
