@@ -8,7 +8,8 @@
     "start": "electron .",
     "dist": "electron-builder --win",
     "test": "node test-wallet-guard.js && node test-wallet-setup.js",
-    "test:e2e": "node test-e2e-setup.js"
+    "test:e2e": "node test-e2e-setup.js",
+    "test:e2e-daemon": "node test-e2e-daemon.js"
   },
   "devDependencies": {
     "electron": "^31",
@@ -29,6 +30,8 @@
       "wallet-setup.js",
       "setup-preload.js",
       "setup.html",
+      "status-preload.js",
+      "status.html",
       "build/icon.ico"
     ],
     "extraResources": [

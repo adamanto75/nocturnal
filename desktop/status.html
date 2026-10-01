@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+<title>Nocturnal Wallet</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 48px 40px;
+    background: #0e1114; color: #e7edf3;
+    font: 14px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 6px; font-weight: 600; }
+  p { color: #9fb0c0; margin: 0 0 14px; max-width: 46em; }
+  .elapsed { color: #6f8094; font-variant-numeric: tabular-nums; }
+  .why { color: #9fb0c0; border-left: 2px solid #253040; padding-left: 14px; margin: 18px 0; }
+  .bad h1 { color: #ff8b8b; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #cfe0f0; word-break: break-all; }
+  pre {
+    background: #0a0d10; border: 1px solid #1c242e; border-radius: 8px;
+    padding: 12px 14px; max-height: 240px; overflow: auto;
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    color: #a8bac9; white-space: pre-wrap; word-break: break-word;
+  }
+  button {
+    background: #1b6ef3; color: #fff; border: 0; border-radius: 8px;
+    padding: 9px 18px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button[disabled] { opacity: .5; cursor: default; }
+  .spin {
+    display: inline-block; width: 11px; height: 11px; margin-right: 9px;
+    border: 2px solid #2b3847; border-top-color: #1b6ef3; border-radius: 50%;
+    animation: s 0.9s linear infinite; vertical-align: -1px;
+  }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+  <div id="busy">
+    <h1><span class="spin"></span><span id="busyTitle">Starting the wallet service</span></h1>
+    <p id="busyWhat"></p>
+    <p class="elapsed" id="elapsed"></p>
+    <div class="why hide" id="why">
+      <strong>This is normal after an upgrade.</strong> When a release changes how
+      the wallet stores what it knows, the first run reads the chain again from
+      the beginning to rebuild it. It is doing that now. Nothing is lost, and the
+      next launch is quick.
+    </div>
+  </div>
+
+  <div id="bad" class="bad hide">
+    <h1 id="badTitle">The wallet service stopped</h1>
+    <p id="badWhat"></p>
+    <p>
+      Nothing was shown to you after it stopped, because a balance that cannot be
+      checked is not a balance — it is the last one that could be.
+    </p>
+    <p>Its output is kept at <code id="logPath"></code>:</p>
+    <pre id="tail"></pre>
+    <button id="restart">Start it again</button>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let shown = null;
+
+  function render(s) {
+    if (!s) return;
+    shown = s;
+    const stopped = s.state === 'stopped';
+    $('busy').classList.toggle('hide', stopped);
+    $('bad').classList.toggle('hide', !stopped);
+    if (stopped) {
+      $('badTitle').textContent = (s.name || 'The wallet service') + ' stopped';
+      $('badWhat').textContent = 'It ' + (s.what || 'is no longer running') + '.';
+      $('logPath').textContent = s.log || '(no log)';
+      $('tail').textContent = s.tail || '(it printed nothing)';
+      $('restart').disabled = false;
+      $('restart').textContent = 'Start it again';
+      return;
+    }
+    $('busyTitle').textContent =
+      s.state === 'waiting' ? 'Waiting for the wallet service' : 'Starting the wallet service';
+    $('busyWhat').textContent = s.what || '';
+    const secs = s.seconds || 0;
+    $('elapsed').textContent = secs < 2 ? '' : secs + ' second' + (secs === 1 ? '' : 's') + ' so far.';
+    // Only once the wait is long enough to look like a hang is there anything
+    // worth explaining; saying it immediately would make every launch look wrong.
+    $('why').classList.toggle('hide', secs < 12);
+  }
+
+  $('restart').onclick = async () => {
+    $('restart').disabled = true;
+    $('restart').textContent = 'Starting…';
+    await window.noctStatus.restart();
+  };
+
+  window.noctStatus.onUpdate(render);
+  window.noctStatus.read().then(render);
+</script>
+</body>
+</html>

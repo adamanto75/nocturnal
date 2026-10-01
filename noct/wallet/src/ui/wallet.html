@@ -21,7 +21,14 @@
   header h1 { font-size: 22px; margin: 0; letter-spacing: .5px; }
   header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
   header .dot.ok { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
-  header .status { color: var(--muted); font-size: 13px; margin-left: auto; }
+  /* One line, however long the error is. A node's connection error can run to a
+     sentence, and letting it wrap pushed the title apart and made a working
+     wallet look broken. The whole text is on the element's tooltip, and the
+     banner in the card says what it means in any case. */
+  header .status { color: var(--muted); font-size: 13px; margin-left: auto;
+                   max-width: 55%; white-space: nowrap; overflow: hidden;
+                   text-overflow: ellipsis; }
+  header h1 { flex: none; }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
     padding: 20px; margin-bottom: 16px;
@@ -30,6 +37,14 @@
   .balance { font-size: 40px; font-weight: 600; margin: 4px 0 2px; }
   .balance .unit { font-size: 18px; color: var(--accent); font-weight: 500; margin-left: 6px; }
   .sub { color: var(--muted); font-size: 13px; }
+  /* Figures nothing can currently confirm. Dimmed *and* captioned: a balance
+     that cannot be checked is the last one that could be, not a current one,
+     and two words in the corner were never enough to say so. */
+  .stalebar { display: none; background: #2a1d12; border: 1px solid #5c3c1f; color: #ffcf9a;
+              border-radius: 8px; padding: 9px 12px; margin-bottom: 14px;
+              font-size: 12.5px; line-height: 1.5; }
+  .stalebar.show { display: block; }
+  .stale .balance, .stale .sub { opacity: .4; }
   .addr-row { display: flex; gap: 8px; align-items: stretch; margin-top: 6px; }
   .addr {
     flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -123,6 +138,7 @@
   </header>
 
   <div class="card">
+    <div class="stalebar" id="staleBar"></div>
     <div class="label">Balance</div>
     <div class="balance"><span id="balance">—</span><span class="unit">NOCT</span></div>
     <!-- Both pools, always, and named. A single figure would have to mean one of
@@ -264,6 +280,45 @@
 <script>
   const $ = (id) => document.getElementById(id);
 
+  // --- stale figures --------------------------------------------------------
+  // When a poll fails, everything on screen stops being a balance and becomes
+  // the last balance that could be checked. The app once sat for an hour showing
+  // 500,334 NOCT with no wallet service running behind it at all, saying so in
+  // two words beside the title. So a failed poll now dims the figures and says,
+  // in the card itself, what they are and when they were last true.
+  let lastOkAt = null;
+
+  function ago(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 90) return s + ' second' + (s === 1 ? '' : 's') + ' ago';
+    const m = Math.round(s / 60);
+    if (m < 90) return m + ' minute' + (m === 1 ? '' : 's') + ' ago';
+    const h = Math.round(m / 60);
+    return h + ' hour' + (h === 1 ? '' : 's') + ' ago';
+  }
+
+  /// The status pill, with the full text kept on the tooltip for when it is
+  /// longer than the one line it gets.
+  function setStatus(text) {
+    $('status').textContent = text;
+    $('status').title = text;
+  }
+
+  function markFresh() {
+    lastOkAt = Date.now();
+    document.body.classList.remove('stale');
+    $('staleBar').classList.remove('show');
+  }
+
+  function markStale(why) {
+    document.body.classList.add('stale');
+    const when = lastOkAt
+      ? 'They were last confirmed ' + ago(Date.now() - lastOkAt) + '.'
+      : 'Nothing below has been confirmed at all yet.';
+    $('staleBar').textContent = why + ' ' + when;
+    $('staleBar').classList.add('show');
+  }
+
   async function loadState() {
     try {
       const r = await fetch('/api/state');
@@ -281,8 +336,11 @@
       } else {
         $('netbar').classList.remove('show');
       }
-      $('address').textContent = s.address || '—';
-      $('shAddress').textContent = s.shielded_address || '—';
+      // Only overwrite what the reply actually carries. The error payload has no
+      // shielded address, and replacing a correct one with a dash loses something
+      // true to report something that merely failed.
+      if (s.address) $('address').textContent = s.address;
+      if (s.shielded_address) $('shAddress').textContent = s.shielded_address;
       if (s.ok) {
         $('balance').textContent = s.balance;
         $('ringBal').textContent = (s.ring || '0') + ' NOCT';
@@ -298,15 +356,22 @@
         $('notesWord').textContent = (s.notes === 1 ? 'note' : 'notes');
         $('height').textContent = s.height;
         $('dot').classList.add('ok');
-        $('status').textContent = 'synced';
+        setStatus('synced');
         renderHistory(s.history || []);
+        markFresh();
       } else {
+        // The wallet is answering; it is the *node* it cannot reach. So the
+        // figures are real as far as they go, and simply cannot advance — money
+        // may have arrived that nothing here can see.
         $('dot').classList.remove('ok');
-        $('status').textContent = s.error || 'node unreachable';
+        setStatus(s.error || 'node unreachable');
+        markStale('The wallet cannot reach the node, so it cannot see anything new.');
       }
     } catch (e) {
+      // Nothing answered at all: the wallet service itself is gone or wedged.
       $('dot').classList.remove('ok');
-      $('status').textContent = 'daemon unreachable';
+      setStatus('daemon unreachable');
+      markStale('The wallet service is not answering, so none of this can be checked.');
     }
   }
 

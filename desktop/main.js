@@ -10,6 +10,7 @@ const { spawn, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const tcp = require('net');
 const {
   fetchState,
   servesWallet,
@@ -231,28 +232,117 @@ function runSetup(P, status) {
   });
 }
 
+// --- daemon supervision ------------------------------------------------------
+// The daemons used to be started with `stdio: 'ignore'` and nothing watching
+// them. When one died — a port already held, a crash, something killing it —
+// the window carried on showing the last balance it had seen, with two words in
+// a corner, and there was no record anywhere of what had happened. A wallet
+// showing money it can no longer verify is the same failure this project keeps
+// closing, so now: everything they print is kept, and their exit is an event the
+// window hears about.
+
+const LOG_LIMIT = 2 * 1024 * 1024; // keep the tail of a long run, not all of it
+
+let stopping = false;    // set while we are killing them, so an expected exit is not reported as a failure
+let daemonLogs = {};     // daemon name -> log file
+let mainWin = null;      // the window showing the wallet, or the status page
+let statusState = null;  // what that page should say
+let statusShowing = false; // is the window on the status page rather than the wallet?
+let launchPaths = null;  // the paths/wallet a restart would use again
+
+/// Open a daemon's log for appending, trimming first if it has grown past the
+/// cap. Trimming keeps the **end** — the lines that explain the last failure.
+function openLog(P, name) {
+  const dir = path.join(P.data, 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name + '.log');
+  try {
+    const size = fs.statSync(file).size;
+    if (size > LOG_LIMIT) {
+      const keep = Buffer.alloc(Math.floor(LOG_LIMIT / 2));
+      const fd = fs.openSync(file, 'r');
+      fs.readSync(fd, keep, 0, keep.length, size - keep.length);
+      fs.closeSync(fd);
+      fs.writeFileSync(file, keep);
+    }
+  } catch (_) {}
+  const out = fs.createWriteStream(file, { flags: 'a' });
+  out.write('\n=== ' + new Date().toISOString() + ' — starting ' + name + ' ===\n');
+  return { file, out };
+}
+
+/// The last `n` non-empty lines of a log, for showing on the stopped page.
+function logTail(file, n = 40) {
+  try {
+    return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((l) => l.length).slice(-n).join('\n');
+  } catch (_) {
+    return '';
+  }
+}
+
+/// Start one daemon with its output captured and its exit observed.
+function spawnDaemon(P, name, args) {
+  const { file, out } = openLog(P, name);
+  daemonLogs[name] = file;
+  const child = spawn(path.join(P.bin, name + '.exe'), args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  child.stdout.on('data', (d) => out.write(d));
+  child.stderr.on('data', (d) => out.write(d));
+  // An unhandled 'error' on a child process throws, which in the main process
+  // takes the whole app down — so a missing binary would kill the window rather
+  // than explain itself.
+  child.on('error', (e) => {
+    out.write('\ncould not start ' + name + ': ' + e.message + '\n');
+    daemonStopped(name, 'could not be started (' + e.message + ')');
+  });
+  child.on('exit', (code, signal) => {
+    out.write('\n=== ' + name + ' exited: ' + (signal ? 'signal ' + signal : 'code ' + code) + ' ===\n');
+    if (child === walletd) walletd = null;
+    if (child === noctd) noctd = null;
+    daemonStopped(name, signal ? 'was stopped (' + signal + ')' : 'exited with code ' + code);
+  });
+  return child;
+}
+
 function startDaemons(P, key, address) {
   fs.mkdirSync(P.chain, { recursive: true });
+  stopping = false;
   // Mining is opt-in from the wallet UI (the "Start mining" toggle). We do NOT
   // pass --mine here: RandomX mining builds a ~2 GB dataset and pins CPU cores,
   // which shouldn't happen just because someone opened their wallet.
   const net = NETWORKS[P.network];
   // Both daemons are told the network explicitly. Without it they default to
   // mainnet and would serve a mainnet chain from the testnet data dir.
-  noctd = spawn(
-    path.join(P.bin, "noctd.exe"),
-    ["--network", P.network, "--data-dir", P.chain, "--miner-address", address],
-    { stdio: "ignore", windowsHide: true }
-  );
-  walletd = spawn(
-    path.join(P.bin, "noct-walletd.exe"),
+  noctd = spawnDaemon(P, 'noctd',
+    ["--network", P.network, "--data-dir", P.chain, "--miner-address", address]);
+  walletd = spawnDaemon(P, 'noct-walletd',
     ["--network", P.network, "--wallet", key, "--node", net.rpc,
-     "--listen", "127.0.0.1:" + net.walletPort],
-    { stdio: "ignore", windowsHide: true }
-  );
+     "--listen", "127.0.0.1:" + net.walletPort]);
+}
+
+/// A daemon we started is gone.
+///
+/// The two matter differently. Losing **noct-walletd** means every figure on
+/// screen is the last one that could be checked rather than a current one, and
+/// nothing is left that could tell them apart — so the page goes, and what
+/// happened takes its place.
+///
+/// Losing **noctd** leaves the wallet page honest on its own: it cannot sync, it
+/// says so on every poll in place of "synced", and the height it shows stops
+/// advancing. Throwing away a page somebody may be reading would be the worse
+/// answer, so that one is recorded in the log and left to the page to report.
+/// (Not by relabelling the title bar, either: the wallet page rewrites its own
+/// title on every poll, so a warning put there would vanish within seconds.)
+function daemonStopped(name, what) {
+  if (stopping) return; // we asked for it
+  if (name !== 'noct-walletd') return;
+  showStatus({ state: 'stopped', name, what, log: daemonLogs[name] || '', tail: logTail(daemonLogs[name]) });
 }
 
 function stopDaemons() {
+  stopping = true;
   for (const p of [walletd, noctd]) {
     if (p && !p.killed) {
       try { p.kill(); } catch (_) {}
@@ -261,26 +351,87 @@ function stopDaemons() {
   walletd = noctd = null;
 }
 
-// Poll the wallet daemon until it responds, resolving with its state (or `null`
-// after ~30s).
 function walletUrl(P) {
   return "http://127.0.0.1:" + NETWORKS[P.network].walletPort;
 }
 
-function waitForWallet(url) {
-  return new Promise((resolve) => {
-    const tryOnce = async (n) => {
-      const state = await fetchState(url);
-      if (state) return resolve(state);
-      if (n > 60) return resolve(null);
-      setTimeout(() => tryOnce(n + 1), 500);
-    };
-    tryOnce(0);
+/// Put the status page on screen with `payload`, or update it if it is already
+/// there. Replacing the wallet page is the point: once the service is gone, the
+/// figures on it are the last ones that could be checked, not current ones.
+function showStatus(payload) {
+  statusState = payload;
+  if (!mainWin || mainWin.isDestroyed()) return;
+  if (statusShowing) {
+    // An update sent before the page has finished loading is simply lost, which
+    // costs nothing: the page asks for the current payload as soon as it loads.
+    mainWin.webContents.send('status:update', payload);
+    return;
+  }
+  // Tracked with a flag rather than by reading the window's URL, because a load
+  // in flight still reports the *old* URL — and the ticking updates would then
+  // each start the load again, so it would never finish.
+  statusShowing = true;
+  mainWin.loadFile(path.join(__dirname, 'status.html'));
+}
+
+/// Leave the status page for the wallet itself.
+function showWallet(url) {
+  statusShowing = false;
+  if (mainWin && !mainWin.isDestroyed()) mainWin.loadURL(url);
+}
+
+function registerStatusHandlers() {
+  ipcMain.handle('status:read', () => statusState);
+  ipcMain.handle('status:restart', async () => {
+    if (!launchPaths) return false;
+    const { P, wallet } = launchPaths;
+    stopDaemons();
+    startDaemons(P, wallet.key, wallet.address);
+    await openWallet(P, wallet);
+    return true;
   });
 }
 
-function createWindow(url, network) {
-  const win = new BrowserWindow({
+/// Is something serving this port? Asked before spawning, because the answer
+/// decides whether starting our own daemon would be useful or merely fatal.
+function portInUse(port) {
+  return new Promise((resolve) => {
+    const sock = tcp.createConnection({ host: '127.0.0.1', port });
+    const done = (yes) => { sock.destroy(); resolve(yes); };
+    sock.on('connect', () => done(true));
+    sock.on('error', () => resolve(false));
+    sock.setTimeout(1000, () => done(false));
+  });
+}
+
+/// Wait for the wallet daemon to answer, for **as long as it is alive**.
+///
+/// This used to give up after thirty seconds and report that the service had not
+/// started. But a release that changes the wallet's state format makes the first
+/// run read the whole chain again before it answers anything — minutes,
+/// legitimately — so the message was wrong, and the black rectangle behind it
+/// said nothing at all. Declaring a daemon broken because it is busy is how a
+/// working wallet gets reported as a dead one.
+///
+/// `alive` is what ends the wait instead: when the thing we are waiting for is
+/// gone, waiting longer is pointless, and the exit handler has already put the
+/// reason on screen.
+function waitForWallet(url, alive, onTick) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const tryOnce = async () => {
+      const state = await fetchState(url);
+      if (state) return resolve(state);
+      if (!(await alive())) return resolve(null);
+      if (onTick) onTick(Math.round((Date.now() - started) / 1000));
+      setTimeout(tryOnce, 500);
+    };
+    tryOnce();
+  });
+}
+
+function createWindow(network) {
+  return new BrowserWindow({
     width: 720,
     height: 900,
     minWidth: 460,
@@ -289,15 +440,45 @@ function createWindow(url, network) {
     title: windowTitle(network),
     icon: ICON,
     autoHideMenuBar: true,
-    webPreferences: { contextIsolation: true },
+    webPreferences: {
+      contextIsolation: true,
+      // The status page needs a way to ask what happened and to retry. The
+      // preload stays attached when the window moves on to the wallet UI, which
+      // is our own page; its whole surface is those two calls.
+      preload: path.join(__dirname, 'status-preload.js'),
+    },
   });
-  win.loadURL(url);
-  return win;
+}
+
+/// Show the wallet once its daemon answers, explaining the wait while it does
+/// not. Returns false if it never did — in which case the reason is already on
+/// screen.
+async function openWallet(P, wallet) {
+  const url = walletUrl(P);
+  const what = 'Opening ' + windowTitle(P.network) + '.';
+  showStatus({ state: 'starting', what, seconds: 0 });
+  const state = await waitForWallet(
+    url,
+    () => walletd !== null,
+    (seconds) => showStatus({ state: 'starting', what, seconds })
+  );
+  if (!state) return false;
+  // Belt and braces: whatever ended up answering must be serving the key we
+  // loaded. Never display an unverified wallet.
+  if (!servesWallet(state, wallet.address)) {
+    dialog.showErrorBox('Nocturnal Wallet', wrongWalletMessage(wallet.address, state.address));
+    stopDaemons();
+    app.quit();
+    return false;
+  }
+  showWallet(url);
+  return true;
 }
 
 app.whenReady().then(async () => {
   const P = paths();
   registerSetupHandlers();
+  registerStatusHandlers();
 
   let wallet;
   try {
@@ -335,11 +516,38 @@ app.whenReady().then(async () => {
     return;
   }
 
+  launchPaths = { P, wallet };
+  mainWin = createWindow(P.network);
+  const port = NETWORKS[P.network].walletPort;
+
   // A daemon left over from an earlier run may still hold the wallet port. If we
   // simply spawned ours, it would fail to bind and the window would quietly show
   // whatever wallet the *old* one has — which looks exactly like your coins
   // having vanished. So check what is already there before starting anything.
-  const existing = await fetchState(walletUrl(P));
+  //
+  // **And a daemon that does not answer is not the same as one that is not
+  // there.** The probe waits a second and a half; a daemon in the middle of a
+  // re-scan does not answer for minutes. Reading that silence as "nothing is
+  // running" is what made this app spawn a pair of daemons onto ports it could
+  // not have, watch them exit on the spot, and then show an hour-old balance
+  // with nothing at all behind it. So when the port is held, wait for whoever
+  // holds it rather than starting a rival.
+  let existing = await fetchState(walletUrl(P));
+  if (!existing && (await portInUse(port))) {
+    showStatus({
+      state: 'waiting',
+      what: 'Something is already using port ' + port + ' and has not answered yet. '
+        + 'Waiting for it rather than starting a second one, which could not have the port anyway.',
+      seconds: 0,
+    });
+    existing = await waitForWallet(
+      walletUrl(P),
+      () => portInUse(port),
+      (seconds) => showStatus({ state: 'waiting', what: statusState.what, seconds })
+    );
+    // Whoever held it is gone without ever answering; fall through and start our
+    // own, which can now have the port.
+  }
   if (existing) {
     if (!servesWallet(existing, wallet.address)) {
       dialog.showErrorBox('Nocturnal Wallet', wrongWalletMessage(wallet.address, existing.address));
@@ -348,31 +556,12 @@ app.whenReady().then(async () => {
     }
     // Same wallet: reuse the running service instead of starting a duplicate
     // (and leave it running on quit, since we did not start it).
-    createWindow(walletUrl(P), P.network);
+    showWallet(walletUrl(P));
     return;
   }
 
   startDaemons(P, wallet.key, wallet.address);
-  const win = createWindow(walletUrl(P), P.network);
-  const state = await waitForWallet(walletUrl(P));
-  if (!state) {
-    win.loadURL(
-      'data:text/html,' +
-        encodeURIComponent(
-          '<body style="background:#0e1114;color:#e7edf3;font-family:sans-serif;padding:40px">' +
-            '<h2>Nocturnal Wallet</h2><p>The wallet service did not start. Check the Noct binaries ' +
-            'under <code>' + P.bin + '</code>.</p></body>'
-        )
-    );
-    return;
-  }
-  // Belt and braces: whatever ended up answering must be serving the key we
-  // loaded. Never display an unverified wallet.
-  if (!servesWallet(state, wallet.address)) {
-    dialog.showErrorBox('Nocturnal Wallet', wrongWalletMessage(wallet.address, state.address));
-    stopDaemons();
-    app.quit();
-  }
+  await openWallet(P, wallet);
 });
 
 app.on('window-all-closed', () => {

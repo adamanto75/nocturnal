@@ -61,6 +61,30 @@ struct App {
 /// fails to apply — a stale cache, or the node reorged below our cached tip —
 /// the cache is discarded and the wallet is rebuilt from genesis so the next
 /// poll recovers.
+/// Take the wallet lock, **surviving a poisoned one**.
+///
+/// `Mutex::lock().unwrap()` turns a single panic in any request thread into a
+/// permanent one: every later request panics on the poison, the connection is
+/// reset with no reply, and the window on the other end shows two words beside
+/// a balance nothing can check any more. One request failing is a bug; every
+/// request afterwards failing silently is a worse one.
+///
+/// The guard is recovered rather than the process aborted, because `App` is only
+/// ever mutated by `sync_app`, which rebuilds the wallet from the chain whenever
+/// it cannot reconcile what it has — so the recovered state is re-derived rather
+/// than trusted. What must not be silent is that it happened, so it is said.
+fn lock_app(app: &Arc<Mutex<App>>) -> std::sync::MutexGuard<'_, App> {
+    match app.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!(
+                "warning: a request panicked while holding the wallet lock. Recovering, and re-deriving state from the chain. Please report this with the lines above."
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn sync_app(app: &mut App) -> Result<u64, String> {
     let height = match sync_both(
         &app.client,
@@ -197,7 +221,28 @@ fn main() {
         let seed_phrase = Arc::clone(&seed_phrase);
         let node_token = Arc::clone(&node_token);
         thread::spawn(move || {
-            let _ = handle(stream, app, node_addr, seed_phrase, node_token);
+            // A panicking request used to drop the connection with nothing on
+            // it, which on the other end is indistinguishable from the daemon
+            // having died — so a bug in one handler read as "the wallet is
+            // gone". It now answers, and says where to look.
+            let mut reply = stream.try_clone().ok();
+            let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = handle(stream, app, node_addr, seed_phrase, node_token);
+            }));
+            if served.is_err() {
+                if let Some(w) = reply.as_mut() {
+                    const BODY: &str = concat!(
+                        "{\"ok\":false,\"error\":\"the wallet service hit an internal error ",
+                        "handling this request — details are on its standard error\"}"
+                    );
+                    let _ = write!(
+                        w,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        BODY.len(),
+                        BODY
+                    );
+                }
+            }
         });
     }
 }
@@ -297,7 +342,7 @@ fn handle(
 
 /// Sync and report balance + address.
 fn api_state(app: &Arc<Mutex<App>>) -> String {
-    let mut app = app.lock().unwrap();
+    let mut app = lock_app(app);
     let address = app.wallet.address().encode();
     // Reported on every poll so the UI can label the network permanently. A
     // balance shown without saying which chain it is on is exactly how a testnet
@@ -425,7 +470,7 @@ fn api_verify_seed(app: &Arc<Mutex<App>>, real_phrase: &str, body: &str) -> Stri
         let derived_matches = match noct_wallet::mnemonic::from_phrase(&submitted) {
             Ok(secret) => match load_account(&hex::encode(secret)) {
                 Ok(acct) => {
-                    let app = app.lock().unwrap();
+                    let app = lock_app(app);
                     Address::new(app.network, acct.spend_public, acct.view_public).encode()
                         == app.wallet.address().encode()
                 }
@@ -506,7 +551,7 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
         None => return err_json("source pool must be ring, shielded or auto"),
     };
 
-    let mut app = app.lock().unwrap();
+    let mut app = lock_app(app);
     if destination.network() != app.network {
         return err_json(&format!(
             "that address belongs to {:?} and this wallet is on {:?} — refusing to send",
@@ -621,7 +666,7 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
 /// Issue the next fresh subaddress (account 0), advancing and persisting the
 /// counter so it is not handed out again.
 fn api_subaddress(app: &Arc<Mutex<App>>) -> String {
-    let mut app = app.lock().unwrap();
+    let mut app = lock_app(app);
     let index = app.next_subaddress.max(1);
     let address = app.wallet.subaddress(0, index).encode();
     app.next_subaddress = index.saturating_add(1);
