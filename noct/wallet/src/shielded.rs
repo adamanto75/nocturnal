@@ -320,6 +320,18 @@ pub struct ShieldedWallet {
     /// will claim that position. A coinbase note is created in one block and
     /// appended maturity blocks later, so this is how the two are joined up.
     expected: HashMap<[u8; 32], PendingNote>,
+    /// Notes spent by a bundle this wallet submitted and has **not yet seen
+    /// confirmed**: tree position → the height the spend was recorded at.
+    ///
+    /// The same defect the ring side had, with nullifiers in place of key images:
+    /// a note is not spent as far as the chain is concerned until its nullifier is
+    /// published in a block, so a second `--from shielded` send a minute later
+    /// selects the same note and builds a double-spend of its own. See
+    /// [`crate::PENDING_SPEND_BLOCKS`].
+    pending_spends: HashMap<u64, u64>,
+    /// The height of the last block scanned. Needed because reservations expire,
+    /// and note selection — unlike the ring side's — has no chain to ask.
+    synced_height: u64,
 }
 
 /// A note found by decryption but not yet in the tree.
@@ -339,6 +351,8 @@ impl ShieldedWallet {
             tree: Tree::empty(),
             leaves: 0,
             own_nullifiers: HashMap::new(),
+            pending_spends: HashMap::new(),
+            synced_height: 0,
             expected: HashMap::new(),
         }
     }
@@ -454,9 +468,17 @@ impl ShieldedWallet {
                         note.spent = true;
                     }
                     self.witnesses.remove(&position);
+                    // The spend is on chain: the reservation has done its job.
+                    self.pending_spends.remove(&position);
                 }
             }
         }
+
+        // Scanning is the only place the wallet learns how far it has synced, and
+        // reservations expire against that height.
+        self.synced_height = height;
+        self.pending_spends
+            .retain(|_, at| height < at.saturating_add(crate::PENDING_SPEND_BLOCKS));
 
         // Two different failures, kept apart because they mean different things.
         // A different leaf count is a wallet that started late. The same count with
@@ -561,11 +583,54 @@ impl ShieldedWallet {
     /// Largest first is the ordinary choice: it minimises the number of actions,
     /// and each action is a proof to make and a proof for every node to verify.
     pub fn spendable(&self) -> Vec<&OwnedNote> {
-        let mut notes: Vec<&OwnedNote> =
-            self.unspent().filter(|n| self.witnesses.contains_key(&n.position)).collect();
+        let mut notes: Vec<&OwnedNote> = self
+            .unspent()
+            .filter(|n| self.witnesses.contains_key(&n.position))
+            // Not a note we have already spent in a bundle the chain has not seen
+            // yet. Selecting it again builds a double-spend of our own, which the
+            // node refuses — the same rule the ring side applies to its outputs.
+            .filter(|n| !self.is_pending(n.position))
+            .collect();
         notes.sort_by_key(|n| std::cmp::Reverse(n.value()));
         notes
     }
+
+    /// Whether this note is reserved by a submitted bundle that has not confirmed.
+    fn is_pending(&self, position: u64) -> bool {
+        match self.pending_spends.get(&position) {
+            Some(&at) => self.synced_height < at.saturating_add(crate::PENDING_SPEND_BLOCKS),
+            None => false,
+        }
+    }
+
+    /// Record that `tx`'s bundle was submitted at `height`, so the notes it spends
+    /// are not spent again before it confirms.
+    ///
+    /// Call this only once the node has accepted the transaction. Matching is by
+    /// nullifier, which is the shielded analogue of a key image: the bundle
+    /// publishes them, and the wallet already knows which of its notes each one
+    /// belongs to.
+    pub fn note_submitted(&mut self, tx: &Transaction, height: u64) {
+        let Some(bundle) = tx.shielded.as_ref() else { return };
+        for nullifier in bundle.nullifiers() {
+            if let Some(&position) = self.own_nullifiers.get(&nullifier) {
+                self.pending_spends.insert(position, height);
+            }
+        }
+    }
+
+    /// Value held in notes reserved by unconfirmed spends.
+    ///
+    /// Reported separately rather than deducted: the money has not left yet, but
+    /// it cannot be spent again either.
+    pub fn pending_spend_value(&self) -> u64 {
+        self.notes
+            .iter()
+            .filter(|n| !n.spent && self.is_pending(n.position))
+            .map(|n| n.value())
+            .sum()
+    }
+
 
     /// Nullifiers of the notes this wallet owns and has not seen spent.
     ///
@@ -958,7 +1023,7 @@ impl ShieldedWallet {
 // account, or an earlier point in this one.
 
 /// Layout version. An older file is refused and rescanned rather than misread.
-const SHIELDED_VERSION: u8 = 1;
+const SHIELDED_VERSION: u8 = 2;
 /// `recipient 43 ‖ value 8 ‖ rho 32 ‖ rseed 32 ‖ version 1`.
 const NOTE_BYTES: usize = 43 + 8 + 32 + 32 + 1;
 
@@ -1202,6 +1267,22 @@ impl ShieldedWallet {
             put_note(&mut out, &p.note);
             out.push(u8::from(p.coinbase));
         }
+
+        // Notes reserved by a bundle we submitted and have not seen confirmed,
+        // plus the height we have scanned to, which is what their expiry is
+        // measured against. Both have to persist: every `noct-cli` run is a new
+        // process, and the chain does not publish a nullifier until the spend is
+        // mined — so forgetting these is how a wallet double-spends itself between
+        // two runs. Sorted, so identical state always writes identical bytes.
+        out.extend_from_slice(&self.synced_height.to_le_bytes());
+        let mut reserved: Vec<(u64, u64)> =
+            self.pending_spends.iter().map(|(k, v)| (*k, *v)).collect();
+        reserved.sort_unstable();
+        out.extend_from_slice(&(reserved.len() as u32).to_le_bytes());
+        for (position, at) in &reserved {
+            out.extend_from_slice(&position.to_le_bytes());
+            out.extend_from_slice(&at.to_le_bytes());
+        }
         out
     }
 
@@ -1254,6 +1335,26 @@ impl ShieldedWallet {
             let cmx = ExtractedNoteCommitment::from(note.commitment()).to_bytes();
             expected.insert(cmx, PendingNote { note, coinbase });
         }
+
+        // The reservations, and the height they expire against. These must be read
+        // BEFORE the "nothing left over" check below — that check is what makes a
+        // file with trailing bytes a file we refuse, and appending a section
+        // without reading it here turns every valid file into a rejected one.
+        let synced_height = cur.u64()?;
+        // `u32_len`, not a bare count: it refuses a number the remaining bytes
+        // cannot possibly hold, before anything is allocated.
+        let reserved_count = cur.u32_len(16)?;
+        let mut pending_spends = HashMap::new();
+        for _ in 0..reserved_count {
+            let position = cur.u64()?;
+            let at = cur.u64()?;
+            // Only what still reserves anything. A lapsed entry would reserve a
+            // note this very load is about to decide is free.
+            if synced_height < at.saturating_add(crate::PENDING_SPEND_BLOCKS) {
+                pending_spends.insert(position, at);
+            }
+        }
+
         if !cur.0.is_empty() {
             return Err(ShieldedStateFileError::Malformed);
         }
@@ -1275,8 +1376,17 @@ impl ShieldedWallet {
             own_nullifiers.insert(nullifier.to_bytes(), owned.position);
         }
 
-        let wallet =
-            ShieldedWallet { keys, notes, witnesses, tree, leaves, own_nullifiers, expected };
+        let wallet = ShieldedWallet {
+            keys,
+            notes,
+            witnesses,
+            tree,
+            leaves,
+            own_nullifiers,
+            expected,
+            pending_spends,
+            synced_height,
+        };
 
         // And the checks that matter: the file has to describe *this* chain, at
         // *this* height.

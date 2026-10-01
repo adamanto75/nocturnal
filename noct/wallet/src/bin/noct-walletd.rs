@@ -563,6 +563,7 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
             // forget. See `Wallet::note_submitted`.
             let h = app.chain.height();
             app.wallet.note_submitted(&tx, h);
+            app.shielded.note_submitted(&tx, h);
             if let Err(e) = save_state(&app.state_path, &app.chain, &app.wallet, &app.shielded) {
                 eprintln!("warning: could not record the pending spend: {e}");
             }

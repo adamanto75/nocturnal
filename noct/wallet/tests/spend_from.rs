@@ -292,3 +292,100 @@ fn an_unknown_from_value_is_refused_rather_than_guessed() {
     assert_eq!(SpendFrom::parse("orchard"), None);
     assert_eq!(SpendFrom::default(), SpendFrom::Auto);
 }
+
+/// **A second in-pool send must not reuse an unconfirmed note.**
+///
+/// The shielded mirror of the ring side's defect: a note is not spent as far as
+/// the chain is concerned until its nullifier is published in a block, so a
+/// wallet that trusts only the chain picks the same note again. Nullifiers stand
+/// in for key images, and the remedy is the same reservation.
+#[test]
+fn a_second_in_pool_send_does_not_reuse_an_unconfirmed_note() {
+    let (mut f, mut alice, mut alice_sh, bob_sh) = funded();
+    let filler = address(&Account::random(&mut OsRng));
+
+    // Two notes, so "picked the other one" is distinguishable from "could not
+    // build at all". The fixture seeds one; this adds a second.
+    let tx = alice
+        .build_shielding(
+            &mut OsRng,
+            &f.chain,
+            &alice_sh,
+            &alice_sh.address(),
+            alice.balance() / 4,
+            FEE,
+            DEFAULT_RING_SIZE,
+            true,
+        )
+        .expect("seeds a second note");
+    f.mine(&filler, &[tx], &mut alice, &mut alice_sh);
+    f.mine(&filler, &[], &mut alice, &mut alice_sh);
+    assert!(alice_sh.spendable().len() >= 2, "two notes to choose between");
+
+    let amount = alice_sh.spendable().last().expect("a note").value() / 2;
+    let first = alice
+        .build_send(
+            &mut OsRng,
+            &f.chain,
+            &alice_sh,
+            AnyAddress::Shielded(bob_sh.address()),
+            amount,
+            FEE,
+            DEFAULT_RING_SIZE,
+            SpendFrom::Shielded,
+        )
+        .expect("builds");
+    alice_sh.note_submitted(&first, f.chain.height());
+
+    let second = alice
+        .build_send(
+            &mut OsRng,
+            &f.chain,
+            &alice_sh,
+            AnyAddress::Shielded(bob_sh.address()),
+            amount,
+            FEE,
+            DEFAULT_RING_SIZE,
+            SpendFrom::Shielded,
+        )
+        .expect("the other note is free, so this must build");
+
+    let a: Vec<_> = first.shielded.as_ref().expect("bundle").nullifiers().collect::<Vec<_>>();
+    let b: Vec<_> = second.shielded.as_ref().expect("bundle").nullifiers().collect::<Vec<_>>();
+    for n in &a {
+        assert!(
+            !b.contains(n),
+            "the second bundle re-spent a note of the first — this is the bug"
+        );
+    }
+    f.chain.validate_tx(&mut OsRng, &second).expect("and the chain accepts it");
+}
+
+/// And that the reservation is what prevents it, not luck in note ordering.
+#[test]
+fn without_the_reservation_the_same_note_is_picked_again() {
+    let (f, alice, alice_sh, bob_sh) = funded();
+    let amount = alice_sh.spendable_value() / 8;
+    let build = || {
+        alice
+            .build_send(
+                &mut OsRng,
+                &f.chain,
+                &alice_sh,
+                AnyAddress::Shielded(bob_sh.address()),
+                amount,
+                FEE,
+                DEFAULT_RING_SIZE,
+                SpendFrom::Shielded,
+            )
+            .expect("builds")
+    };
+    let first = build();
+    let second = build();
+    let a: Vec<_> = first.shielded.as_ref().expect("bundle").nullifiers().collect::<Vec<_>>();
+    let b: Vec<_> = second.shielded.as_ref().expect("bundle").nullifiers().collect::<Vec<_>>();
+    assert!(
+        a.iter().any(|n| b.contains(n)),
+        "selection is largest-first, so without a reservation both spend the same note"
+    );
+}

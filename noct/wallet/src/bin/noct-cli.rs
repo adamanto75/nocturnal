@@ -429,13 +429,14 @@ fn reserve_and_save(
     tx: &noct_core::tx::Transaction,
     height: u64,
     chain: &noct_core::chain::Blockchain<noct_wallet::client::TrustedPow>,
-    shielded: &noct_wallet::shielded::ShieldedWallet,
+    shielded: &mut noct_wallet::shielded::ShieldedWallet,
     wallet_path: &str,
 ) {
     if !accepted {
         return;
     }
     wallet.note_submitted(tx, height);
+    shielded.note_submitted(tx, height);
     let state = client::state_path(std::path::Path::new(&cache_path(wallet_path)));
     if let Err(e) = client::save_state(&state, chain, wallet, shielded) {
         eprintln!("warning: could not record this spend as pending ({e}).");
@@ -473,7 +474,7 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
 
     let account = load_account(path);
     let client = NodeClient::with_token(node.clone(), token.clone());
-    let (chain, mut wallet, shielded, height) =
+    let (chain, mut wallet, mut shielded, height) =
         load_synced_wallets(&client, account, network, cache_path(path), &load_issued(path))
             .unwrap_or_else(|e| fail(&e));
     println!(
@@ -532,7 +533,7 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
             format_noct(fee)
         ),
     );
-    reserve_and_save(accepted, &mut wallet, &tx, height, &chain, &shielded, path);
+    reserve_and_save(accepted, &mut wallet, &tx, height, &chain, &mut shielded, path);
 }
 
 fn load(path: &str, network: Network) -> Wallet {
@@ -642,7 +643,7 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
 
     let account = load_account(path);
     let client = NodeClient::with_token(node.clone(), token.clone());
-    let (chain, mut wallet, shielded, height) =
+    let (chain, mut wallet, mut shielded, height) =
         load_synced_wallets(&client, account, network, cache_path(path), &load_issued(path))
             .unwrap_or_else(|e| fail(&e));
 
@@ -676,7 +677,7 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
             format_noct(fee)
         ),
     );
-    reserve_and_save(accepted, &mut wallet, &tx, height, &chain, &shielded, path);
+    reserve_and_save(accepted, &mut wallet, &tx, height, &chain, &mut shielded, path);
 }
 
 fn cmd_premine_key_image(wallet_path: &str) {
