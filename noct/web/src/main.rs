@@ -468,7 +468,15 @@ fn recent_blocks(ctx: &Ctx) -> String {
                 txs.len(),
                 block.coinbase.total().unwrap_or(0)
             )),
-            Err(_) => break,
+            // **Never turn a failure into a short list.** Every height in this
+            // range exists by construction — the range is derived from the tip the
+            // node just reported — so a read that fails is the node failing, not
+            // the chain ending. Breaking out left `{"blocks":[...]}` with no error
+            // in it, and the page rendered that as "no blocks yet": a node nobody
+            // could read, reported as a chain with nothing in it. The static
+            // emitter in this same file already returns the error here; the live
+            // endpoint now agrees with it.
+            Err(e) => return err_json(&format!("reading block {h}: {e}")),
         }
     }
     format!("{{\"blocks\":[{}]}}", items.join(","))
@@ -948,5 +956,70 @@ mod tests {
         assert!(MAX_HEAD_BYTES >= 8 * 1024, "too tight for a request with cookies");
         assert!(MAX_HEAD_BYTES <= 64 * 1024, "large enough to be worth capping at all");
         assert!(MAX_HEADERS >= 32 && MAX_HEADERS <= 256);
+    }
+
+    /// A node whose blocks cannot be read is **not** a chain with nothing in it.
+    ///
+    /// `recent_blocks` used to `break` out of its loop when a block read failed
+    /// and return the items it had — `{"blocks":[]}` when the first one failed —
+    /// with no error anywhere in the reply. The explorer rendered that as "no
+    /// blocks yet", under a perfectly current height. An unreadable node and an
+    /// empty chain are not the same fact and the page could not tell them apart.
+    ///
+    /// **A node that is simply unreachable would not catch this**, because the
+    /// `height()` call fails first and that path already returned an error. The
+    /// gap is the node that answers `/info` and then does not answer `/block/N`
+    /// — a node dying between the two calls, or failing on one read. So this
+    /// stands up a real server that does exactly that, rather than asserting
+    /// against the easy case that was never broken.
+    #[test]
+    fn blocks_that_cannot_be_read_are_an_error_not_an_empty_chain() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().unwrap().port();
+        // Answers `/info` like a healthy node, and refuses every block.
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut out = match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let mut line = String::new();
+                if BufReader::new(stream).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let body = if line.contains("/info") {
+                    "{\"height\":5,\"peers\":1}"
+                } else {
+                    // Well-formed JSON with no `data` field: the node answering,
+                    // and not with a block.
+                    "{\"error\":\"block unavailable\"}"
+                };
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        let ctx = Ctx {
+            node: Endpoint::parse(&format!("127.0.0.1:{port}"), 19334).expect("a valid endpoint"),
+            token: None,
+            node_pin: None,
+            trusted_proxies: HashSet::new(),
+        };
+        let out = recent_blocks(&ctx);
+        assert!(
+            out.contains("\"error\""),
+            "a node that cannot produce blocks must be reported as an error, got: {out}"
+        );
+        assert!(
+            !out.contains("\"blocks\""),
+            "and it must not answer with a block list at all, got: {out}"
+        );
     }
 }

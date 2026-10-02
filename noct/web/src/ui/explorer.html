@@ -61,7 +61,30 @@
       fetch("/api/blocks").then((r) => r.json()),
     ]);
     if (info.error) throw new Error(info.error);
+    // A blocks reply that carries an error, or no list at all, is not an empty
+    // chain. Reading it as one put "no blocks yet" under a live height.
+    if (recent.error) throw new Error(recent.error);
+    if (!Array.isArray(recent.blocks)) throw new Error("the node did not return a block list");
     return { info, blocks: recent.blocks, taken: null };
+  }
+
+  // When a load fails, the four figures above the table are the last ones that
+  // could be checked rather than current ones, and nothing on the page said so:
+  // the note changed and the table emptied while the height went on standing
+  // there in large type. Now they are dimmed and dated.
+  let lastOkAt = null;
+  const STATS = ["s-height", "s-outputs", "s-emitted", "s-peers"];
+
+  function ago(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 90) return s + " second" + (s === 1 ? "" : "s") + " ago";
+    const m = Math.round(s / 60);
+    if (m < 90) return m + " minute" + (m === 1 ? "" : "s") + " ago";
+    return Math.round(m / 60) + " hour" + (Math.round(m / 60) === 1 ? "" : "s") + " ago";
+  }
+
+  function setStale(stale) {
+    for (const id of STATS) $(id).classList.toggle("stale", stale);
   }
 
   async function load() {
@@ -69,10 +92,14 @@
     try {
       data = CHAIN_SOURCE === "snapshot" ? await snapshot() : await live();
     } catch (e) {
+      setStale(true);
+      const when = lastOkAt
+        ? " The figures below were last confirmed " + ago(Date.now() - lastOkAt) + "."
+        : "";
       $("chain-note").textContent =
         CHAIN_SOURCE === "snapshot"
           ? "The published chain snapshot could not be read."
-          : "Explorer is offline right now (the node is unreachable).";
+          : "Explorer is offline right now (the node is unreachable)." + when;
     }
 
     if (data) {
@@ -87,6 +114,9 @@
       $("chain-note").textContent = data.taken
         ? "Snapshot taken " + fmtTime(data.taken) + " — not live. Coins here are worthless."
         : "Live testnet — coins here are worthless.";
+      // A snapshot is never "fresh": it is frozen on purpose and says so above,
+      // so only a live read clears the mark.
+      if (!data.taken) { lastOkAt = Date.now(); setStale(false); }
     }
 
     const body = $("blocks");

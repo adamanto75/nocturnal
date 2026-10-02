@@ -244,6 +244,9 @@ p code, li code, td code {
 }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
 .muted { color:var(--dim); }
+/* A figure nothing can currently confirm. The note beside it says when it was
+   last true; this says, without reading, that it is not now. */
+.stat .v.stale { opacity:.35; }
 
 footer {
   padding:34px 0 64px; color:var(--dim); font-size:14px;
