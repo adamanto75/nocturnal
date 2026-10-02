@@ -147,7 +147,7 @@
          nowhere on screen. -->
     <div class="sub">ring <span id="ringBal">—</span> · shielded <span id="shBal">—</span></div>
     <div class="sub" id="pendingRow" style="display:none">plus <span id="shPending">—</span> NOCT of shielded rewards still maturing</div>
-    <div class="sub"><span id="outputs">—</span> outputs · <span id="notes">—</span> <span id="notesWord">notes</span> · synced to height <span id="height">—</span></div>
+    <div class="sub"><span id="outputs">—</span> outputs · <span id="notes">—</span> <span id="notesWord">notes</span> · at height <span id="height">—</span></div>
     <div class="label" style="margin-top:18px">Your ring address</div>
     <div class="addr-row">
       <div class="addr mono" id="address">—</div>
@@ -309,7 +309,6 @@
   }
 
   function markFresh() {
-    lastOkAt = Date.now();
     document.body.classList.remove('stale');
     $('staleBar').classList.remove('show');
   }
@@ -322,12 +321,29 @@
     $('staleBar').classList.add('show');
   }
 
+  /// Figures that could not be **checked**: the wallet service or the node is
+  /// not answering, so the last values are all there is. The timing clause is
+  /// the point here — how old they are is the whole question.
   function markStale(why) {
     document.body.classList.add('stale');
     const when = lastOkAt
       ? 'They were last confirmed ' + ago(Date.now() - lastOkAt) + '.'
       : 'Nothing below has been confirmed at all yet.';
     $('staleBar').textContent = why + ' ' + when;
+    $('staleBar').classList.add('show');
+  }
+
+  /// Figures that **were** confirmed, against a chain that is not the network —
+  /// a node with nowhere to dial, or one stranded on its own fork.
+  ///
+  /// These must not borrow `markStale`'s sentence. "Nothing below has been
+  /// confirmed at all yet" is simply untrue here: the node answered, the chain
+  /// synced, the balance is real as far as that chain goes. Saying otherwise
+  /// contradicts the figures sitting directly under it and makes the message
+  /// that matters — *which chain* — easier to disbelieve.
+  function markUntrusted(why) {
+    document.body.classList.add('stale');
+    $('staleBar').textContent = why;
     $('staleBar').classList.add('show');
   }
 
@@ -354,6 +370,12 @@
       if (s.address) $('address').textContent = s.address;
       if (s.shielded_address) $('shAddress').textContent = s.shielded_address;
       if (s.ok) {
+        // **Every branch below this read the node successfully**, whatever it
+        // thinks of the chain it read. Recording that here rather than inside
+        // `markFresh` is the difference between a later outage saying "last
+        // confirmed 30 seconds ago" and saying "nothing has been confirmed at
+        // all yet" — which, after a reading that plainly happened, is false.
+        lastOkAt = Date.now();
         $('balance').textContent = s.balance;
         $('ringBal').textContent = (s.ring || '0') + ' NOCT';
         $('shBal').textContent = (s.shielded || '0') + ' NOCT';
@@ -379,7 +401,7 @@
           // up" would promise it will finish. It will not, without a resync.
           $('dot').classList.remove('ok');
           setStatus('node stranded');
-          markStale(
+          markUntrusted(
             'This node has diverged from the network and cannot rejoin on its own — it is not '
             + 'catching up and will not. Nothing below can be trusted as current until it is resynced '
             + 'from scratch.'
@@ -406,7 +428,7 @@
           // at their firewall for a network that does not exist.
           $('dot').classList.remove('ok');
           setStatus('no network to join');
-          markStale(
+          markUntrusted(
             s.network === 'mainnet'
               ? 'Nocturnal mainnet has not launched. This node has no seeds to dial and no '
                 + 'network to join, so it is extending a private chain of its own — anything '
