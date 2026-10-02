@@ -738,8 +738,25 @@ fn api_subaddress(app: &Arc<Mutex<App>>) -> String {
     let mut app = lock_app(app);
     let index = app.next_subaddress.max(1);
     let address = app.wallet.subaddress(0, index).encode();
+
+    // **Record it before handing it over.** This counter is how a restart knows
+    // which subaddresses to register before scanning, and funds paid to one past
+    // the lookahead window are invisible to a wallet that did not register it.
+    // The write used to be `let _ = …`: on failure the user was given an address
+    // to put in front of somebody, and the wallet had no idea it had issued it.
+    //
+    // `noct-cli` warns and carries on, which is right at a terminal where the
+    // warning is on screen. Here there is no stderr anyone will read, so the
+    // honest option is to issue nothing and say so — an address not given out is
+    // a retry, an address given out and forgotten is money that does not appear.
+    if let Err(e) = std::fs::write(&app.subaddr_path, index.saturating_add(1).to_string()) {
+        eprintln!("could not record subaddress {index} in {}: {e}", app.subaddr_path);
+        return err_json(
+            "could not record the new address, so none was issued — the addresses you already \
+             have are unaffected. Check that the wallet folder is writable and try again.",
+        );
+    }
     app.next_subaddress = index.saturating_add(1);
-    let _ = std::fs::write(&app.subaddr_path, app.next_subaddress.to_string());
     format!("{{\"ok\":true,\"index\":{index},\"address\":\"{address}\"}}")
 }
 

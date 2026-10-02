@@ -328,6 +328,11 @@ pub struct Discovery {
     target_outbound: usize,
     /// Where the address book is persisted, so peers survive a restart.
     book_path: Option<PathBuf>,
+    /// Whether the "could not write the address book" warning has been printed.
+    /// The save runs on a loop; the warning is worth saying once, not for ever.
+    /// `Arc` because `Discovery` is cloned per connection, and a warning said
+    /// once must mean once across all of them.
+    save_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Accumulated misbehavior points, per [`BanKey`].
     scores: Arc<Mutex<HashMap<BanKey, u32>>>,
     /// Banned peers → the time their ban lifts, per [`BanKey`].
@@ -490,6 +495,7 @@ impl Discovery {
             magic,
             target_outbound: target_outbound.max(1),
             book_path: None,
+            save_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scores: Arc::new(Mutex::new(HashMap::new())),
             banned: Arc::new(Mutex::new(HashMap::new())),
             self_nonce: OsRng.next_u64(),
@@ -693,11 +699,26 @@ impl Discovery {
         }
     }
 
-    /// Write the current book to disk (best effort), one `ip:port` per line.
+    /// Write the current book to disk, one `ip:port` per line.
+    ///
+    /// Best effort by design — a node that cannot write its address book still
+    /// runs — but **not silent**. This is how a restart finds anyone without
+    /// going back to the seeds, and on a network whose seed list is empty,
+    /// losing it means the next start has nowhere at all to dial. Said once
+    /// rather than on every pass: the connection manager calls this in a loop,
+    /// and a line each time would bury everything else in the log.
     fn save(&self) {
         let Some(path) = &self.book_path else { return };
         let lines: Vec<String> = self.book.lock().unwrap().iter().map(|a| a.to_string()).collect();
-        let _ = std::fs::write(path, lines.join("\n"));
+        if let Err(e) = std::fs::write(path, lines.join("\n")) {
+            if !self.save_failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "warning: could not write the peer address book to {}: {e}. Peers learned \
+this run will be forgotten on restart, and the next start will have only its seeds to dial.",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// Seed the address book from **trusted** sources: operator-supplied
