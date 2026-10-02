@@ -5,7 +5,7 @@
 // daemon to come up, then shows it in a real desktop window. On quit it stops
 // both child processes.
 
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -48,13 +48,105 @@ function windowTitle(network) {
   return network && network !== 'mainnet' ? 'Nocturnal Wallet — ' + network : 'Nocturnal Wallet';
 }
 
-/// Which network to open. `--testnet` (or NOCT_NETWORK=testnet) selects it;
+/// Which network to open. `--testnet`/`--mainnet` (or NOCT_NETWORK) select it;
 /// mainnet is the default, so an existing install keeps behaving exactly as
 /// before and nobody lands on a test chain by accident.
+///
+/// `--mainnet` is accepted as well as `--testnet` so the Network menu can switch
+/// *back*. Relying on "no flag means mainnet" would make that switch depend on
+/// the default never changing, which is exactly the kind of thing that changes.
+/// The flag beats the environment, because the menu passes a flag and an
+/// inherited `NOCT_NETWORK` must not quietly win against something just clicked.
 function selectedNetwork() {
-  const fromArgs = process.argv.includes('--testnet') ? 'testnet' : null;
-  const fromEnv = (process.env.NOCT_NETWORK || '').toLowerCase() === 'testnet' ? 'testnet' : null;
+  const fromArgs = process.argv.includes('--testnet')
+    ? 'testnet'
+    : process.argv.includes('--mainnet')
+      ? 'mainnet'
+      : null;
+  const env = (process.env.NOCT_NETWORK || '').toLowerCase();
+  const fromEnv = env === 'testnet' || env === 'mainnet' ? env : null;
   return fromArgs || fromEnv || 'mainnet';
+}
+
+/// Restart the app on the other chain.
+///
+/// **Each network has its own wallet, key and balance.** That separation is
+/// deliberate and is what stops a testnet wallet being mistaken for an emptied
+/// mainnet one — but it also means switching shows a different balance, and
+/// somebody who clicks "Testnet", sees 0 NOCT and was told nothing has been
+/// given every reason to think their coins are gone. So this says what will
+/// happen, and that the wallet being left behind is untouched, first.
+async function switchNetwork(to) {
+  const from = selectedNetwork();
+  if (to === from) return;
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    buttons: ['Open ' + to, 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    title: 'Switch network',
+    message: 'Open the ' + to + ' wallet?',
+    detail:
+      'Each network has its own wallet, its own key and its own balance. The ' + from +
+      ' wallet is not changed or moved by this — it is still there, and this menu brings ' +
+      'it back.\n\nThe app will restart.' +
+      (to === 'mainnet'
+        ? '\n\nNote: Nocturnal mainnet has not launched. A mainnet node has no network to ' +
+          'join and will mine a private chain of its own.'
+        : ''),
+  });
+  if (response !== 0) return;
+  // Strip any network flag we were given before adding the one we want, so
+  // switching twice does not leave both on the command line.
+  const args = process.argv
+    .slice(1)
+    .filter((a) => a !== '--testnet' && a !== '--mainnet')
+    .concat(to === 'testnet' ? '--testnet' : '--mainnet');
+  stopDaemons();
+  app.relaunch({ args });
+  app.exit(0);
+}
+
+/// The application menu.
+///
+/// It exists for one reason: until mainnet launches there is no mainnet network
+/// to join, and this app opens mainnet by default — so the chain where anything
+/// actually happens was reachable only by editing a shortcut. This is not a
+/// change of default; it is a way out of one.
+///
+/// The menu bar is shown rather than auto-hidden, because a way out nobody can
+/// find is not one.
+function buildMenu(network) {
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      {
+        label: 'Wallet',
+        submenu: [
+          { role: 'reload' },
+          { role: 'toggleDevTools' },
+          { type: 'separator' },
+          { role: 'quit' },
+        ],
+      },
+      {
+        label: 'Network',
+        submenu: [
+          {
+            label: 'Mainnet',
+            type: 'radio',
+            checked: network === 'mainnet',
+            click: () => switchNetwork('mainnet'),
+          },
+          {
+            label: 'Testnet',
+            type: 'radio',
+            checked: network === 'testnet',
+            click: () => switchNetwork('testnet'),
+          },
+        ],
+      },
+    ])
+  );
 }
 
 // --- where things live ------------------------------------------------------
@@ -338,7 +430,14 @@ function startDaemons(P, key, address) {
 function daemonStopped(name, what) {
   if (stopping) return; // we asked for it
   if (name !== 'noct-walletd') return;
-  showStatus({ state: 'stopped', name, what, log: daemonLogs[name] || '', tail: logTail(daemonLogs[name]) });
+  showStatus({
+    state: 'stopped',
+    name,
+    what,
+    network: launchPaths ? launchPaths.P.network : null,
+    log: daemonLogs[name] || '',
+    tail: logTail(daemonLogs[name]),
+  });
 }
 
 function stopDaemons() {
@@ -439,7 +538,11 @@ function createWindow(network) {
     backgroundColor: '#0e1114',
     title: windowTitle(network),
     icon: ICON,
-    autoHideMenuBar: true,
+    // Shown, not auto-hidden: the Network menu is the only way out of a mainnet
+    // that has not launched, and a way out behind Alt is one most people will
+    // never find. The setup window keeps its menu hidden — nothing in it helps
+    // while a seed phrase is being typed.
+    autoHideMenuBar: false,
     webPreferences: {
       contextIsolation: true,
       // The status page needs a way to ask what happened and to retry. The
@@ -456,11 +559,12 @@ function createWindow(network) {
 async function openWallet(P, wallet) {
   const url = walletUrl(P);
   const what = 'Opening ' + windowTitle(P.network) + '.';
-  showStatus({ state: 'starting', what, seconds: 0 });
+  const net = P.network;
+  showStatus({ state: 'starting', what, seconds: 0, network: net });
   const state = await waitForWallet(
     url,
     () => walletd !== null,
-    (seconds) => showStatus({ state: 'starting', what, seconds })
+    (seconds) => showStatus({ state: 'starting', what, seconds, network: net })
   );
   if (!state) return false;
   // Belt and braces: whatever ended up answering must be serving the key we
@@ -479,6 +583,7 @@ app.whenReady().then(async () => {
   const P = paths();
   registerSetupHandlers();
   registerStatusHandlers();
+  buildMenu(P.network);
 
   let wallet;
   try {
@@ -536,6 +641,7 @@ app.whenReady().then(async () => {
   if (!existing && (await portInUse(port))) {
     showStatus({
       state: 'waiting',
+      network: P.network,
       what: 'Something is already using port ' + port + ' and has not answered yet. '
         + 'Waiting for it rather than starting a second one, which could not have the port anyway.',
       seconds: 0,
@@ -543,7 +649,7 @@ app.whenReady().then(async () => {
     existing = await waitForWallet(
       walletUrl(P),
       () => portInUse(port),
-      (seconds) => showStatus({ state: 'waiting', what: statusState.what, seconds })
+      (seconds) => showStatus({ state: 'waiting', what: statusState.what, seconds, network: P.network })
     );
     // Whoever held it is gone without ever answering; fall through and start our
     // own, which can now have the port.

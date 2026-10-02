@@ -69,6 +69,14 @@
   function render(s) {
     if (!s) return;
     shown = s;
+    // **Name the chain in the title, here too.** The title bar is where this app
+    // says which network is open, and a testnet window that does not say so is
+    // how a test wallet gets mistaken for a real one. The wallet page sets it
+    // once it loads; before that — which is every launch, and minutes of it
+    // after a format change — this page is what is on screen.
+    if (s.network) {
+      document.title = 'Nocturnal Wallet' + (s.network === 'mainnet' ? '' : ' — ' + s.network);
+    }
     const stopped = s.state === 'stopped';
     $('busy').classList.toggle('hide', stopped);
     $('bad').classList.toggle('hide', !stopped);
