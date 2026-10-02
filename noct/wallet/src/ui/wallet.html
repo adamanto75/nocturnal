@@ -192,6 +192,10 @@
         <div class="statval" id="blocksFound">—</div>
       </div>
     </div>
+    <!-- Where this card says what went wrong. Starting or stopping mining used
+         to ignore the node's reply entirely, so a refused start looked exactly
+         like a button that had not registered the click. -->
+    <div class="note hide" id="mineMsg" style="margin-top:12px"></div>
   </div>
 
   <div class="card">
@@ -602,10 +606,45 @@
     return h + ' <small>H/s</small>';
   }
 
+  /// Say something in the mining card, or clear it.
+  ///
+  /// A **sticky** message is the node's answer to something you asked it to do,
+  /// and has to outlive the next poll: otherwise a refusal is wiped a second
+  /// later by a successful read of the mining state, and the click looks like it
+  /// simply did nothing. Trying again clears it.
+  let mineMsgSticky = false;
+  function mineMsg(text, sticky) {
+    const box = $('mineMsg');
+    mineMsgSticky = Boolean(text) && Boolean(sticky);
+    box.textContent = text || '';
+    box.classList.toggle('hide', !text);
+  }
+
+  /// Nothing about mining can be read right now, so nothing about it is shown.
+  ///
+  /// This used to `return` on an error and fall through to `keep last values` on
+  /// an exception, which left a hashrate, a thread count and a **"Stop mining"**
+  /// button on screen for a node that was no longer there. A button offering to
+  /// stop something it cannot reach is worse than a blank: it says mining is
+  /// happening.
+  function miningUnknown(why) {
+    $('hashrate').innerHTML = '—';
+    $('threads').textContent = '—';
+    $('blocksFound').textContent = '—';
+    const btn = $('mineToggle');
+    btn.textContent = 'Start mining';
+    btn.className = '';
+    btn.disabled = true;
+    mineMsg(why);
+  }
+
   async function loadMining() {
     try {
       const m = await (await fetch('/api/mining')).json();
-      if (m.error !== undefined) return;
+      if (m.error !== undefined) {
+        miningUnknown('Mining cannot be reached: ' + m.error);
+        return;
+      }
       mineActive = !!m.active;
       curThreads = m.threads;
       $('hashrate').innerHTML = mineActive ? fmtRate(m.hashrate) : '<small>idle</small>';
@@ -613,22 +652,53 @@
       $('blocksFound').textContent = m.blocks_found;
       if (m.pow) $('powname').textContent = '· ' + m.pow;
       const btn = $('mineToggle');
+      btn.disabled = false;
       btn.textContent = mineActive ? 'Stop mining' : 'Start mining';
       btn.className = mineActive ? 'mining' : '';
-    } catch (e) { /* keep last values */ }
+      if (!mineMsgSticky) mineMsg('');
+    } catch (e) {
+      miningUnknown('The wallet service is not answering, so mining cannot be read.');
+    }
+  }
+
+  /// Send a mining command and **report what the node said about it**.
+  ///
+  /// These calls used to ignore the reply completely. A start the node refused
+  /// left the button back on "Start mining" with nothing said, which is
+  /// indistinguishable from a click that never registered — so the obvious
+  /// response is to click it again, and again.
+  async function mineCommand(path, body, failed) {
+    try {
+      const r = await fetch(path, { method: 'POST', body });
+      const j = await r.json().catch(() => ({}));
+      if (j.error !== undefined) { mineMsg(failed + ': ' + j.error, true); return false; }
+      return true;
+    } catch (e) {
+      mineMsg(failed + ': the wallet service is not answering.', true);
+      return false;
+    }
   }
 
   $('mineToggle').onclick = async () => {
-    const path = mineActive ? '/api/mining/stop' : '/api/mining/start';
-    const body = mineActive ? '' : String(curThreads);
+    const stopping = mineActive;
+    const path = stopping ? '/api/mining/stop' : '/api/mining/start';
+    const body = stopping ? '' : String(curThreads);
     $('mineToggle').disabled = true;
-    try { await fetch(path, { method: 'POST', body }); await loadMining(); }
-    finally { $('mineToggle').disabled = false; }
+    mineMsg('');
+    const ok = await mineCommand(path, body, stopping ? 'Could not stop mining' : 'Could not start mining');
+    // `loadMining` decides whether the button is usable: re-enabling it here
+    // would undo the disable that "mining cannot be read" has just set.
+    await loadMining();
+    // The node accepted the command and still is not mining. That is its answer,
+    // not a click that failed to land, and it deserves saying.
+    if (ok && !stopping && !mineActive) {
+      mineMsg('The node accepted the request but is not mining. Check its output for why.', true);
+    }
   };
 
   async function setThreads(n) {
     n = Math.max(1, Math.min(hwThreads, n));
-    await fetch('/api/mining/threads', { method: 'POST', body: String(n) });
+    await mineCommand('/api/mining/threads', String(n), 'Could not change the thread count');
     await loadMining();
   }
   $('tMinus').onclick = () => setThreads(curThreads - 1);
