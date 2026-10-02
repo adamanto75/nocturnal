@@ -118,9 +118,17 @@
       // no claim to report rather than a false reassurance.
       const claim = Number(info.peer_best_claim || 0);
       const behind = claim > 0 ? Math.max(0, claim - Number(info.height || 0)) : 0;
-      for (const id of STATS) $(id).classList.toggle("stale", behind > 0);
+      // A **stranded** node has diverged deeper than the reorg cap and cannot
+      // rejoin by reorganising: it is serving its own dead fork as the chain, for
+      // ever, and "catching up" would promise it will recover. This explorer
+      // exists partly because a seed once served a dead fork for hours while
+      // height and peer count both called it healthy.
+      const stranded = info.stranded === true;
+      for (const id of STATS) $(id).classList.toggle("stale", behind > 0 || stranded);
       $("chain-note").textContent = data.taken
         ? "Snapshot taken " + fmtTime(data.taken) + " — not live. Coins here are worthless."
+        : stranded
+          ? "This node has diverged from the network and cannot rejoin on its own. What is below is its own fork, not the chain."
         : behind > 0
           ? "This node is still catching up — a peer reports " + behind.toLocaleString()
             + " more block" + (behind === 1 ? "" : "s") + ", so the figures below are not the chain's tip."

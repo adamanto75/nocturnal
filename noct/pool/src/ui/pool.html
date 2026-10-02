@@ -250,9 +250,10 @@ function paint(s) {
   // finds blocks that are already orphaned, so this is not cosmetic: it is the
   // difference between hashrate earning and hashrate being wasted.
   nodeBehind = Number(s.node_behind || 0);
+  nodeStranded = s.node_stranded === true;
   const lost = nodeAge === null || nodeAge > NODE_STALE_SECONDS;
   for (const id of ['height', 'netdiff']) {
-    document.getElementById(id).classList.toggle('stale', lost || nodeBehind > 0);
+    document.getElementById(id).classList.toggle('stale', lost || nodeBehind > 0 || nodeStranded);
   }
   document.getElementById('pooladdr').textContent = s.pool_address || 'not published';
   if (s.network) document.getElementById('net').textContent = s.network;
@@ -309,6 +310,7 @@ function paint(s) {
 const NODE_STALE_SECONDS = 60;
 let nodeAge = null;
 let nodeBehind = 0;
+let nodeStranded = false;
 
 /// Say which of the two things is wrong, because the answers differ: the pool
 /// being unreachable is the reader's problem to retry, the pool having lost its
@@ -316,6 +318,11 @@ let nodeBehind = 0;
 /// know it is the second one.
 function nodeNote() {
   if (nodeAge === null) return ' The pool has not reached its node since it started, so Height and Network difficulty below are not real.';
+  if (nodeStranded && nodeAge <= NODE_STALE_SECONDS) {
+    return ' The node this pool reads has diverged from the network and cannot rejoin on its own.'
+      + ' Every block found here is on its own dead fork and is worth nothing. This will not fix itself:'
+      + ' the operator has to resync that node. Do not point hashrate at this pool until they have.';
+  }
   if (nodeBehind > 0 && nodeAge <= NODE_STALE_SECONDS) {
     return ' The node this pool reads is still catching up — a peer reports ' + nodeBehind.toLocaleString()
       + ' more block' + (nodeBehind === 1 ? '' : 's') + '. Work handed out now builds on an old tip, so a block found'
@@ -352,6 +359,7 @@ async function tick() {
   document.getElementById('age').textContent =
     secs === null ? ''
       : chainLost ? '· pool answering, chain not'
+      : nodeStranded ? '· node stranded on a dead fork'
       : nodeBehind > 0 ? '· node catching up, ' + nodeBehind.toLocaleString() + ' behind'
       : fresh ? '· live'
       : '· last updated ' + secs + 's ago';

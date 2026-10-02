@@ -230,6 +230,14 @@ struct Shared {
     /// The chain's difficulty for the current job — the real target a share has
     /// to meet to also be a block. Reporting only.
     network_difficulty: Difficulty,
+    /// Whether the node says it has diverged from the network for good.
+    ///
+    /// A stranded node cannot rejoin by reorganising, so a pool on one is mining
+    /// its own dead fork: every block it finds is worthless and no amount of
+    /// waiting changes that. It is the one state where "behind" understates the
+    /// problem, and the one the whole joinability check exists for — a seed once
+    /// served a dead fork for hours while height and peer count called it fine.
+    node_stranded: bool,
     /// How far behind the chain the node says it is, as of the last template.
     ///
     /// A pool whose node is still catching up builds templates on an old tip, so
@@ -557,6 +565,7 @@ fn main() {
         height: 0,
         network_difficulty: 0,
         node_behind: 0,
+        node_stranded: false,
         // Nothing seen yet; `/stats` reports null rather than zero, which would
         // read as "seen just now".
         template_seen: None,
@@ -885,15 +894,16 @@ fn refresh_template(shared: &Arc<Mutex<Shared>>, node: &NodeLink, token: &Option
     // `/info` that fails leaves the previous answer alone — the template just
     // succeeded, so the node is plainly there, and a failed extra request is not
     // evidence of a backlog.
-    let behind = http_get(node, "/info", token).ok().and_then(|body| {
+    let health = http_get(node, "/info", token).ok().and_then(|body| {
         let claim = json_u64(&body, "peer_best_claim")?;
         let mine = json_u64(&body, "height")?;
-        Some(claim.saturating_sub(mine))
+        Some((claim.saturating_sub(mine), body.contains("\"stranded\":true")))
     });
 
     let mut s = shared.lock().unwrap();
-    if let Some(behind) = behind {
+    if let Some((behind, stranded)) = health {
         s.node_behind = behind;
+        s.node_stranded = stranded;
     }
     // Stamped here, *before* the unchanged-tip early return: the question this
     // answers is "when did the node last answer us", not "when did the tip last
@@ -1701,7 +1711,8 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps, info: &PoolInfo) -> Strin
         None => "null".to_string(),
     };
     format!(
-        "{{\"node_behind\":{},\"node_seen_seconds_ago\":{},\"height\":{},\"network_difficulty\":{},\"network\":\"{}\",\"pool_address\":\"{}\",\"pool_hashrate\":{:.1},\"connected_workers\":{},\"payout_threshold\":\"{}\",\"payout_tx_fee\":\"{}\",\"total_paid\":\"{}\",\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}],\"recent_payments\":[{}]}}",
+        "{{\"node_stranded\":{},\"node_behind\":{},\"node_seen_seconds_ago\":{},\"height\":{},\"network_difficulty\":{},\"network\":\"{}\",\"pool_address\":\"{}\",\"pool_hashrate\":{:.1},\"connected_workers\":{},\"payout_threshold\":\"{}\",\"payout_tx_fee\":\"{}\",\"total_paid\":\"{}\",\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}],\"recent_payments\":[{}]}}",
+        s.node_stranded,
         s.node_behind,
         node_age,
         s.height,

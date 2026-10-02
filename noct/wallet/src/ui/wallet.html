@@ -373,7 +373,18 @@
         // the node is still catching up put a balance missing recent payments
         // under the one word that promises nothing is missing.
         const behind = Number(s.behind || 0);
-        if (behind > 0) {
+        if (s.stranded) {
+          // A stranded node is behind and always will be: it has diverged deeper
+          // than the reorg cap and cannot rejoin by reorganising, so "catching
+          // up" would promise it will finish. It will not, without a resync.
+          $('dot').classList.remove('ok');
+          setStatus('node stranded');
+          markStale(
+            'This node has diverged from the network and cannot rejoin on its own — it is not '
+            + 'catching up and will not. Nothing below can be trusted as current until it is resynced '
+            + 'from scratch.'
+          );
+        } else if (behind > 0) {
           $('dot').classList.remove('ok');
           setStatus('catching up · ' + behind.toLocaleString() + ' behind');
           // Not dimmed: these figures *are* confirmed, at the height shown. The
