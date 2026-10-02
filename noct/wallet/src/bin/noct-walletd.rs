@@ -670,6 +670,24 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
     };
     let pool = if destination.is_shielded() { "shielded" } else { "ring" };
 
+    // **Where this payment can actually go.** A node with nowhere to dial, or one
+    // stranded on its own fork, will mine this into a chain nobody else sees. The
+    // send is then entirely successful and entirely pointless: "it will confirm
+    // when a block is mined" is true, and the recipient will never be paid. That
+    // is the most expensive thing in this file to leave unsaid, so it goes on the
+    // receipt rather than being left to be worked out from the status line.
+    let reach = match app.client.info() {
+        Ok(body) if body.contains("\"stranded\":true") => {
+            " WARNING: this node has diverged from the network and cannot rejoin, so this will \
+confirm only on its own dead fork. Nobody else will ever see it."
+        }
+        Ok(body) if noct_wallet::client::json_u64(&body, "dialable") == Some(0) => {
+            " WARNING: this node has no network to join, so this will confirm only on a private \
+chain of its own. Nobody else will ever see it."
+        }
+        _ => "",
+    };
+
     let txid = hex::encode(tx.hash());
     // **The node's answer decides, not the transport's.** This used to report
     // success whenever `submit_tx` returned `Ok`, which is true even when the
@@ -693,7 +711,7 @@ fn api_send(app: &Arc<Mutex<App>>, body: &str) -> String {
             format_noct(amount),
             pool,
             format_noct(fee),
-            format!("{crossing}{shape}"),
+            format!("{crossing}{shape}{reach}"),
             )
         }
         Ok(reply) => {

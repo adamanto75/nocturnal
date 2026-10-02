@@ -27,6 +27,24 @@ use noct_wallet::shielded::ShieldedKeys;
 use noct_wallet::{mnemonic, Direction, SpendFrom, Wallet, DEFAULT_RING_SIZE};
 use rand_core::OsRng;
 
+/// Warn when the node that just accepted a transaction has nowhere to send it.
+///
+/// Acceptance is a statement about this node's mempool, not about the network.
+/// On a node with no peers and no seeds, or one stranded past the reorg cap,
+/// every send is accepted, mined and worthless.
+fn warn_if_unreachable(client: &NodeClient) {
+    let Ok(body) = client.info() else { return };
+    if body.contains("\"stranded\":true") {
+        eprintln!(
+            "WARNING: this node has diverged from the network and cannot rejoin, so this will confirm only on its own dead fork. Nobody else will ever see it."
+        );
+    } else if client::json_u64(&body, "dialable") == Some(0) {
+        eprintln!(
+            "WARNING: this node has no network to join, so this will confirm only on a private chain of its own. Nobody else will ever see it."
+        );
+    }
+}
+
 /// Warn, on stderr, when the node this wallet just read is **itself** still
 /// catching up.
 ///
@@ -110,6 +128,11 @@ fn submit_and_report(client: &NodeClient, tx: &noct_core::tx::Transaction, succe
                     eprintln!("warning: {reason}");
                 }
             }
+            // **Relayed to whom?** A node with nowhere to dial, or one stranded
+            // on its own fork, accepts this and mines it into a chain nobody
+            // else sees. The send succeeded and the recipient will never be
+            // paid, which is the most expensive thing here to leave unsaid.
+            warn_if_unreachable(client);
             return true;
         }
         Ok(reply) => {
