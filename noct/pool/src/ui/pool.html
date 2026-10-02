@@ -46,6 +46,9 @@ h2{font-size:15px;letter-spacing:.10em;text-transform:uppercase;color:var(--dim)
 .card .v{font-size:23px;margin-top:4px;letter-spacing:-.01em}
 .card .v.small{font-size:15px;font-family:var(--mono);word-break:break-all;line-height:1.45}
 .card.free .v{color:var(--good)}
+/* A figure the pool can no longer confirm with its node. The note above says
+   how long ago it was true; this says, without reading, that it is not now. */
+.card .v.stale{opacity:.35}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
 .mono{font-family:var(--mono)}
 pre{margin:10px 0 0;padding:13px 14px;background:#0b0d13;border:1px solid var(--line);
@@ -236,6 +239,17 @@ function paint(s) {
   document.getElementById('maturing').textContent = num(s.pending_rounds);
   document.getElementById('height').textContent = num(s.height);
   document.getElementById('netdiff').textContent = num(s.network_difficulty);
+  // **Two different questions.** That this page reached the pool says nothing
+  // about whether the pool can still reach its node — and when it cannot, it
+  // goes on serving the last height it saw, as a plain number, for as long as it
+  // runs. The failure was logged to the operator's stderr and published nowhere,
+  // so the dashboard called a frozen height "live".
+  nodeAge = (s.node_seen_seconds_ago === null || s.node_seen_seconds_ago === undefined)
+    ? null : Number(s.node_seen_seconds_ago);
+  const lost = nodeAge === null || nodeAge > NODE_STALE_SECONDS;
+  for (const id of ['height', 'netdiff']) {
+    document.getElementById(id).classList.toggle('stale', lost);
+  }
   document.getElementById('pooladdr').textContent = s.pool_address || 'not published';
   if (s.network) document.getElementById('net').textContent = s.network;
 
@@ -285,6 +299,26 @@ function paint(s) {
     s.total_paid && Number(s.total_paid) > 0 ? 'Paid out so far: ' + noct(s.total_paid) : '';
 }
 
+// How long the pool may go without an answer from its node before the chain
+// figures stop being presentable as current. Templates are fetched every few
+// seconds, so a minute is many missed attempts, not one slow one.
+const NODE_STALE_SECONDS = 60;
+let nodeAge = null;
+
+/// Say which of the two things is wrong, because the answers differ: the pool
+/// being unreachable is the reader's problem to retry, the pool having lost its
+/// node is the operator's to fix, and a miner pointing hashrate here needs to
+/// know it is the second one.
+function nodeNote() {
+  if (nodeAge === null) return ' The pool has not reached its node since it started, so Height and Network difficulty below are not real.';
+  if (nodeAge > NODE_STALE_SECONDS) {
+    const m = Math.round(nodeAge / 60);
+    const when = nodeAge < 120 ? nodeAge + ' seconds' : m + ' minute' + (m === 1 ? '' : 's');
+    return ' The pool has not reached its node for ' + when + ': Height and Network difficulty below are the last it could see, not current ones.';
+  }
+  return '';
+}
+
 async function tick() {
   const box = document.getElementById('err');
   try {
@@ -292,15 +326,24 @@ async function tick() {
     if (r.status === 401) throw new Error('This pool requires a miner token to read its stats.');
     if (!r.ok) throw new Error('The pool answered ' + r.status + '.');
     paint(await r.json());
-    box.style.display = 'none';
+    const note = nodeNote();
+    box.textContent = note.trim();
+    box.style.display = note ? 'block' : 'none';
     lastOk = Date.now();
   } catch (e) {
     box.textContent = e.message + ' Retrying…';
     box.style.display = 'block';
   }
   const secs = lastOk ? Math.round((Date.now() - lastOk) / 1000) : null;
+  const fresh = secs !== null && secs < 15;
+  // "live" is only true when both are: this page is reading the pool, and the
+  // pool is reading the chain.
+  const chainLost = nodeAge === null || nodeAge > NODE_STALE_SECONDS;
   document.getElementById('age').textContent =
-    secs === null ? '' : (secs < 15 ? '· live' : '· last updated ' + secs + 's ago');
+    secs === null ? ''
+      : chainLost ? '· pool answering, chain not'
+      : fresh ? '· live'
+      : '· last updated ' + secs + 's ago';
 }
 
 // Only a real http(s) address is worth printing. Opened any other way — from a

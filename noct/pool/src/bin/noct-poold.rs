@@ -230,6 +230,15 @@ struct Shared {
     /// The chain's difficulty for the current job — the real target a share has
     /// to meet to also be a block. Reporting only.
     network_difficulty: Difficulty,
+    /// When the node last handed over a usable block template.
+    ///
+    /// Without this, a pool whose node has gone away keeps serving the height it
+    /// last saw, as a plain number with nothing beside it, for as long as it runs
+    /// — and the dashboard calls it "live", because its own fetch of `/stats`
+    /// succeeded. The two are different questions: whether the pool is answering,
+    /// and whether the pool can still see the chain. A template fetch that fails
+    /// is logged to the operator's stderr and was published nowhere.
+    template_seen: Option<std::time::Instant>,
     /// Who is owed what, and what has already been sent.
     ledger: PayoutLedger,
     /// Durable record of the PPLNS window, so a restart does not forfeit
@@ -539,6 +548,9 @@ fn main() {
         current_job: None,
         height: 0,
         network_difficulty: 0,
+        // Nothing seen yet; `/stats` reports null rather than zero, which would
+        // read as "seen just now".
+        template_seen: None,
         ledger,
         window_log,
         worker_work: HashMap::new(),
@@ -860,6 +872,11 @@ fn refresh_template(shared: &Arc<Mutex<Shared>>, node: &NodeLink, token: &Option
     let height = block.coinbase.height;
 
     let mut s = shared.lock().unwrap();
+    // Stamped here, *before* the unchanged-tip early return: the question this
+    // answers is "when did the node last answer us", not "when did the tip last
+    // move". A quiet chain is not a lost node, and conflating them would make a
+    // healthy pool look broken every time a block took a while.
+    s.template_seen = Some(std::time::Instant::now());
     // Only republish when the tip moved; otherwise miners would be handed a new
     // job id every few seconds and lose their in-flight work for nothing.
     if s.height == height && s.current_job.is_some() {
@@ -1651,9 +1668,18 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps, info: &PoolInfo) -> Strin
         .filter(|p| !matches!(p.state, PaymentState::Lost))
         .map(|p| p.amount as u128)
         .sum();
-    let (rate, active) = hashrate(&s.assignments, std::time::Instant::now());
+    let now = std::time::Instant::now();
+    let (rate, active) = hashrate(&s.assignments, now);
+    // How long since the node last answered, so a reader can tell a current
+    // height from the last one this pool was able to see. `null` means it has
+    // not answered once since the pool started.
+    let node_age = match s.template_seen {
+        Some(t) => now.duration_since(t).as_secs().to_string(),
+        None => "null".to_string(),
+    };
     format!(
-        "{{\"height\":{},\"network_difficulty\":{},\"network\":\"{}\",\"pool_address\":\"{}\",\"pool_hashrate\":{:.1},\"connected_workers\":{},\"payout_threshold\":\"{}\",\"payout_tx_fee\":\"{}\",\"total_paid\":\"{}\",\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}],\"recent_payments\":[{}]}}",
+        "{{\"node_seen_seconds_ago\":{},\"height\":{},\"network_difficulty\":{},\"network\":\"{}\",\"pool_address\":\"{}\",\"pool_hashrate\":{:.1},\"connected_workers\":{},\"payout_threshold\":\"{}\",\"payout_tx_fee\":\"{}\",\"total_paid\":\"{}\",\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}],\"recent_payments\":[{}]}}",
+        node_age,
         s.height,
         s.network_difficulty,
         info.network,
