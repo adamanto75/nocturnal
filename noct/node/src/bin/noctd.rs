@@ -209,10 +209,23 @@ fn main() {
         }
     }
 
+    // **Is there a network to join at all?** A node with no peers and no seeds
+    // cannot find anyone, ever, and its only symptom is a peer count that stays
+    // at zero — which looks exactly like a quiet network or a firewall. Mainnet
+    // ships with no seeds because it has not launched, so this is the ordinary
+    // state of every mainnet node today, and calling it "real value" was a claim
+    // about a network that does not exist yet.
+    let nothing_to_dial = peers.is_empty() && seeds.is_empty();
+
     eprintln!("noctd starting");
     eprintln!(
         "  network: {} (p2p magic {:#010x})",
         match network {
+            // Keyed on whether this build knows how to reach mainnet, so the
+            // wording corrects itself the day seeds are baked in rather than
+            // waiting for somebody to remember this line.
+            Network::Mainnet if noct_node::MAINNET_SEEDS.is_empty() =>
+                "MAINNET — NOT LAUNCHED, see below",
             Network::Mainnet => "MAINNET — real value",
             Network::Testnet => "testnet — coins here are worthless",
         },
@@ -227,6 +240,25 @@ fn main() {
     match &data_dir {
         Some(d) => eprintln!("  data:  {}", d.display()),
         None => eprintln!("  data:  (in-memory only — chain is lost on exit)"),
+    }
+
+    if nothing_to_dial {
+        eprintln!();
+        eprintln!("NOTHING TO DIAL — this node has no peers and no seeds, so it cannot join");
+        eprintln!("any network. It will sit at 0 peers for ever, which looks the same from");
+        eprintln!("outside as a quiet network or a blocked port, and is not.");
+        if matches!(network, Network::Mainnet) && noct_node::MAINNET_SEEDS.is_empty() {
+            eprintln!();
+            eprintln!("Nocturnal MAINNET HAS NOT LAUNCHED: there are no mainnet seeds in this");
+            eprintln!("binary because there is no mainnet network yet. Anything mined here is on");
+            eprintln!("a private chain of this node's own, and will be discarded the moment it");
+            eprintln!("meets the real one. The live network is the testnet:");
+            eprintln!();
+            eprintln!("    noctd --network testnet");
+        } else {
+            eprintln!("Give it somewhere to start with --seed or --peer.");
+        }
+        eprintln!();
     }
 
     if let Err(e) = run(Config {

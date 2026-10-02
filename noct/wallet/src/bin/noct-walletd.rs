@@ -388,21 +388,27 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
             // reorganising. Telling its owner it is "catching up" would be a
             // promise that it will finish, which is exactly wrong: it needs
             // resyncing by hand and nothing else will do.
-            let (behind, peers, stranded) = match app.client.info() {
+            let (behind, peers, stranded, dialable) = match app.client.info() {
                 Ok(body) => (
                     noct_wallet::client::json_u64(&body, "peer_best_claim")
                         .unwrap_or(0)
                         .saturating_sub(height),
                     noct_wallet::client::json_u64(&body, "peers").unwrap_or(0),
                     body.contains("\"stranded\":true"),
+                    // How many addresses the node has to dial at all. Zero peers
+                    // because nobody has answered yet and zero peers because
+                    // there is nowhere to call are the same number and not the
+                    // same fact — and on mainnet today it is always the second,
+                    // because mainnet ships with no seeds and has not launched.
+                    noct_wallet::client::json_u64(&body, "dialable").unwrap_or(0),
                 ),
                 // Unknown, and reported as such rather than as zero peers: only
                 // one of "nobody is connected" and "we could not ask" is a
                 // problem with the chain.
-                Err(_) => (0, u64::MAX, false),
+                Err(_) => (0, u64::MAX, false, u64::MAX),
             };
             format!(
-                "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"shielded_address\":\"{}\",\"balance\":\"{}\",\"ring\":\"{}\",\"shielded\":\"{}\",\"shielded_pending\":\"{}\",\"notes\":{},\"outputs\":{},\"unspent\":{},\"behind\":{},\"peers\":{},\"stranded\":{},\"history\":{}}}",
+                "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"shielded_address\":\"{}\",\"balance\":\"{}\",\"ring\":\"{}\",\"shielded\":\"{}\",\"shielded_pending\":\"{}\",\"notes\":{},\"outputs\":{},\"unspent\":{},\"behind\":{},\"peers\":{},\"stranded\":{},\"dialable\":{},\"history\":{}}}",
                 net,
                 height,
                 address,
@@ -422,6 +428,7 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
                 // nothing rather than as a peer count.
                 peers,
                 stranded,
+                dialable,
                 history_json(&app.wallet, &app.shielded),
             )
         }

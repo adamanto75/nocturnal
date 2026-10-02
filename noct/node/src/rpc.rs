@@ -246,6 +246,12 @@ pub fn serve(
     token: Option<String>,
     rate: u32,
     acceptor: Option<Acceptor>,
+    // `dialable`: how many addresses this node was given to dial — explicit peers
+    // plus resolved seeds. Reported so a reader can tell "nobody has connected
+    // yet" from "there is nothing to connect to", which look identical from
+    // outside and mean entirely different things. On a network with no seeds
+    // baked in and none supplied it is 0, and the node will never find anyone.
+    dialable: usize,
 ) {
     let token = Arc::new(token);
     let limiter = Arc::new(RateLimiter::new(rate));
@@ -273,7 +279,7 @@ pub fn serve(
             let token = Arc::clone(&token);
             let limiter = Arc::clone(&limiter);
             thread::spawn(move || {
-                let _ = handle_client(stream, state, peers, token, limiter);
+                let _ = handle_client(stream, state, peers, token, limiter, dialable);
             });
         }
     });
@@ -285,6 +291,7 @@ fn handle_client(
     peers: Peers,
     token: Arc<Option<String>>,
     limiter: Arc<RateLimiter>,
+    dialable: usize,
 ) -> std::io::Result<()> {
     // Identify the client before anything else, for rate limiting. An address we
     // cannot read cannot be limited, so treat it as unspecified and bill it to a
@@ -381,7 +388,7 @@ fn handle_client(
             let node = state.lock().unwrap();
             let totals = node.pool_totals();
             let json = format!(
-                "{{\"height\":{},\"peer_best_claim\":{},\"outputs\":{},\"emitted\":{},\"ring\":{},\"shielded\":{},\"notes\":{},\"anchor\":\"{}\",\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"min_fee_per_kb\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
+                "{{\"height\":{},\"peer_best_claim\":{},\"outputs\":{},\"emitted\":{},\"ring\":{},\"shielded\":{},\"notes\":{},\"anchor\":\"{}\",\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"min_fee_per_kb\":{},\"peers\":{},\"dialable\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
                 node.height(),
                 // **The highest height a connected peer claims**, which is how a
                 // reader can tell "this node is at the tip" from "this node is
@@ -422,6 +429,11 @@ fn handle_client(
                 // the node it is actually submitting to.
                 noct_core::mempool::MIN_FEE_PER_KB,
                 peer_count,
+                // Zero here is not "nobody has connected yet" — it is "there is
+                // nowhere to connect to". A node on a network with no seeds will
+                // sit at peers=0 for ever, and saying only `peers: 0` leaves that
+                // indistinguishable from a network that is merely quiet.
+                dialable,
                 hex::encode(node.tip_id()),
                 // Which proof-of-work this binary was built with. A pool or miner
                 // built against a different one re-hashes shares with a function

@@ -398,16 +398,34 @@
             + '. What is below is correct as far as block ' + s.height
             + ' — a payment may have arrived since that it cannot see yet.'
           );
+        } else if (Number(s.peers) === 0 && Number(s.dialable) === 0) {
+          // **Zero peers because there is nowhere to call.** On mainnet today
+          // this is always the case: no mainnet seeds are baked in, because
+          // mainnet has not launched. Saying only "no peers" reads as a
+          // connectivity fault somebody might try to fix, and sends them looking
+          // at their firewall for a network that does not exist.
+          $('dot').classList.remove('ok');
+          setStatus('no network to join');
+          markStale(
+            s.network === 'mainnet'
+              ? 'Nocturnal mainnet has not launched. This node has no seeds to dial and no '
+                + 'network to join, so it is extending a private chain of its own — anything '
+                + 'mined on it is worthless and will be discarded when the real network exists. '
+                + 'The live network is the testnet.'
+              : 'This node has no peers and nothing to dial, so it cannot join a network at all. '
+                + 'Give it a --seed or --peer to start from.'
+          );
         } else if (Number(s.peers) === 0) {
-          // The third state, which used to be reported as the first. A node with
-          // nobody connected is not synced and is not behind — it has nobody to
-          // be behind. Saying "synced" there makes the same promise about a chain
-          // it cannot see, with none of the backing.
+          // Nobody connected, but there *are* addresses to try — so this is a
+          // node that may yet find someone, which is a different thing from one
+          // that never can. Either way it is not synced and not behind: it has
+          // nobody to be behind, and saying "synced" would promise about a chain
+          // it cannot see.
           $('dot').classList.remove('ok');
           setStatus('no peers');
           markFresh();
           note(
-            'This node has no peers, so it cannot tell whether block ' + s.height
+            'This node has no peers connected, so it cannot tell whether block ' + s.height
             + ' is the tip. What is below is what it has; there may be more chain it has not seen.'
           );
         } else {

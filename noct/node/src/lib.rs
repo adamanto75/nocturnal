@@ -333,6 +333,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
         config.rpc_token.clone(),
         config.rpc_rate_limit,
         rpc_acceptor,
+        config.peers.len() + config.seeds.len(),
     );
 
     // Multi-threaded miner: always spawned so it can be toggled on/off over RPC,
