@@ -362,8 +362,27 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
             let ring = app.wallet.balance();
             let shielded = app.shielded.balance();
             let pending = app.shielded.pending_balance();
+            // **Is the node we are reading actually at the tip?**
+            //
+            // Every figure below is correct *as of this height*, and the wallet
+            // presented that as "synced" whatever height it was. A node 2,000
+            // blocks behind therefore served a balance missing every payment
+            // since, under the word synced — which is what money having vanished
+            // looks like. The node now reports the highest height a connected
+            // peer claims; the difference is how far it may still have to go.
+            //
+            // That claim is unverified, so this is reported as a number of blocks
+            // a peer *says* are missing, never as a fault. A failure to read it
+            // is 0: the node is plainly answering us, and inventing a backlog
+            // because one extra request failed would be its own kind of lie.
+            let behind = match app.client.info() {
+                Ok(body) => noct_wallet::client::json_u64(&body, "peer_best_claim")
+                    .unwrap_or(0)
+                    .saturating_sub(height),
+                Err(_) => 0,
+            };
             format!(
-                "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"shielded_address\":\"{}\",\"balance\":\"{}\",\"ring\":\"{}\",\"shielded\":\"{}\",\"shielded_pending\":\"{}\",\"notes\":{},\"outputs\":{},\"unspent\":{},\"history\":{}}}",
+                "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"shielded_address\":\"{}\",\"balance\":\"{}\",\"ring\":\"{}\",\"shielded\":\"{}\",\"shielded_pending\":\"{}\",\"notes\":{},\"outputs\":{},\"unspent\":{},\"behind\":{},\"history\":{}}}",
                 net,
                 height,
                 address,
@@ -378,6 +397,7 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
                 app.shielded.unspent().count(),
                 app.wallet.outputs().len(),
                 app.wallet.unspent().count(),
+                behind,
                 history_json(&app.wallet, &app.shielded),
             )
         }

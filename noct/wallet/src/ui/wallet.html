@@ -310,6 +310,14 @@
     $('staleBar').classList.remove('show');
   }
 
+  /// A caveat about figures that *are* confirmed — shown in the same place as the
+  /// stale banner but without dimming anything, because there is nothing wrong
+  /// with the numbers themselves. Call it after `markFresh`, which clears it.
+  function note(text) {
+    $('staleBar').textContent = text;
+    $('staleBar').classList.add('show');
+  }
+
   function markStale(why) {
     document.body.classList.add('stale');
     const when = lastOkAt
@@ -355,10 +363,31 @@
         $('notes').textContent = (s.notes === undefined ? '—' : s.notes);
         $('notesWord').textContent = (s.notes === 1 ? 'note' : 'notes');
         $('height').textContent = s.height;
-        $('dot').classList.add('ok');
-        setStatus('synced');
         renderHistory(s.history || []);
-        markFresh();
+        // "Synced" is a claim about the chain, not about this wallet. Every
+        // figure here is right as of the height shown, and saying synced while
+        // the node is still catching up put a balance missing recent payments
+        // under the one word that promises nothing is missing.
+        const behind = Number(s.behind || 0);
+        if (behind > 0) {
+          $('dot').classList.remove('ok');
+          setStatus('catching up · ' + behind.toLocaleString() + ' behind');
+          // Not dimmed: these figures *are* confirmed, at the height shown. The
+          // doubt is a different one — that there is more chain they have not
+          // seen — so it gets its own sentence rather than being folded into
+          // "nothing here can be checked", which would be untrue.
+          markFresh();
+          note(
+            'This node is still catching up: a peer reports ' + behind.toLocaleString()
+            + ' more block' + (behind === 1 ? '' : 's')
+            + '. What is below is correct as far as block ' + s.height
+            + ' — a payment may have arrived since that it cannot see yet.'
+          );
+        } else {
+          $('dot').classList.add('ok');
+          setStatus('synced');
+          markFresh();
+        }
       } else {
         // The wallet is answering; it is the *node* it cannot reach. So the
         // figures are real as far as they go, and simply cannot advance — money

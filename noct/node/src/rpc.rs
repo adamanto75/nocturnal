@@ -381,8 +381,21 @@ fn handle_client(
             let node = state.lock().unwrap();
             let totals = node.pool_totals();
             let json = format!(
-                "{{\"height\":{},\"outputs\":{},\"emitted\":{},\"ring\":{},\"shielded\":{},\"notes\":{},\"anchor\":\"{}\",\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"min_fee_per_kb\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
+                "{{\"height\":{},\"peer_best_claim\":{},\"outputs\":{},\"emitted\":{},\"ring\":{},\"shielded\":{},\"notes\":{},\"anchor\":\"{}\",\"cumulative_difficulty\":\"{}\",\"mempool\":{},\"min_fee_per_kb\":{},\"peers\":{},\"tip\":\"{}\",\"pow\":\"{}\",\"stranded\":{}}}",
                 node.height(),
+                // **The highest height a connected peer claims**, which is how a
+                // reader can tell "this node is at the tip" from "this node is
+                // still catching up". Without it every consumer treated our own
+                // height as the chain's: a wallet on a node 2,000 blocks behind
+                // said "synced" over a balance missing every payment since, which
+                // is indistinguishable from the money being gone.
+                //
+                // It is **unverified and must be reported as a claim**, never as
+                // the chain's height: a peer can say anything. It is scoped to
+                // live peers so a liar's number leaves with the liar, and it is
+                // 0 when no peer has spoken — which means "nothing known", not
+                // "we are at the tip".
+                node.peer_best_claim(),
                 node.num_outputs(),
                 node.emitted(),
                 // What each pool holds. `ring + shielded` must equal `emitted` at

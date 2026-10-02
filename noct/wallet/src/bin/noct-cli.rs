@@ -27,6 +27,30 @@ use noct_wallet::shielded::ShieldedKeys;
 use noct_wallet::{mnemonic, Direction, SpendFrom, Wallet, DEFAULT_RING_SIZE};
 use rand_core::OsRng;
 
+/// Warn, on stderr, when the node this wallet just read is **itself** still
+/// catching up.
+///
+/// Every figure the commands below print is correct as of the height they
+/// reached. They all said "synced to height N" regardless, so a wallet reading a
+/// node two thousand blocks behind reported a balance missing every payment
+/// since, under a word that promises nothing is missing.
+///
+/// The peer's claim is unverified, so this is phrased as what a peer reports and
+/// never as a fault, and a node that will not answer the extra request is left
+/// alone rather than accused of anything.
+///
+/// On **stderr** so that `noct-cli balance | …` keeps producing exactly what it
+/// did before, while a person at a terminal still sees it.
+fn warn_if_behind(client: &NodeClient, height: u64) {
+    let Ok(body) = client.info() else { return };
+    let behind = client::json_u64(&body, "peer_best_claim").unwrap_or(0).saturating_sub(height);
+    if behind > 0 {
+        eprintln!(
+            "warning: this node is still catching up — a peer reports {behind} more block(s). What follows is correct as far as block {height}; a payment may have arrived since that it cannot see yet."
+        );
+    }
+}
+
 /// Refuse to send a transaction the network will not relay, and say by how much.
 ///
 /// The node would answer this too — `/submit_tx` returns `required_fee` — but
@@ -296,15 +320,17 @@ fn cmd_seed(path: &str) {
 
 fn cmd_balance(path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
     let account = load_account(path);
+    let client = NodeClient::with_token(node.clone(), token.clone());
     let (_chain, wallet, shielded, height) = load_synced_wallets(
-        &NodeClient::with_token(node.clone(), token.clone()),
+        &client,
         account,
         network,
         cache_path(path),
         &load_issued(path),
     )
     .unwrap_or_else(|e| fail(&e));
-    println!("synced to height {height}");
+    warn_if_behind(&client, height);
+    println!("read to height {height}");
 
     // Both pools, always, and named — a single "balance" line would have to pick
     // one pool to mean, and whichever it picked would be wrong for somebody.
@@ -387,15 +413,17 @@ fn cmd_subaddress(args: &[String], path: &str, network: Network) {
 
 fn cmd_history(path: &str, node: &Endpoint, token: &Option<String>, network: Network) {
     let account = load_account(path);
+    let client = NodeClient::with_token(node.clone(), token.clone());
     let (_chain, wallet, shielded, height) = load_synced_wallets(
-        &NodeClient::with_token(node.clone(), token.clone()),
+        &client,
         account,
         network,
         cache_path(path),
         &load_issued(path),
     )
     .unwrap_or_else(|e| fail(&e));
-    println!("synced to height {height}");
+    warn_if_behind(&client, height);
+    println!("read to height {height}");
 
     // **Both pools, merged by height.** A shielded receipt appears in no ring
     // history, and an in-pool payment has no ring side at all, so listing only
@@ -526,8 +554,9 @@ fn cmd_send(args: &[String], path: &str, node: &Endpoint, token: &Option<String>
     let (chain, mut wallet, mut shielded, height) =
         load_synced_wallets(&client, account, network, cache_path(path), &load_issued(path))
             .unwrap_or_else(|e| fail(&e));
+    warn_if_behind(&client, height);
     println!(
-        "synced to height {height}; ring {} NOCT, shielded {} NOCT",
+        "read to height {height}; ring {} NOCT, shielded {} NOCT",
         format_noct(wallet.balance()),
         format_noct(shielded.balance())
     );
@@ -706,8 +735,9 @@ fn cmd_unshield(args: &[String], path: &str, node: &Endpoint, token: &Option<Str
         None => wallet.address(),
     };
 
+    warn_if_behind(&client, height);
     println!(
-        "synced to height {height}; shielded {} NOCT spendable",
+        "read to height {height}; shielded {} NOCT spendable",
         format_noct(shielded.spendable_value())
     );
     println!("note: unshielding {} NOCT publishes that amount.", format_noct(amount));

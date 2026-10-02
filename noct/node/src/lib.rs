@@ -685,6 +685,22 @@ pub struct NodeState {
     reorgs_without_ancestor: u32,
     /// Highest height any peer has advertised — the initial-block-download target.
     peer_best_height: u64,
+    /// The height each **currently connected** peer has claimed, for reporting
+    /// only — never for a sync decision.
+    ///
+    /// [`Self::peer_best_height`] cannot answer "is this node behind?" for a
+    /// reader, because it only ever rises and is never reset: one message
+    /// claiming an absurd height pins it for the life of the process, and a node
+    /// that caught up long ago would go on being reported as thousands of blocks
+    /// short. That is the same cheap message that once pinned relaying off
+    /// permanently. Keyed by peer, and dropped with the peer in
+    /// [`Self::forget_peer`], the claim leaves when the peer making it does.
+    ///
+    /// It is still **unverified** — a connected peer can claim anything, and
+    /// nothing here checks it. So what this supports is "a peer claims the chain
+    /// is further on than we are", which is a true statement about a claim. It
+    /// must never be phrased as a fact about the chain.
+    peer_claims: std::collections::HashMap<usize, u64>,
     /// Per peer, what [`Self::peer_best_height`] was when we last *started* a
     /// branch collection from it.
     ///
@@ -762,6 +778,7 @@ impl NodeState {
             collected_txs: 0,
             peers_serving_invalid_blocks: std::collections::HashSet::new(),
             peer_best_height: 0,
+            peer_claims: std::collections::HashMap::new(),
             collect_attempt_best: HashMap::new(),
             store: None,
             sync: HashMap::new(),
@@ -1086,6 +1103,22 @@ impl NodeState {
         self.peer_best_height
     }
 
+    /// Record what a connected peer says its height is. Reporting only — no sync
+    /// decision reads this, so a lie costs an attacker a misleading line on a
+    /// status page and nothing else.
+    fn note_claim(&mut self, peer: usize, height: u64) {
+        let entry = self.peer_claims.entry(peer).or_insert(0);
+        *entry = (*entry).max(height);
+    }
+
+    /// The highest height any **currently connected** peer claims to have.
+    ///
+    /// Zero when no peer has said anything yet, which is not the same as "we are
+    /// at the tip" and must not be reported as it.
+    pub fn peer_best_claim(&self) -> u64 {
+        self.peer_claims.values().copied().max().unwrap_or(0)
+    }
+
     /// Handle a message from a specific peer, returning what to send back to it,
     /// what to broadcast, and what to stem. This is the single entry point the
     /// TCP transport uses; it folds in gossip *and* initial block download.
@@ -1131,6 +1164,7 @@ impl NodeState {
                     return out;
                 }
                 self.peer_best_height = self.peer_best_height.max(height);
+                self.note_claim(peer, height);
 
                 // Same tip: we already agree, whatever the heights say.
                 if tip == self.chain.tip_id() {
@@ -1180,6 +1214,7 @@ impl NodeState {
         // A valid block at index H means the sender has at least H+1 blocks.
         let block_height = block.coinbase.height;
         self.peer_best_height = self.peer_best_height.max(block_height.saturating_add(1));
+        self.note_claim(peer, block_height.saturating_add(1));
 
         // If we're downloading a branch from this peer, this block is part of it.
         // (Deliberately before the seen-dedup: a branch re-sends blocks we know.)
@@ -1342,6 +1377,8 @@ impl NodeState {
     /// already been OOM-killed once in production.
     pub fn forget_peer(&mut self, peer: usize) {
         self.collect_attempt_best.remove(&peer);
+        // A claim is only worth as much as the connection it arrived on.
+        self.peer_claims.remove(&peer);
         if let Some(abandoned) = self.sync.remove(&peer) {
             let txs: usize = abandoned.blocks.iter().map(|(_, t)| t.len()).sum();
             self.collected_txs = self.collected_txs.saturating_sub(txs);
@@ -1807,6 +1844,57 @@ mod tests {
         assert!(
             !node.sync.contains_key(&42),
             "an unfinished collection must not outlive the peer's session"
+        );
+    }
+
+    /// **A liar's claim must leave with the liar.**
+    ///
+    /// `peer_best_height` only ever rises and is never reset, so one message
+    /// claiming an absurd height pins it for the life of the process — the same
+    /// cheap message that once turned block relay off permanently. Publishing it
+    /// would mean a node that caught up long ago is still reported as millions of
+    /// blocks short, by a peer that is no longer even connected.
+    ///
+    /// So the reported claim is scoped to live peers. This asserts both halves:
+    /// the lie is visible while the liar is connected, and gone the moment it is
+    /// not — while `peer_best_height`, which sync still uses, is deliberately
+    /// left alone.
+    #[test]
+    fn a_disconnected_peers_height_claim_is_not_reported_any_more() {
+        let mut w = wallet();
+        let mut node = test_node(w.address());
+        mine_n(&mut node, &mut w, 3);
+
+        node.note_claim(7, 10);
+        node.note_claim(8, 5_000_000); // the liar
+        assert_eq!(node.peer_best_claim(), 5_000_000, "a connected peer's claim is reported");
+
+        node.forget_peer(8);
+        assert_eq!(
+            node.peer_best_claim(),
+            10,
+            "once the liar is gone its claim must be too, or the node is reported              as behind for ever by someone who is not there"
+        );
+
+        node.forget_peer(7);
+        assert_eq!(
+            node.peer_best_claim(),
+            0,
+            "with nobody connected there is no claim — which means `nothing known`,              not `we are at the tip`"
+        );
+    }
+
+    /// A claim is reporting only: it must not move the number sync decisions read.
+    #[test]
+    fn recording_a_claim_does_not_touch_the_sync_target() {
+        let mut w = wallet();
+        let mut node = test_node(w.address());
+        let before = node.sync_target();
+        node.note_claim(1, 9_000_000);
+        assert_eq!(
+            node.sync_target(),
+            before,
+            "note_claim is for the status page; nothing about syncing may read it"
         );
     }
 
