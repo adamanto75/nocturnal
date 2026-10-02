@@ -230,6 +230,14 @@ struct Shared {
     /// The chain's difficulty for the current job — the real target a share has
     /// to meet to also be a block. Reporting only.
     network_difficulty: Difficulty,
+    /// How far behind the chain the node says it is, as of the last template.
+    ///
+    /// A pool whose node is still catching up builds templates on an old tip, so
+    /// every block it finds is already orphaned — miners burn power for nothing
+    /// and the dashboard reports the stale height as the chain's. The node knows
+    /// (it compares its height against what connected peers claim) and now says
+    /// so; this carries it to the people paying the electricity bill.
+    node_behind: u64,
     /// When the node last handed over a usable block template.
     ///
     /// Without this, a pool whose node has gone away keeps serving the height it
@@ -548,6 +556,7 @@ fn main() {
         current_job: None,
         height: 0,
         network_difficulty: 0,
+        node_behind: 0,
         // Nothing seen yet; `/stats` reports null rather than zero, which would
         // read as "seen just now".
         template_seen: None,
@@ -871,7 +880,21 @@ fn refresh_template(shared: &Arc<Mutex<Shared>>, node: &NodeLink, token: &Option
     let Ok(seed) = <[u8; 32]>::try_from(seed) else { return };
     let height = block.coinbase.height;
 
+    // Asked on the same cycle as the template, because the two answers belong
+    // together: this height is only the chain's tip if the node is at it. An
+    // `/info` that fails leaves the previous answer alone — the template just
+    // succeeded, so the node is plainly there, and a failed extra request is not
+    // evidence of a backlog.
+    let behind = http_get(node, "/info", token).ok().and_then(|body| {
+        let claim = json_u64(&body, "peer_best_claim")?;
+        let mine = json_u64(&body, "height")?;
+        Some(claim.saturating_sub(mine))
+    });
+
     let mut s = shared.lock().unwrap();
+    if let Some(behind) = behind {
+        s.node_behind = behind;
+    }
     // Stamped here, *before* the unchanged-tip early return: the question this
     // answers is "when did the node last answer us", not "when did the tip last
     // move". A quiet chain is not a lost node, and conflating them would make a
@@ -1678,7 +1701,8 @@ fn stats(shared: &Arc<Mutex<Shared>>, fee_bps: FeeBps, info: &PoolInfo) -> Strin
         None => "null".to_string(),
     };
     format!(
-        "{{\"node_seen_seconds_ago\":{},\"height\":{},\"network_difficulty\":{},\"network\":\"{}\",\"pool_address\":\"{}\",\"pool_hashrate\":{:.1},\"connected_workers\":{},\"payout_threshold\":\"{}\",\"payout_tx_fee\":\"{}\",\"total_paid\":\"{}\",\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}],\"recent_payments\":[{}]}}",
+        "{{\"node_behind\":{},\"node_seen_seconds_ago\":{},\"height\":{},\"network_difficulty\":{},\"network\":\"{}\",\"pool_address\":\"{}\",\"pool_hashrate\":{:.1},\"connected_workers\":{},\"payout_threshold\":\"{}\",\"payout_tx_fee\":\"{}\",\"total_paid\":\"{}\",\"share_difficulty\":{},\"shares_in_window\":{},\"blocks_found\":{},\"pending_rounds\":{},\"unresolved_payments\":{},\"fee_percent\":{},\"operator_earned\":\"{}\",\"operator_pending\":\"{}\",\"miners\":[{}],\"workers\":[{}],\"owed\":[{}],\"recent_payments\":[{}]}}",
+        s.node_behind,
         node_age,
         s.height,
         s.network_difficulty,

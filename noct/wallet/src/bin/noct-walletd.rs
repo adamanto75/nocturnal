@@ -375,14 +375,26 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
             // a peer *says* are missing, never as a fault. A failure to read it
             // is 0: the node is plainly answering us, and inventing a backlog
             // because one extra request failed would be its own kind of lie.
-            let behind = match app.client.info() {
-                Ok(body) => noct_wallet::client::json_u64(&body, "peer_best_claim")
-                    .unwrap_or(0)
-                    .saturating_sub(height),
-                Err(_) => 0,
+            //
+            // The peer count comes back with it, because there is a third state
+            // and it was being reported as the first: a node with **no peers** is
+            // not synced and is not behind — it has nobody to be behind. An
+            // isolated node saying "synced" makes the same promise about a chain
+            // it cannot see, with none of the backing.
+            let (behind, peers) = match app.client.info() {
+                Ok(body) => (
+                    noct_wallet::client::json_u64(&body, "peer_best_claim")
+                        .unwrap_or(0)
+                        .saturating_sub(height),
+                    noct_wallet::client::json_u64(&body, "peers").unwrap_or(0),
+                ),
+                // Unknown, and reported as such rather than as zero peers: only
+                // one of "nobody is connected" and "we could not ask" is a
+                // problem with the chain.
+                Err(_) => (0, u64::MAX),
             };
             format!(
-                "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"shielded_address\":\"{}\",\"balance\":\"{}\",\"ring\":\"{}\",\"shielded\":\"{}\",\"shielded_pending\":\"{}\",\"notes\":{},\"outputs\":{},\"unspent\":{},\"behind\":{},\"history\":{}}}",
+                "{{\"ok\":true,\"network\":\"{}\",\"height\":{},\"address\":\"{}\",\"shielded_address\":\"{}\",\"balance\":\"{}\",\"ring\":\"{}\",\"shielded\":\"{}\",\"shielded_pending\":\"{}\",\"notes\":{},\"outputs\":{},\"unspent\":{},\"behind\":{},\"peers\":{},\"history\":{}}}",
                 net,
                 height,
                 address,
@@ -398,6 +410,9 @@ fn api_state(app: &Arc<Mutex<App>>) -> String {
                 app.wallet.outputs().len(),
                 app.wallet.unspent().count(),
                 behind,
+                // `u64::MAX` means "we could not ask", which the page shows as
+                // nothing rather than as a peer count.
+                peers,
                 history_json(&app.wallet, &app.shielded),
             )
         }

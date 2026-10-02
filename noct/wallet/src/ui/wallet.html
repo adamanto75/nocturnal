@@ -383,6 +383,18 @@
             + '. What is below is correct as far as block ' + s.height
             + ' — a payment may have arrived since that it cannot see yet.'
           );
+        } else if (Number(s.peers) === 0) {
+          // The third state, which used to be reported as the first. A node with
+          // nobody connected is not synced and is not behind — it has nobody to
+          // be behind. Saying "synced" there makes the same promise about a chain
+          // it cannot see, with none of the backing.
+          $('dot').classList.remove('ok');
+          setStatus('no peers');
+          markFresh();
+          note(
+            'This node has no peers, so it cannot tell whether block ' + s.height
+            + ' is the tip. What is below is what it has; there may be more chain it has not seen.'
+          );
         } else {
           $('dot').classList.add('ok');
           setStatus('synced');

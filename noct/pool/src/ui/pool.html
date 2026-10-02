@@ -246,9 +246,13 @@ function paint(s) {
   // so the dashboard called a frozen height "live".
   nodeAge = (s.node_seen_seconds_ago === null || s.node_seen_seconds_ago === undefined)
     ? null : Number(s.node_seen_seconds_ago);
+  // And whether that node is at the tip. A pool building templates on an old tip
+  // finds blocks that are already orphaned, so this is not cosmetic: it is the
+  // difference between hashrate earning and hashrate being wasted.
+  nodeBehind = Number(s.node_behind || 0);
   const lost = nodeAge === null || nodeAge > NODE_STALE_SECONDS;
   for (const id of ['height', 'netdiff']) {
-    document.getElementById(id).classList.toggle('stale', lost);
+    document.getElementById(id).classList.toggle('stale', lost || nodeBehind > 0);
   }
   document.getElementById('pooladdr').textContent = s.pool_address || 'not published';
   if (s.network) document.getElementById('net').textContent = s.network;
@@ -304,6 +308,7 @@ function paint(s) {
 // seconds, so a minute is many missed attempts, not one slow one.
 const NODE_STALE_SECONDS = 60;
 let nodeAge = null;
+let nodeBehind = 0;
 
 /// Say which of the two things is wrong, because the answers differ: the pool
 /// being unreachable is the reader's problem to retry, the pool having lost its
@@ -311,6 +316,11 @@ let nodeAge = null;
 /// know it is the second one.
 function nodeNote() {
   if (nodeAge === null) return ' The pool has not reached its node since it started, so Height and Network difficulty below are not real.';
+  if (nodeBehind > 0 && nodeAge <= NODE_STALE_SECONDS) {
+    return ' The node this pool reads is still catching up — a peer reports ' + nodeBehind.toLocaleString()
+      + ' more block' + (nodeBehind === 1 ? '' : 's') + '. Work handed out now builds on an old tip, so a block found'
+      + ' against it would be orphaned. Mining here will not pay until it catches up.';
+  }
   if (nodeAge > NODE_STALE_SECONDS) {
     const m = Math.round(nodeAge / 60);
     const when = nodeAge < 120 ? nodeAge + ' seconds' : m + ' minute' + (m === 1 ? '' : 's');
@@ -342,6 +352,7 @@ async function tick() {
   document.getElementById('age').textContent =
     secs === null ? ''
       : chainLost ? '· pool answering, chain not'
+      : nodeBehind > 0 ? '· node catching up, ' + nodeBehind.toLocaleString() + ' behind'
       : fresh ? '· live'
       : '· last updated ' + secs + 's ago';
 }

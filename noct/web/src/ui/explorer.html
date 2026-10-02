@@ -111,9 +111,20 @@
       // Never call a snapshot "live". On an immutable network this page may
       // still be readable years from now, and a stale number presented as
       // current is worse than no number at all.
+      // **Whose height is this?** The node answering is not necessarily at the
+      // tip, and its own height was being presented as the chain's. A node that
+      // is still catching up says so now, so a reader is not told the chain is
+      // shorter than it is. Older nodes do not send the field, and then there is
+      // no claim to report rather than a false reassurance.
+      const claim = Number(info.peer_best_claim || 0);
+      const behind = claim > 0 ? Math.max(0, claim - Number(info.height || 0)) : 0;
+      for (const id of STATS) $(id).classList.toggle("stale", behind > 0);
       $("chain-note").textContent = data.taken
         ? "Snapshot taken " + fmtTime(data.taken) + " — not live. Coins here are worthless."
-        : "Live testnet — coins here are worthless.";
+        : behind > 0
+          ? "This node is still catching up — a peer reports " + behind.toLocaleString()
+            + " more block" + (behind === 1 ? "" : "s") + ", so the figures below are not the chain's tip."
+          : "Live testnet — coins here are worthless.";
       // A snapshot is never "fresh": it is frozen on purpose and says so above,
       // so only a live read clears the mark.
       if (!data.taken) { lastOkAt = Date.now(); setStale(false); }
