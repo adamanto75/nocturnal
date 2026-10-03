@@ -839,8 +839,14 @@ this run will be forgotten on restart, and the next start will have only its see
         self.connected.lock().unwrap().remove(addr);
     }
     /// How many addresses we know of at all. Reported by the connection
-    /// manager, because "no peers" and "no addresses" need different fixes.
-    fn book_len(&self) -> usize {
+    /// manager and on `/info`, because "no peers" and "no addresses" need
+    /// different fixes — and only one of them can ever come right on its own.
+    ///
+    /// Public because the RPC reports it live. Counting the *configured* peers
+    /// and seeds instead would be wrong in both directions: it misses everything
+    /// learned from `peers.dat` or from a peer since, and it counts addresses
+    /// that never resolved.
+    pub fn book_len(&self) -> usize {
         self.book.lock().unwrap().len()
     }
 

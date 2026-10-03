@@ -304,6 +304,43 @@ pub fn run(config: Config) -> std::io::Result<()> {
     disc.learn_seeds(config.peers.iter().copied());
     disc.learn_seeds(config.seeds.iter().copied());
 
+    // **Is there a network to join at all?**
+    //
+    // Asked here rather than from the command-line flags, because the address
+    // book is the only thing that knows the answer: `with_book` has just loaded
+    // `peers.dat`, so a node restarted with no flags that has been running for
+    // weeks knows plenty of addresses. Deciding this from the flags called such
+    // a node unreachable while it was reconnecting to its peers.
+    //
+    // A node that really has nowhere to call will sit at zero peers for ever,
+    // and from outside that looks exactly like a quiet network or a blocked
+    // port. Mainnet ships with no seeds because it has not launched, so this is
+    // the ordinary state of every mainnet node today.
+    if disc.book_len() == 0 {
+        eprintln!();
+        eprintln!("NOTHING TO DIAL — this node has no peers, no seeds and no remembered");
+        eprintln!("addresses, so it cannot join any network. It will sit at 0 peers for");
+        eprintln!("ever, which looks the same from outside as a quiet network or a blocked");
+        eprintln!("port, and is not.");
+        if matches!(config.network, noct_core::address::Network::Mainnet) && MAINNET_SEEDS.is_empty() {
+            eprintln!();
+            eprintln!("Nocturnal MAINNET HAS NOT LAUNCHED: there are no mainnet seeds in this");
+            eprintln!("binary because there is no mainnet network yet. Anything mined here is on");
+            eprintln!("a private chain of this node's own, and will be discarded the moment it");
+            eprintln!("meets the real one. The live network is the testnet:");
+            eprintln!();
+            eprintln!("    noctd --network testnet");
+        } else {
+            eprintln!("Give it somewhere to start with --seed or --peer.");
+        }
+        eprintln!();
+    }
+
+    // Kept for the RPC, which reports how many addresses this node knows to dial.
+    // It has to be the live book, not the configured lists: the book also holds
+    // whatever `peers.dat` carried over and whatever peers have gossiped since.
+    let disc_for_rpc = disc.clone();
+
     let p2p = TcpListener::bind(config.p2p_listen)?;
     transport::spawn_listener(p2p, Arc::clone(&state), peers.clone(), disc.clone());
     transport::spawn_connection_manager(Arc::clone(&state), peers.clone(), disc);
@@ -333,7 +370,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
         config.rpc_token.clone(),
         config.rpc_rate_limit,
         rpc_acceptor,
-        config.peers.len() + config.seeds.len(),
+        disc_for_rpc,
     );
 
     // Multi-threaded miner: always spawned so it can be toggled on/off over RPC,

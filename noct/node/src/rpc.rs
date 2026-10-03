@@ -246,12 +246,18 @@ pub fn serve(
     token: Option<String>,
     rate: u32,
     acceptor: Option<Acceptor>,
-    // `dialable`: how many addresses this node was given to dial — explicit peers
-    // plus resolved seeds. Reported so a reader can tell "nobody has connected
-    // yet" from "there is nothing to connect to", which look identical from
-    // outside and mean entirely different things. On a network with no seeds
-    // baked in and none supplied it is 0, and the node will never find anyone.
-    dialable: usize,
+    // The address book, read live for `/info`'s `dialable`: how many addresses
+    // this node knows to dial. Reported so a reader can tell "nobody has
+    // connected yet" from "there is nothing to connect to", which look identical
+    // from outside and mean entirely different things.
+    //
+    // **The book, not the configured peers and seeds.** Counting the
+    // configuration was wrong in both directions: it missed everything carried
+    // over in `peers.dat` and everything gossiped since — so a node that had been
+    // running for weeks and knew fifty addresses would report `dialable: 0` after
+    // a restart without flags, and the wallet would tell its owner there was no
+    // network to join. It also counted seed names that never resolved.
+    disc: crate::transport::Discovery,
 ) {
     let token = Arc::new(token);
     let limiter = Arc::new(RateLimiter::new(rate));
@@ -276,10 +282,11 @@ pub fn serve(
             };
             let state = Arc::clone(&state);
             let peers = peers.clone();
+            let disc = disc.clone();
             let token = Arc::clone(&token);
             let limiter = Arc::clone(&limiter);
             thread::spawn(move || {
-                let _ = handle_client(stream, state, peers, token, limiter, dialable);
+                let _ = handle_client(stream, state, peers, token, limiter, disc);
             });
         }
     });
@@ -291,7 +298,7 @@ fn handle_client(
     peers: Peers,
     token: Arc<Option<String>>,
     limiter: Arc<RateLimiter>,
-    dialable: usize,
+    disc: crate::transport::Discovery,
 ) -> std::io::Result<()> {
     // Identify the client before anything else, for rate limiting. An address we
     // cannot read cannot be limited, so treat it as unspecified and bill it to a
@@ -433,7 +440,7 @@ fn handle_client(
                 // nowhere to connect to". A node on a network with no seeds will
                 // sit at peers=0 for ever, and saying only `peers: 0` leaves that
                 // indistinguishable from a network that is merely quiet.
-                dialable,
+                disc.book_len(),
                 hex::encode(node.tip_id()),
                 // Which proof-of-work this binary was built with. A pool or miner
                 // built against a different one re-hashes shares with a function

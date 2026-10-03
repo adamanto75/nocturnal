@@ -68,43 +68,42 @@ function selectedNetwork() {
   return fromArgs || fromEnv || 'mainnet';
 }
 
-/// Restart the app on the other chain.
+/// The network currently open. `null` until the app has chosen one, after which
+/// it is what `paths()` answers with — so switching is a matter of changing this
+/// and reopening, not of restarting the process.
+let currentNetwork = null;
+
+/// Guard against a second switch landing on top of one still in progress: the
+/// daemons would be started twice and the two races would fight over the ports.
+let switching = false;
+
+/// Open the other chain **in place**.
 ///
-/// **Each network has its own wallet, key and balance.** That separation is
-/// deliberate and is what stops a testnet wallet being mistaken for an emptied
-/// mainnet one — but it also means switching shows a different balance, and
-/// somebody who clicks "Testnet", sees 0 NOCT and was told nothing has been
-/// given every reason to think their coins are gone. So this says what will
-/// happen, and that the wallet being left behind is untouched, first.
+/// The first version of this relaunched the app, which was the obvious thing and
+/// the wrong one: nothing about a different chain needs a new process. Each
+/// network already has its own data directory, key, pins and ports, so switching
+/// is stopping two daemons and starting two others — the same work the status
+/// page's restart button already does, pointed at different paths.
+///
+/// Each network's wallet, key and balance are separate, which is exactly what
+/// stops a testnet wallet being read as an emptied mainnet one. The window says
+/// which chain it is on the whole time: testnet carries a permanent banner,
+/// mainnet says it has not launched, and the menu marks the open one. A
+/// confirmation dialog on top of all that is friction, not safety, when nothing
+/// is destroyed and the way back is one click.
 async function switchNetwork(to) {
-  const from = selectedNetwork();
-  if (to === from) return;
-  const { response } = await dialog.showMessageBox({
-    type: 'question',
-    buttons: ['Open ' + to, 'Cancel'],
-    defaultId: 0,
-    cancelId: 1,
-    title: 'Switch network',
-    message: 'Open the ' + to + ' wallet?',
-    detail:
-      'Each network has its own wallet, its own key and its own balance. The ' + from +
-      ' wallet is not changed or moved by this — it is still there, and this menu brings ' +
-      'it back.\n\nThe app will restart.' +
-      (to === 'mainnet'
-        ? '\n\nNote: Nocturnal mainnet has not launched. A mainnet node has no network to ' +
-          'join and will mine a private chain of its own.'
-        : ''),
-  });
-  if (response !== 0) return;
-  // Strip any network flag we were given before adding the one we want, so
-  // switching twice does not leave both on the command line.
-  const args = process.argv
-    .slice(1)
-    .filter((a) => a !== '--testnet' && a !== '--mainnet')
-    .concat(to === 'testnet' ? '--testnet' : '--mainnet');
-  stopDaemons();
-  app.relaunch({ args });
-  app.exit(0);
+  if (to !== 'mainnet' && to !== 'testnet') return false;
+  if (to === currentNetwork || switching) return false;
+  switching = true;
+  try {
+    const from = currentNetwork;
+    stopDaemons();
+    currentNetwork = to;
+    buildMenu(to);
+    return await openNetwork(from);
+  } finally {
+    switching = false;
+  }
 }
 
 /// The application menu.
@@ -159,7 +158,7 @@ function buildMenu(network) {
 // look exactly like the "my coins are gone" failure, and a shared pin would make
 // switching networks read as a wallet mismatch. Mainnet keeps the original,
 // unsuffixed paths so existing installs are untouched.
-function paths(network = selectedNetwork()) {
+function paths(network = currentNetwork || selectedNetwork()) {
   if (app.isPackaged) {
     const bin = path.join(process.resourcesPath, "bin");
     const root = app.getPath("userData");
@@ -481,6 +480,12 @@ function showWallet(url) {
 
 function registerStatusHandlers() {
   ipcMain.handle('status:read', () => statusState);
+  // The wallet page offers this when it is on a chain with no network to join.
+  // `switchNetwork` asks before doing anything, so a stray call cannot move
+  // somebody's wallet without them seeing why.
+  ipcMain.handle('status:switch', (_e, to) =>
+    switchNetwork(to === 'testnet' ? 'testnet' : 'mainnet')
+  );
   ipcMain.handle('status:restart', async () => {
     if (!launchPaths) return false;
     const { P, wallet } = launchPaths;
@@ -579,11 +584,27 @@ async function openWallet(P, wallet) {
   return true;
 }
 
-app.whenReady().then(async () => {
+/// Open whichever network `currentNetwork` names: find or create its wallet,
+/// check the pin, start its daemons and show it.
+///
+/// Called at launch and again on every network switch. It was the body of
+/// `whenReady`; switching needed every line of it, and copying them would have
+/// been two startup paths to keep in step — which is how one of them quietly
+/// stops checking the pin.
+async function openNetwork(fallback) {
   const P = paths();
-  registerSetupHandlers();
-  registerStatusHandlers();
-  buildMenu(P.network);
+  // Where to land if this network cannot be opened. At launch there is nowhere
+  // to go, so a failure quits as it always did. On a switch there is: the chain
+  // that was working a second ago. Cancelling the setup window for a network you
+  // have never used must not take the wallet you *were* looking at down with it.
+  // `fallback` is cleared on the way back, so a second failure ends rather than
+  // bouncing between the two for ever.
+  const giveUp = async () => {
+    if (!fallback) { app.quit(); return false; }
+    currentNetwork = fallback;
+    buildMenu(currentNetwork);
+    return await openNetwork(null);
+  };
 
   let wallet;
   try {
@@ -595,7 +616,7 @@ app.whenReady().then(async () => {
       // opened before. Both are answered by the same window — the difference is
       // that recovery says whose coins are at stake and never creates over them.
       wallet = await runSetup(P, status);
-      if (!wallet) { app.quit(); return; }
+      if (!wallet) return await giveUp();
     }
   } catch (e) {
     dialog.showErrorBox(
@@ -605,8 +626,7 @@ app.whenReady().then(async () => {
         '\n\n(When running from source, build them with:  cargo build --release)\n\n' +
         String(e)
     );
-    app.quit();
-    return;
+    return await giveUp();
   }
 
   // Is the key on disk still the wallet this app has been opening? This catches
@@ -617,12 +637,15 @@ app.whenReady().then(async () => {
       'Nocturnal Wallet',
       pinMismatchMessage(readPin(fs, wallet.pins), wallet.address)
     );
-    app.quit();
-    return;
+    return await giveUp();
   }
 
   launchPaths = { P, wallet };
-  mainWin = createWindow(P.network);
+  // Reuse the window on a switch. A second one would leave the old chain's page
+  // open beside the new one, which is the clearest possible way to show somebody
+  // two balances and let them believe both are current.
+  if (!mainWin || mainWin.isDestroyed()) mainWin = createWindow(P.network);
+  else mainWin.setTitle(windowTitle(P.network));
   const port = NETWORKS[P.network].walletPort;
 
   // A daemon left over from an earlier run may still hold the wallet port. If we
@@ -657,17 +680,28 @@ app.whenReady().then(async () => {
   if (existing) {
     if (!servesWallet(existing, wallet.address)) {
       dialog.showErrorBox('Nocturnal Wallet', wrongWalletMessage(wallet.address, existing.address));
-      app.quit();
-      return;
+      return await giveUp();
     }
     // Same wallet: reuse the running service instead of starting a duplicate
     // (and leave it running on quit, since we did not start it).
     showWallet(walletUrl(P));
-    return;
+    return true;
   }
 
   startDaemons(P, wallet.key, wallet.address);
-  await openWallet(P, wallet);
+  return await openWallet(P, wallet);
+}
+
+// A handle for the end-to-end test, which drives the switch the way the menu
+// item and the banner button do. Nothing in the app reads it.
+globalThis.__switch = switchNetwork;
+
+app.whenReady().then(async () => {
+  registerSetupHandlers();
+  registerStatusHandlers();
+  currentNetwork = selectedNetwork();
+  buildMenu(currentNetwork);
+  await openNetwork(null);
 });
 
 app.on('window-all-closed', () => {

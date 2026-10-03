@@ -341,10 +341,23 @@
   /// synced, the balance is real as far as that chain goes. Saying otherwise
   /// contradicts the figures sitting directly under it and makes the message
   /// that matters — *which chain* — easier to disbelieve.
-  function markUntrusted(why) {
+  function markUntrusted(why, action) {
     document.body.classList.add('stale');
-    $('staleBar').textContent = why;
-    $('staleBar').classList.add('show');
+    const bar = $('staleBar');
+    bar.textContent = why;
+    // **An offer, and only where there is somewhere to go.** The desktop app
+    // exposes the network switch through its preload; opened in an ordinary
+    // browser there is no such thing, and a button that did nothing would be
+    // worse than no button. Telling somebody the live network is elsewhere and
+    // making them go and find the menu is most of the way to not telling them.
+    if (action && window.noctStatus && window.noctStatus.switchNetwork) {
+      const b = document.createElement('button');
+      b.textContent = action.label;
+      b.style.cssText = 'display:block;margin-top:10px;font-size:12.5px;padding:7px 12px';
+      b.onclick = () => { b.disabled = true; window.noctStatus.switchNetwork(action.to); };
+      bar.appendChild(b);
+    }
+    bar.classList.add('show');
   }
 
   async function loadState() {
@@ -435,7 +448,10 @@
                 + 'mined on it is worthless and will be discarded when the real network exists. '
                 + 'The live network is the testnet.'
               : 'This node has no peers and nothing to dial, so it cannot join a network at all. '
-                + 'Give it a --seed or --peer to start from.'
+                + 'Give it a --seed or --peer to start from.',
+            s.network === 'mainnet'
+              ? { label: 'Open the test network instead', to: 'testnet' }
+              : null
           );
         } else if (Number(s.peers) === 0) {
           // Nobody connected, but there *are* addresses to try — so this is a

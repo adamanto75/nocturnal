@@ -19,4 +19,10 @@ contextBridge.exposeInMainWorld('noctStatus', {
   restart: () => ipcRenderer.invoke('status:restart'),
   /// Updates pushed while this page is open.
   onUpdate: (fn) => ipcRenderer.on('status:update', (_e, payload) => fn(payload)),
+  /// Reopen the app on the other chain. Exposed here because this preload stays
+  /// attached when the window navigates to the wallet UI, and the wallet UI is
+  /// where somebody is standing when it tells them the live network is the
+  /// testnet. A menu they have to go and find is a worse answer than a button
+  /// on the sentence that says to switch.
+  switchNetwork: (to) => ipcRenderer.invoke('status:switch', to),
 });

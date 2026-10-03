@@ -10,7 +10,8 @@
     "test": "node test-wallet-guard.js && node test-wallet-setup.js",
     "test:e2e": "node test-e2e-setup.js",
     "test:e2e-daemon": "node test-e2e-daemon.js",
-    "test:e2e-network": "node test-e2e-network-menu.js"
+    "test:e2e-network": "node test-e2e-network-menu.js",
+    "test:e2e-switch": "node test-e2e-network-switch.js"
   },
   "devDependencies": {
     "electron": "^31",
