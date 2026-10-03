@@ -43,7 +43,11 @@ sed -e "s/VERSION/$TAG/g" -e "s/INSTALLER/$INSTALLER_VERSION/g" \
     "$HERE/README-dist.txt" > "$OUT/$name/README.txt"
 
 cd "$OUT"
-"$HERE/package-release.sh" "$name-linux-x64.tar.gz" \
+# Invoked through `bash` rather than relied on to be executable: the exec bit
+# survives a clone only if it was committed, and a packaging step that works on
+# one checkout and not another is a trap worth not setting. The dry run of this
+# script failed exactly that way.
+bash "$HERE/package-release.sh" "$name-linux-x64.tar.gz" \
     $(printf "%s/%s\n" "$name" "${BINARIES[@]}") "$name/README.txt"
 
 echo
