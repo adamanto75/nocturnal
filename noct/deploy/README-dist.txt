@@ -1,5 +1,6 @@
-Nocturnal VERSION — command-line tools
-=======================================
+Nocturnal — command-line tools
+==============================
+VERSION
 
 THIS IS NOT THE DESKTOP WALLET.
 
