@@ -47,8 +47,16 @@ cd "$OUT"
 # survives a clone only if it was committed, and a packaging step that works on
 # one checkout and not another is a trap worth not setting. The dry run of this
 # script failed exactly that way.
-bash "$HERE/package-release.sh" "$name-linux-x64.tar.gz" \
-    $(printf "%s/%s\n" "$name" "${BINARIES[@]}") "$name/README.txt"
+# Built as an array, one member at a time. `printf "%s/%s\n" "$name"
+# "${BINARIES[@]}"` looks like it prefixes each binary and does not: printf
+# cycles its format over *all* the arguments, so it paired them off and asked
+# tar for `noct-cli/noct-miner`. The dry run caught it; the shape that looks
+# clever is the one to distrust here.
+members=()
+for b in "${BINARIES[@]}"; do members+=("$name/$b"); done
+members+=("$name/README.txt")
+
+bash "$HERE/package-release.sh" "$name-linux-x64.tar.gz" "${members[@]}"
 
 echo
 echo "contents:"
