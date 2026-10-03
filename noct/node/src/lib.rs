@@ -334,6 +334,31 @@ pub fn run(config: Config) -> std::io::Result<()> {
             eprintln!("Give it somewhere to start with --seed or --peer.");
         }
         eprintln!();
+
+        // **Somebody double-clicked this looking for a wallet.**
+        //
+        // Started with no arguments at all is how `noctd.exe` behaves when it is
+        // launched from a file manager, which happens because it sits in the same
+        // folder as four other programs and its name is the closest thing in
+        // there to "the coin". What they get is a console explaining a network,
+        // which answers a question they did not ask and not the one they did.
+        //
+        // Only said here: a node deliberately started with flags does not need to
+        // be told what a wallet is.
+        if std::env::args().len() == 1 {
+            eprintln!("Looking for the WALLET — a window with your balance in it? This is not it.");
+            eprintln!("This program is the node. The wallet is a separate download:");
+            eprintln!();
+            eprintln!("    Nocturnal-Wallet-Setup-<version>.exe   —  nocturnalcoin.com/downloads");
+            eprintln!();
+            eprintln!("Or, without installing anything, from this same folder:");
+            eprintln!();
+            eprintln!("    noct-cli new --wallet wallet.key --network testnet");
+            eprintln!("    noct-walletd --network testnet --wallet wallet.key");
+            eprintln!();
+            eprintln!("and open the address it prints. Leave this node running first.");
+            eprintln!();
+        }
     }
 
     // Kept for the RPC, which reports how many addresses this node knows to dial.
