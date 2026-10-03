@@ -17,28 +17,30 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.13-testnet</b> — <b>a payment nobody will ever see is not a payment.</b>
-     Acceptance is a statement about one node's mempool, not about the network: on a node
-     with nowhere to dial, or one stranded on its own fork, every send is accepted, mined
-     and worthless — you get a txid and a confirmation, and the recipient is never paid.
-     The wallet and <code>noct-cli</code> now say so on the receipt. Also: the desktop
-     wallet would hand you a fresh receiving address even when it failed to record having
-     issued it, which is how funds arrive at an address the wallet never looks at; it now
-     issues nothing rather than forget. v0.3.0 changed consensus: a node older than that
-     cannot follow the current testnet chain, so if you are running v0.2.x or earlier,
-     update or you will simply stop syncing.</p>
-  <p class="note"><b>Mining?</b> <code>noct-miner</code> and <code>noct-poold</code> changed
-     with <b>no behavioural change</b> — their sources are untouched since v0.3.12 and they
-     rebuilt only because they link the node crate.</p>
+  <p><b>v0.3.14-testnet</b> — <b>switching networks happens in place.</b> The desktop
+     wallet's Network menu used to relaunch the app; nothing about a different chain needs
+     a new process, so it now just stops one pair of daemons and starts the other, in the
+     same window. The banner that says the live network is the testnet now offers the
+     switch directly, and a cancelled switch falls back to the chain that was working
+     rather than closing the wallet. Also fixed: the figure behind "no network to join"
+     counted the command line instead of the address book, so a node that had been running
+     for weeks and knew fifty peers could report having nowhere to dial while it was
+     reconnecting. v0.3.0 changed consensus: a node older than that cannot follow the
+     current testnet chain, so if you are running v0.2.x or earlier, update or you will
+     simply stop syncing.</p>
+  <p class="note"><b>Command line only?</b> <code>noct-cli</code> is <b>byte-identical to
+     v0.3.13</b> — there is nothing here for you. <code>noct-miner</code> and
+     <code>noct-poold</code> changed with no behavioural change: their sources are untouched
+     and they rebuilt only because they link the node crate.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.13-testnet/Nocturnal-Wallet-Setup-0.3.13.exe">Nocturnal-Wallet-Setup-0.3.13.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.14-testnet/Nocturnal-Wallet-Setup-0.3.14.exe">Nocturnal-Wallet-Setup-0.3.14.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.13-testnet/nocturnal-v0.3.13-testnet-linux-x64.tar.gz">nocturnal-v0.3.13-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.14-testnet/nocturnal-v0.3.14-testnet-linux-x64.tar.gz">nocturnal-v0.3.14-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.13-testnet/nocturnal-v0.3.13-testnet-windows-x64.zip">nocturnal-v0.3.13-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.14-testnet/nocturnal-v0.3.14-testnet-windows-x64.zip">nocturnal-v0.3.14-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.13-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.13-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.14-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.14-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
