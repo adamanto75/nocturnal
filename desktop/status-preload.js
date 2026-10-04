@@ -25,4 +25,8 @@ contextBridge.exposeInMainWorld('noctStatus', {
   /// testnet. A menu they have to go and find is a worse answer than a button
   /// on the sentence that says to switch.
   switchNetwork: (to) => ipcRenderer.invoke('status:switch', to),
+  /// Give the node an address to dial, for when its seeds cannot be reached —
+  /// a machine behind the same NAT as the seeds, a blocked port, a LAN with no
+  /// route out. Writes `peers.txt` and restarts the node.
+  addPeer: (addr) => ipcRenderer.invoke('status:addPeer', addr),
 });

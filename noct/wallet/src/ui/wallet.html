@@ -125,11 +125,37 @@
     font-weight: 600; font-size: 13px; text-align: center; padding: 7px 12px;
     border-radius: 10px; margin-bottom: 16px; letter-spacing: .3px; }
   .netbar.show { display: block; }
+  /* The network switch. In the page, always on screen, and labelled — three
+     people could not find the same control in the menu bar, which is a fair
+     verdict on putting it there. */
+  .netpick { display: none; align-items: center; gap: 8px; margin-bottom: 14px;
+             font-size: 12.5px; color: var(--muted); }
+  .netpick.show { display: flex; }
+  .netpick .seg { display: flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .netpick .seg button {
+    border: 0; border-radius: 0; background: transparent; color: var(--muted);
+    font-size: 12.5px; padding: 5px 14px; transition: .12s;
+  }
+  .netpick .seg button:hover { color: var(--fg); background: var(--panel2); }
+  .netpick .seg button.on { background: var(--accent); color: #06231a; font-weight: 600; }
+  .netpick .seg button:disabled { cursor: default; opacity: 1; }
+  .netpick .busy { opacity: .75; }
   .netbar small { display: block; font-weight: 400; opacity: .85; margin-top: 2px; }
 </style>
 </head>
 <body>
 <div class="app">
+  <!-- Shown only in the desktop app, which is the only thing that can act on it;
+       in a browser there is no process to restart and the control would be a
+       button that does nothing. -->
+  <div class="netpick" id="netpick">
+    <span>Network</span>
+    <span class="seg">
+      <button id="netMainnet" type="button">Mainnet</button>
+      <button id="netTestnet" type="button">Testnet</button>
+    </span>
+    <span class="busy" id="netBusy"></span>
+  </div>
   <div class="netbar" id="netbar"></div>
   <header>
     <span class="dot" id="dot"></span>
@@ -284,6 +310,42 @@
 <script>
   const $ = (id) => document.getElementById(id);
 
+  // --- the network switch ---------------------------------------------------
+  // Only in the desktop app: the preload is what can stop one pair of daemons
+  // and start another, and a browser has none. A control that cannot act is
+  // worse than no control.
+  const canSwitch = Boolean(window.noctStatus && window.noctStatus.switchNetwork);
+  let switchingTo = null;
+
+  function paintNetpick(network) {
+    if (!canSwitch) return;
+    $('netpick').classList.add('show');
+    for (const [id, net] of [['netMainnet', 'mainnet'], ['netTestnet', 'testnet']]) {
+      const b = $(id);
+      b.classList.toggle('on', network === net);
+      // The one you are on is not a button worth pressing, and neither is
+      // anything while a switch is under way.
+      b.disabled = Boolean(switchingTo) || network === net;
+    }
+    $('netBusy').textContent = switchingTo ? 'opening ' + switchingTo + '…' : '';
+  }
+
+  async function pickNetwork(to) {
+    if (!canSwitch || switchingTo) return;
+    switchingTo = to;
+    paintNetpick(null);
+    // The daemons stop and start underneath this page, so the next few polls
+    // will fail. That is the switch happening, not a fault, and the status line
+    // would otherwise call it one.
+    await window.noctStatus.switchNetwork(to);
+    switchingTo = null;
+  }
+
+  if (canSwitch) {
+    $('netMainnet').onclick = () => pickNetwork('mainnet');
+    $('netTestnet').onclick = () => pickNetwork('testnet');
+  }
+
   // --- stale figures --------------------------------------------------------
   // When a poll fails, everything on screen stops being a balance and becomes
   // the last balance that could be checked. The app once sat for an hour showing
@@ -313,10 +375,60 @@
     $('staleBar').classList.remove('show');
   }
 
+  /// Anything that replaces the note's contents must forget the peer box too, or
+  /// `offerPeer` believes one is still on screen after it has been wiped.
+  function clearNote() {
+    $('staleBar').textContent = '';
+    peerBoxUp = false;
+  }
+
+  /// Offer a box to name a peer, inside the note. Desktop app only: it needs the
+  /// preload to reach the process that starts the node, and a browser has none.
+  ///
+  /// Shown once per spell without peers — rebuilding it on every five-second poll
+  /// would wipe whatever was half-typed into it.
+  let peerBoxUp = false;
+  function offerPeer() {
+    if (peerBoxUp) return;
+    if (!(window.noctStatus && window.noctStatus.addPeer)) return;
+    peerBoxUp = true;
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+    const hint = document.createElement('div');
+    hint.textContent = 'If you know a node to connect to, give it here as host:port.';
+    hint.style.cssText = 'width:100%;font-size:12px;opacity:.85';
+    const input = document.createElement('input');
+    input.placeholder = '10.0.0.5:19333';
+    input.style.cssText = 'flex:1;min-width:170px;font-size:12.5px;padding:6px 9px';
+    const btn = document.createElement('button');
+    btn.textContent = 'Connect';
+    btn.style.cssText = 'font-size:12.5px;padding:6px 12px';
+    const said = document.createElement('div');
+    said.style.cssText = 'width:100%;font-size:12px;opacity:.9';
+    const go = async () => {
+      const addr = input.value.trim();
+      if (!addr) return;
+      btn.disabled = true;
+      said.textContent = 'Restarting the node with ' + addr + '...';
+      const r = await window.noctStatus.addPeer(addr);
+      btn.disabled = false;
+      // Saying the node is trying is not the same as saying it connected, and
+      // only one of those is known here. The peer count above answers the other.
+      said.textContent = r && r.ok
+        ? 'Saved. The node is restarting and will try it. That takes a minute, and the peer count above is the answer.'
+        : 'Not saved: ' + ((r && r.error) || 'unknown error');
+    };
+    btn.onclick = go;
+    input.onkeydown = (e) => { if (e.key === 'Enter') go(); };
+    row.append(hint, input, btn, said);
+    $('staleBar').appendChild(row);
+  }
+
   /// A caveat about figures that *are* confirmed — shown in the same place as the
   /// stale banner but without dimming anything, because there is nothing wrong
   /// with the numbers themselves. Call it after `markFresh`, which clears it.
   function note(text) {
+    clearNote();
     $('staleBar').textContent = text;
     $('staleBar').classList.add('show');
   }
@@ -329,6 +441,7 @@
     const when = lastOkAt
       ? 'They were last confirmed ' + ago(Date.now() - lastOkAt) + '.'
       : 'Nothing below has been confirmed at all yet.';
+    clearNote();
     $('staleBar').textContent = why + ' ' + when;
     $('staleBar').classList.add('show');
   }
@@ -344,6 +457,7 @@
   function markUntrusted(why, action) {
     document.body.classList.add('stale');
     const bar = $('staleBar');
+    clearNote();
     bar.textContent = why;
     // **An offer, and only where there is somewhere to go.** The desktop app
     // exposes the network switch through its preload; opened in an ordinary
@@ -367,6 +481,9 @@
       // Label the network before anything else. On mainnet the bar stays hidden;
       // on a testnet it is permanent, because a balance with no chain named is
       // how a testnet wallet gets mistaken for an emptied mainnet one.
+      // Which chain this is comes from the wallet daemon, not from what was
+      // clicked: the buttons follow the wallet, never the other way round.
+      paintNetpick(s.network);
       if (s.network && s.network !== 'mainnet') {
         $('netbar').textContent = s.network.toUpperCase() + ' — these coins are not real';
         const note = document.createElement('small');
@@ -466,6 +583,12 @@
             'This node has no peers connected, so it cannot tell whether block ' + s.height
             + ' is the tip. What is below is what it has; there may be more chain it has not seen.'
           );
+          // **It has addresses and none of them answer.** The commonest cause is
+          // not a broken node: it is a machine that cannot reach the seeds —
+          // behind the same NAT as them, or a blocked port. Without a way to
+          // name a peer that is a dead end reached through no fault of the
+          // person in front of it, so offer one here rather than in a manual.
+          offerPeer();
         } else {
           $('dot').classList.add('ok');
           setStatus('synced');

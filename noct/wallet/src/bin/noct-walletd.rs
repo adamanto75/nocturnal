@@ -105,6 +105,25 @@ fn sync_app(app: &mut App) -> Result<u64, String> {
             // as at startup, or funds at addresses past the lookahead window
             // vanish from the rebuilt wallet.
             app.wallet.register_issued((0..app.next_subaddress).map(|i| (0, i)));
+            // **And the shielded half, which this used to leave alone.**
+            //
+            // Rebuilding the chain and the ring wallet while keeping a shielded
+            // wallet that has already scanned notes is not a recovery, it is a
+            // contradiction: the rescan starts at genesis, the shielded wallet
+            // says it has seen two notes, and the first block is refused with
+            // "2 notes scanned but the chain holds 0". That check exists so a
+            // wallet cannot silently disagree with its own chain — and because
+            // the recovery forgot this half, it fired on every retry and the
+            // wallet never synced again. Reported as a wallet stuck on
+            // "Starting the wallet service" for ever, which is exactly what it
+            // was: it could not finish, and could not fail either.
+            //
+            // A fresh shielded wallet has seen nothing, which is precisely what
+            // a chain rebuilt from genesis has put in it.
+            app.shielded = ShieldedWallet::new(
+                noct_wallet::shielded::ShieldedKeys::for_account(&app.account, app.network)
+                    .expect("an account's Orchard keys derive from the same secret"),
+            );
             sync_both(
                 &app.client,
                 &mut app.chain,

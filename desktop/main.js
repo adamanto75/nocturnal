@@ -65,7 +65,43 @@ function selectedNetwork() {
       : null;
   const env = (process.env.NOCT_NETWORK || '').toLowerCase();
   const fromEnv = env === 'testnet' || env === 'mainnet' ? env : null;
-  return fromArgs || fromEnv || 'mainnet';
+  return fromArgs || fromEnv || rememberedNetwork() || 'mainnet';
+}
+
+/// Where the chosen network is remembered between runs.
+///
+/// Not per-network, because this is what *chooses* the network.
+function networkFile() {
+  return path.join(app.getPath('userData'), 'network.txt');
+}
+
+/// The network this app was last switched to, if any.
+///
+/// **This exists because switching used to be remembered by accident.** The
+/// Network menu originally relaunched the app with `--testnet`, and the flag on
+/// the new command line was what carried the choice. Making the switch happen in
+/// place — the right fix for a different complaint — quietly removed the only
+/// thing persisting it, so every restart went back to mainnet and the menu
+/// looked like it did nothing. Now it is written down on purpose.
+function rememberedNetwork() {
+  try {
+    const v = fs.readFileSync(networkFile(), 'utf8').trim();
+    return v === 'mainnet' || v === 'testnet' ? v : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function rememberNetwork(network) {
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true });
+    fs.writeFileSync(networkFile(), network);
+  } catch (e) {
+    // Worth saying, not worth refusing the switch over: the app is about to open
+    // the network asked for either way, and the only cost is that the next start
+    // forgets.
+    console.error('could not remember the network choice:', e.message);
+  }
 }
 
 /// The network currently open. `null` until the app has chosen one, after which
@@ -99,6 +135,7 @@ async function switchNetwork(to) {
     const from = currentNetwork;
     stopDaemons();
     currentNetwork = to;
+    rememberNetwork(to);
     buildMenu(to);
     return await openNetwork(from);
   } finally {
@@ -397,6 +434,69 @@ function spawnDaemon(P, name, args) {
   return child;
 }
 
+/// Extra peers to dial, one `host:port` per line, from `peers.txt` in the
+/// network's data directory.
+///
+/// **The baked-in seeds are not always reachable.** They are public hostnames,
+/// and a machine behind the same NAT as the seeds cannot reach its own public
+/// address on most home routers — so the node dials them, is refused, and sits
+/// at zero peers for ever on a network that is working perfectly for everyone
+/// else. That is not a hypothetical: it is what happened on the machine this
+/// app was written on, and there was no way to tell the node about a peer
+/// without a command line it does not have.
+function extraPeers(P) {
+  try {
+    return fs
+      .readFileSync(path.join(P.data, 'peers.txt'), 'utf8')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#'));
+  } catch (_) {
+    return [];
+  }
+}
+
+/// Add an address to `peers.txt` and restart the node so it dials it.
+///
+/// Appends rather than replaces: somebody who has found one working peer should
+/// not lose it by adding a second.
+async function addPeer(P, wallet, addr) {
+  const clean = String(addr || '').trim();
+  // Deliberately loose — a hostname, an IPv4, a bracketed IPv6, with a port.
+  // `noctd` is the authority on what it can dial and says so when it cannot;
+  // this only refuses what is obviously not an address at all.
+  if (!/^[\w.:\[\]-]+:\d{1,5}$/.test(clean)) {
+    return { ok: false, error: 'That does not look like host:port — for example 10.0.0.5:19333.' };
+  }
+  const file = path.join(P.data, 'peers.txt');
+  const have = extraPeers(P);
+  if (!have.includes(clean)) {
+    try {
+      fs.mkdirSync(P.data, { recursive: true });
+      fs.writeFileSync(file, have.concat(clean).join('\n') + '\n');
+    } catch (e) {
+      return { ok: false, error: 'Could not save it: ' + e.message };
+    }
+  }
+  // Restart only the node: the wallet daemon is unaffected by who the node talks
+  // to, and leaving it alone keeps the page it is serving.
+  if (noctd) {
+    stopping = true;
+    try { noctd.kill(); } catch (_) {}
+    noctd = null;
+    stopping = false;
+  }
+  noctd = spawnDaemon(P, 'noctd', nodeArgs(P, wallet.address));
+  return { ok: true, peers: extraPeers(P) };
+}
+
+/// The node's arguments, in one place so a restart cannot drift from a start.
+function nodeArgs(P, address) {
+  const args = ['--network', P.network, '--data-dir', P.chain, '--miner-address', address];
+  for (const p of extraPeers(P)) args.push('--peer', p);
+  return args;
+}
+
 function startDaemons(P, key, address) {
   fs.mkdirSync(P.chain, { recursive: true });
   stopping = false;
@@ -406,8 +506,7 @@ function startDaemons(P, key, address) {
   const net = NETWORKS[P.network];
   // Both daemons are told the network explicitly. Without it they default to
   // mainnet and would serve a mainnet chain from the testnet data dir.
-  noctd = spawnDaemon(P, 'noctd',
-    ["--network", P.network, "--data-dir", P.chain, "--miner-address", address]);
+  noctd = spawnDaemon(P, 'noctd', nodeArgs(P, address));
   walletd = spawnDaemon(P, 'noct-walletd',
     ["--network", P.network, "--wallet", key, "--node", net.rpc,
      "--listen", "127.0.0.1:" + net.walletPort]);
@@ -486,6 +585,12 @@ function registerStatusHandlers() {
   ipcMain.handle('status:switch', (_e, to) =>
     switchNetwork(to === 'testnet' ? 'testnet' : 'mainnet')
   );
+  // Offered by the wallet page when the node has addresses to dial and none of
+  // them answer — which is what an unreachable seed looks like from inside.
+  ipcMain.handle('status:addPeer', async (_e, addr) => {
+    if (!launchPaths) return { ok: false, error: 'The wallet is not open yet.' };
+    return await addPeer(launchPaths.P, launchPaths.wallet, addr);
+  });
   ipcMain.handle('status:restart', async () => {
     if (!launchPaths) return false;
     const { P, wallet } = launchPaths;
@@ -602,6 +707,7 @@ async function openNetwork(fallback) {
   const giveUp = async () => {
     if (!fallback) { app.quit(); return false; }
     currentNetwork = fallback;
+    rememberNetwork(fallback);
     buildMenu(currentNetwork);
     return await openNetwork(null);
   };
