@@ -12,7 +12,9 @@
     "test:e2e-daemon": "node test-e2e-daemon.js",
     "test:e2e-network": "node test-e2e-network-menu.js",
     "test:e2e-switch": "node test-e2e-network-switch.js",
-    "test:e2e-memory": "node test-e2e-network-memory.js"
+    "test:e2e-memory": "node test-e2e-network-memory.js",
+    "test:e2e-toggle": "node test-e2e-network-toggle.js",
+    "test:e2e-packaged": "node test-e2e-packaged.js"
   },
   "devDependencies": {
     "electron": "^31",
