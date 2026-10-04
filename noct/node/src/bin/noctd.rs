@@ -277,6 +277,24 @@ fn main() {
 ///
 /// A name may resolve to several addresses (A and AAAA); all are kept, so a
 /// seed reachable over either family is dialled over whichever works.
+/// Resolve one `--peer`/`--seed` value, **skipping what will not resolve rather
+/// than refusing to start**.
+///
+/// A missing value stays fatal: that is a mistake in the command line and
+/// nothing can be inferred from it. An address that does not resolve is a
+/// different thing, and killing the node over one is wrong twice over.
+///
+/// These are **hostnames**, resolved at startup, so a node restarted while DNS
+/// was briefly unavailable would have refused to run at all — on the very seeds
+/// it ships with. And the desktop wallet now writes peers into a file it passes
+/// here, so one typo in that file became a node that would not start, on every
+/// start, with the bad line still in the file. A convenience that can stop the
+/// thing starting is worse than no convenience.
+///
+/// The baked-in default seeds have always been warn-and-skip; this was the only
+/// place that differed, and nothing was better for the difference. A node that
+/// ends up with nowhere to dial is not silent about it either — see the NOTHING
+/// TO DIAL block in `run`.
 fn parse_dial_addrs(args: &[String], i: usize, flag: &str) -> Vec<SocketAddr> {
     let raw = args
         .get(i)
@@ -285,11 +303,14 @@ fn parse_dial_addrs(args: &[String], i: usize, flag: &str) -> Vec<SocketAddr> {
         Ok(addrs) => {
             let v: Vec<SocketAddr> = addrs.collect();
             if v.is_empty() {
-                fail(&format!("{flag}: `{raw}` resolved to no addresses"));
+                eprintln!("warning: {flag}: `{raw}` resolved to no addresses — skipping it");
             }
             v
         }
-        Err(e) => fail(&format!("{flag}: could not resolve `{raw}`: {e}")),
+        Err(e) => {
+            eprintln!("warning: {flag}: could not resolve `{raw}`: {e} — skipping it");
+            Vec::new()
+        }
     }
 }
 
@@ -313,4 +334,37 @@ fn print_help() {
 fn fail(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **One bad address must not stop the node starting.**
+    ///
+    /// `--peer` and `--seed` take hostnames, resolved here at startup, and this
+    /// used to `fail()` — exit the process — on anything that would not resolve.
+    /// Two ways that is wrong: a node restarted while DNS is briefly unavailable
+    /// refuses to run at all, on the seeds it ships with; and the desktop wallet
+    /// writes peers into a file it passes here, so one typo in that file became a
+    /// node that would not start, on every start, with the bad line still in it.
+    ///
+    /// `.invalid` is reserved by RFC 2606 precisely so that it never resolves,
+    /// which keeps this test from depending on somebody's DNS.
+    #[test]
+    fn an_address_that_will_not_resolve_is_skipped_not_fatal() {
+        let args = vec!["--peer".to_string(), "no-such-host.invalid:19333".to_string()];
+        let got = parse_dial_addrs(&args, 1, "--peer");
+        assert!(got.is_empty(), "an unresolvable address contributes nothing, and does not exit");
+    }
+
+    /// And the good ones still come through, or the skip above would be hiding
+    /// everything rather than one thing.
+    #[test]
+    fn an_address_that_resolves_is_kept() {
+        let args = vec!["--peer".to_string(), "127.0.0.1:19333".to_string()];
+        let got = parse_dial_addrs(&args, 1, "--peer");
+        assert_eq!(got.len(), 1, "a literal address resolves to exactly itself");
+        assert_eq!(got[0].port(), 19333);
+    }
 }
