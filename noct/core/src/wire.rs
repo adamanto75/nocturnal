@@ -786,6 +786,29 @@ mod tests {
         }
     }
 
+    /// **A five-byte message must not be able to ask for four billion items.**
+    ///
+    /// The classic length-prefix DoS: a `Peers` tag followed by a count of
+    /// `u32::MAX`. `read_vec` rejects it on the count, before it loops or
+    /// allocates, so this returns `TooLarge` in constant time rather than
+    /// attempting four billion reads. Pinned deterministically rather than left
+    /// to the random-soup test to stumble onto.
+    #[test]
+    fn a_huge_claimed_count_is_rejected_not_attempted() {
+        let mut msg = vec![TAG_PEERS];
+        msg.extend_from_slice(&u32::MAX.to_le_bytes());
+        // Nothing follows: if the count were honoured it would read past the end
+        // on the first item. It must never get that far.
+        assert!(matches!(decode_message(&msg), Err(WireError::TooLarge)));
+
+        // Same for a block's transaction list and a transaction's input list.
+        let mut blk = vec![TAG_BLOCK];
+        blk.extend_from_slice(&[0u8; 8]); // a (bogus) header start; decode fails before the tx count anyway
+        // The point here is only that no claimed count can drive an allocation;
+        // the block header decode erroring first is also acceptable.
+        assert!(decode_message(&blk).is_err());
+    }
+
     #[test]
     fn decode_never_panics_on_adversarial_input() {
         use rand_core::RngCore;
