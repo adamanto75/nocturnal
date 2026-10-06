@@ -1655,6 +1655,73 @@ pub(crate) mod tests {
         );
     }
 
+    /// **The cheap double-spend check must run before the expensive signature
+    /// check.** This is the replay-verification DoS, pinned as an ordering test
+    /// rather than an outcome test.
+    ///
+    /// `double_spend_is_rejected` proves the *outcome* (a replayed spend is
+    /// refused), but it would still pass if the checks were reordered so that
+    /// `tx.verify()` ran first — reintroducing the DoS, because a transaction
+    /// spending an already-spent output could then be replayed forever, each
+    /// replay buying a full CLSAG + range-proof verification for the price of
+    /// the bandwidth.
+    ///
+    /// The distinguishing trick: a transaction that fails *both* ways at once.
+    /// Its key image is already on-chain (cheap check → `DoubleSpend`) and its
+    /// pseudo-out is corrupted (signature check → `InvalidTx`). Whichever error
+    /// comes back names which check ran first. It must be `DoubleSpend`.
+    #[test]
+    fn a_replayed_spend_is_rejected_before_its_signature_is_verified() {
+        use crate::amounts::Commitment;
+        use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        let (received, cb_index) = mine_coinbase(&mut chain, &miner, 1_000);
+        warm_up(&mut chain, 15, 1_200);
+        let reward = received.amount;
+        let bob = Account::random(&mut OsRng);
+        let fee = ATOMIC_UNITS / 100;
+
+        // Spend the coinbase and mine it, so its key image is now on-chain.
+        let tx = build_spend(
+            &chain,
+            &received,
+            cb_index,
+            vec![Payment { destination: address(&bob), amount: reward - fee }],
+            fee,
+        );
+        let (block, _) = make_block(&chain, &miner, std::slice::from_ref(&tx), 5_000);
+        chain.add_block(&mut OsRng, &block, std::slice::from_ref(&tx)).unwrap();
+
+        // Re-spend the same output: same key image. Then corrupt the pseudo-out
+        // so the signature can no longer verify, while the key image — which the
+        // double-spend check reads — stays intact.
+        let mut replay = build_spend(
+            &chain,
+            &received,
+            cb_index,
+            vec![Payment { destination: address(&bob), amount: reward - fee }],
+            fee,
+        );
+        let image_before = replay.inputs[0].key_image();
+        replay.inputs[0].signature.pseudo_out =
+            Commitment(replay.inputs[0].signature.pseudo_out.0 + ED25519_BASEPOINT_POINT);
+        assert_eq!(
+            replay.inputs[0].key_image(),
+            image_before,
+            "corrupting the pseudo-out must leave the key image untouched, or the test proves nothing"
+        );
+
+        // DoubleSpend, not InvalidTx: the cheap check reached its verdict first,
+        // and the signature was never verified.
+        assert_eq!(
+            chain.validate_tx(&mut OsRng, &replay),
+            Err(ChainError::DoubleSpend),
+            "a replayed spend must be rejected on its key image, before any signature work"
+        );
+    }
+
     #[test]
     fn wrong_prev_id_is_rejected() {
         let mut chain = Blockchain::with_maturity(KeccakPow, 1);
