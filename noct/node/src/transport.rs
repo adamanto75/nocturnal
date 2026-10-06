@@ -43,6 +43,30 @@ const MAX_MSGS_PER_SEC: u32 = 5000;
 /// Reject any framed message larger than this (anti-DoS on the length prefix).
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Most inbound (peer-initiated) connections to carry at once.
+///
+/// Every accepted connection spawns a reader thread and a writer thread and
+/// holds a socket, whether or not the peer ever handshakes — and the listener
+/// accepted *all of them*, without limit. An adversarial test confirmed the
+/// cost: 400 connections that sent not one byte took a node from 10 threads to
+/// 807 and from 127 handles to 2928, roughly two threads and seven handles
+/// each, climbing linearly. A few thousand would exhaust the process's thread
+/// stacks. One attacker, no handshake, no spend.
+///
+/// Outbound connections are the node's own choice and already bounded by
+/// `target_outbound`, so this caps the unsolicited side only. 128 is far above
+/// any honest inbound count on this network and far below what hurts.
+const MAX_INBOUND: usize = 128;
+
+/// Most inbound connections from a single source IP.
+///
+/// The total cap alone is not enough: without a per-source limit one address
+/// fills all 128 slots and locks every honest peer out — the same shape as the
+/// address-book eclipse above, one layer down. Eight is generous for the real
+/// thing (distinct nodes have distinct IPs) and leaves a flooder with eight
+/// slots instead of the whole node.
+const MAX_INBOUND_PER_IP: usize = 8;
+
 /// Cap on the address book, so a peer can't grow our memory without bound.
 const MAX_BOOK: usize = 1024;
 
@@ -319,6 +343,24 @@ impl Peers {
 pub struct Discovery {
     book: Arc<Mutex<HashSet<SocketAddr>>>,
     connected: Arc<Mutex<HashSet<SocketAddr>>>,
+    /// Live inbound (peer-initiated) connections, total and per source IP.
+    ///
+    /// Separate from `connected`, which is keyed by a peer's *advertised* listen
+    /// address and so is empty for a connection that never handshakes — which is
+    /// exactly the connection a flood is made of. This counts sockets, by where
+    /// they actually came from, and is what [`Discovery::admit_inbound`] gates
+    /// on. Decremented by dropping the [`InboundSlot`] that admission returns, so
+    /// no exit path from the reader loop can forget to.
+    inbound_total: Arc<AtomicUsize>,
+    inbound_by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    /// When the inbound-cap warning was last printed.
+    ///
+    /// Refusals are otherwise silent, which is right — logging every one would
+    /// hand a flooder a second DoS, the node writing a line per rejected packet.
+    /// But a node refusing honest peers because its inbound slots are full of
+    /// junk is exactly the "cut off and silent about it" state this code works
+    /// to avoid, so it says so — once, then rarely.
+    inbound_cap_warned: Arc<Mutex<Instant>>,
     /// Our own listen address, so we never dial or advertise ourselves.
     self_addr: SocketAddr,
     genesis: [u8; 32],
@@ -490,6 +532,12 @@ impl Discovery {
         Discovery {
             book: Arc::new(Mutex::new(HashSet::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
+            inbound_total: Arc::new(AtomicUsize::new(0)),
+            inbound_by_ip: Arc::new(Mutex::new(HashMap::new())),
+            // Far enough in the past that the first refusal warns immediately.
+            inbound_cap_warned: Arc::new(Mutex::new(
+                Instant::now() - Duration::from_secs(3600),
+            )),
             self_addr,
             genesis,
             magic,
@@ -832,6 +880,56 @@ this run will be forgotten on restart, and the next start will have only its see
         true
     }
 
+    /// Try to admit one inbound connection from `ip`, returning a slot that frees
+    /// itself when dropped — or `None` if a cap is hit, in which case the caller
+    /// closes the socket without spawning anything.
+    ///
+    /// The whole point is to decide *before* a reader thread and a writer thread
+    /// exist, because those threads are the cost a flood is buying. Both caps are
+    /// checked, then both counters bumped, under the one lock, so two connections
+    /// racing cannot each see room that only one of them has.
+    fn admit_inbound(&self, ip: IpAddr) -> Option<InboundSlot> {
+        let mut by_ip = self.inbound_by_ip.lock().unwrap();
+        // Read the total inside the same critical section the per-IP map is held
+        // under, so the pair is decided atomically.
+        let total = self.inbound_total.load(Ordering::Relaxed);
+        if total >= MAX_INBOUND {
+            self.warn_inbound_cap(format!(
+                "inbound connection cap ({MAX_INBOUND}) reached — refusing new peers. \
+                 If this persists the node is under a connection flood; honest peers may \
+                 be unable to reach it."
+            ));
+            return None;
+        }
+        let per_ip = by_ip.entry(ip).or_insert(0);
+        if *per_ip >= MAX_INBOUND_PER_IP {
+            self.warn_inbound_cap(format!(
+                "{ip} has reached its inbound connection cap ({MAX_INBOUND_PER_IP}) — \
+                 refusing further connections from it."
+            ));
+            return None;
+        }
+        *per_ip += 1;
+        self.inbound_total.fetch_add(1, Ordering::Relaxed);
+        Some(InboundSlot {
+            ip,
+            total: Arc::clone(&self.inbound_total),
+            by_ip: Arc::clone(&self.inbound_by_ip),
+        })
+    }
+
+    /// Print an inbound-cap message at most once a minute, whatever the rate of
+    /// refusals. The throttle is the point: the thing being warned about is a
+    /// flood, and a warning that fires per refused packet is the flood's own
+    /// amplifier.
+    fn warn_inbound_cap(&self, msg: String) {
+        let mut last = self.inbound_cap_warned.lock().unwrap();
+        if last.elapsed() >= Duration::from_secs(60) {
+            *last = Instant::now();
+            eprintln!("warning: {msg}");
+        }
+    }
+
     fn mark_connected(&self, addr: SocketAddr) {
         self.connected.lock().unwrap().insert(addr);
     }
@@ -1010,6 +1108,36 @@ this run will be forgotten on restart, and the next start will have only its see
 /// handshake, gossip, discovery, and initial block download. `dialed` is the
 /// peer's known listen address for an *outbound* connection (`None` for inbound,
 /// where we learn it from the peer's handshake).
+/// Holds one inbound-connection slot for as long as it lives.
+///
+/// Dropping it releases the slot — the total and the per-IP count both come
+/// down. This is a guard rather than a pair of explicit increment/decrement
+/// calls because the reader loop has a dozen ways to end (foreign network,
+/// duplicate link, flood ban, a read error, the peer simply closing), and a
+/// decrement that has to be remembered on every one of them is a decrement that
+/// will be missed on one of them — and a missed decrement leaks the slot, which
+/// is the very exhaustion this guards against, arrived at the slow way.
+struct InboundSlot {
+    ip: IpAddr,
+    total: Arc<AtomicUsize>,
+    by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        self.total.fetch_sub(1, Ordering::Relaxed);
+        let mut by_ip = self.by_ip.lock().unwrap();
+        if let Some(n) = by_ip.get_mut(&self.ip) {
+            *n -= 1;
+            // Don't leave a zero entry behind for every IP that ever connected,
+            // or the map itself becomes an unbounded thing a flood can grow.
+            if *n == 0 {
+                by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
 pub fn register_connection(
     stream: TcpStream,
     state: &Arc<Mutex<NodeState>>,
@@ -1039,9 +1167,32 @@ pub fn register_connection(
         }
     }
     let peer_ip = socket_addr.map(|a| a.ip());
+
+    // Admit inbound connections against the caps **before** any thread or socket
+    // handle is committed — that is the whole cost a flood is trying to make us
+    // pay. Outbound connections (`dialed.is_some()`) are the node's own doing and
+    // already bounded by `target_outbound`, so they are not gated here; a slot
+    // they do not hold is a slot they cannot leak. A connection with no peer
+    // address is unusual but gets admitted rather than special-cased, since
+    // without an IP there is nothing to key a per-source limit on.
+    let slot = match (dialed.is_none(), peer_ip) {
+        (true, Some(ip)) => match disc.admit_inbound(ip) {
+            Some(slot) => Some(slot),
+            None => {
+                // No thread spawned, no handle held: the socket drops here. The
+                // flood pays for a TCP handshake and gets nothing to hold.
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "inbound connection limit reached",
+                ));
+            }
+        },
+        _ => None,
+    };
+
     let writer = PeerLink::spawn(stream.try_clone()?)?;
     let peer_id = peers.add(Arc::clone(&writer));
-    spawn_peer_reader(stream, writer, peer_id, peer_ip, state.clone(), peers.clone(), disc.clone(), dialed);
+    spawn_peer_reader(stream, writer, peer_id, peer_ip, state.clone(), peers.clone(), disc.clone(), dialed, slot);
     Ok(())
 }
 
@@ -1058,8 +1209,14 @@ fn spawn_peer_reader(
     peers: Peers,
     disc: Discovery,
     dialed: Option<SocketAddr>,
+    // Held for the life of the reader thread; dropping it frees the inbound slot.
+    // `None` for outbound connections, which are not slot-counted. Named with a
+    // leading underscore because it is never read — its whole job is to be
+    // dropped when this closure ends, on every exit path at once.
+    inbound_slot: Option<InboundSlot>,
 ) {
     thread::spawn(move || {
+        let _inbound_slot = inbound_slot;
         // The listen-address we attribute this peer (known up front if we dialed)
         // and its session nonce (learned from the handshake).
         let mut peer_listen: Option<SocketAddr> = dialed;
@@ -1363,6 +1520,76 @@ mod tests {
 
     fn discovery() -> Discovery {
         Discovery::new("127.0.0.1:1".parse().unwrap(), [0u8; 32], noct_core::params::MAINNET.p2p_magic, 8)
+    }
+
+    /// **The connection-flood cap.** An adversarial test took an unguarded node
+    /// from 10 threads to 807 with 400 connections that sent nothing. Admission
+    /// now holds one source to `MAX_INBOUND_PER_IP` and everyone to `MAX_INBOUND`,
+    /// and a slot comes back the instant it is dropped.
+    #[test]
+    fn one_source_is_capped_and_slots_free_on_drop() {
+        let d = discovery();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        // Up to the per-IP cap, admitted; beyond it, refused.
+        let mut held: Vec<InboundSlot> = Vec::new();
+        for _ in 0..MAX_INBOUND_PER_IP {
+            held.push(d.admit_inbound(ip).expect("under the cap"));
+        }
+        assert!(
+            d.admit_inbound(ip).is_none(),
+            "the {MAX_INBOUND_PER_IP}th+1 connection from one IP must be refused"
+        );
+
+        // Drop one; exactly one slot frees for that IP, no more. The re-admitted
+        // slot has to be *kept* — a `is_some()` that drops it again would free
+        // the very slot the next line is checking is taken, which is a trap the
+        // first draft of this test fell into.
+        held.pop();
+        let reused = d.admit_inbound(ip);
+        assert!(reused.is_some(), "a freed slot is reusable");
+        assert!(d.admit_inbound(ip).is_none(), "but only the one that was freed");
+        drop(reused);
+    }
+
+    /// A flood from one IP must not shut other IPs out: the per-source cap is
+    /// what keeps the total cap from being monopolised.
+    #[test]
+    fn a_flood_from_one_ip_leaves_room_for_others() {
+        let d = discovery();
+        let flooder: IpAddr = "203.0.113.7".parse().unwrap();
+        let honest: IpAddr = "198.51.100.9".parse().unwrap();
+
+        let _flood: Vec<InboundSlot> =
+            (0..MAX_INBOUND_PER_IP).map(|_| d.admit_inbound(flooder).unwrap()).collect();
+        assert!(d.admit_inbound(flooder).is_none(), "flooder is capped");
+        assert!(
+            d.admit_inbound(honest).is_some(),
+            "a different source must still get in while one IP floods"
+        );
+    }
+
+    /// And the global cap holds across many sources, so a distributed flood is
+    /// bounded too — just at the total rather than per IP.
+    #[test]
+    fn the_total_cap_bounds_a_distributed_flood() {
+        let d = discovery();
+        let mut held = Vec::new();
+        // MAX_INBOUND / MAX_INBOUND_PER_IP distinct IPs, each at its own cap,
+        // exactly fills the total.
+        let sources = MAX_INBOUND / MAX_INBOUND_PER_IP;
+        for i in 0..sources {
+            let ip: IpAddr = format!("198.51.100.{i}").parse().unwrap();
+            for _ in 0..MAX_INBOUND_PER_IP {
+                held.push(d.admit_inbound(ip).expect("within both caps"));
+            }
+        }
+        assert_eq!(held.len(), MAX_INBOUND, "the sources add up to the total cap");
+        let one_more: IpAddr = "198.51.100.250".parse().unwrap();
+        assert!(
+            d.admit_inbound(one_more).is_none(),
+            "a fresh source is refused once the total cap is full"
+        );
     }
 
     #[test]
