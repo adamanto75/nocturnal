@@ -17,29 +17,29 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.16-testnet</b> — <b>a network switch you can see.</b> Changing between mainnet
-     and testnet used to be an item in the application menu bar; after three separate
-     reports of "there is no way to toggle", it is now a labelled pair of buttons at the
-     top of the wallet itself, marking the chain you are on and switching in place. Also
-     fixed: the chosen network was forgotten on every restart, a failed sync could wedge
-     the wallet daemon permanently on "Starting the wallet service", and a node whose
-     seeds are unreachable — a machine behind the same router as them, for instance — now
-     has a way to be given a peer. v0.3.0 changed consensus: a node older than that cannot
-     follow the current testnet chain, so if you are running v0.2.x or earlier, update or
-     you will simply stop syncing.</p>
-  <p class="note"><b>Running a node, a pool or a miner?</b> <code>noctd</code>,
-     <code>noct-cli</code>, <code>noct-miner</code> and <code>noct-poold</code> are all
-     <b>byte-identical to v0.3.15</b>. Everything here is in the wallet daemon, so there is
-     nothing for you to do.</p>
+  <p><b>v0.3.17-testnet</b> — <b>security: a node could be exhausted by an attacker who
+     never said a word.</b> The node accepted every inbound connection and spawned threads
+     for each, with no limit and no handshake required — 400 silent connections took a
+     victim from 10 threads to 807, and a few thousand would exhaust it. Inbound
+     connections are now capped (128 total, 8 per source) before any thread is committed.
+     Also: a node no longer refuses to start over one unresolvable peer or seed.
+     <b>Anyone running a node that accepts connections from the internet should update.</b>
+     v0.3.0 changed consensus: a node older than that cannot follow the current testnet
+     chain, so if you are running v0.2.x or earlier, update or you will simply stop
+     syncing.</p>
+  <p class="note"><b>Already on v0.3.16?</b> <code>noct-cli</code> and
+     <code>noct-walletd</code> are <b>byte-identical</b> — this release is the node.
+     <code>noct-miner</code> and <code>noct-poold</code> rebuilt by linkage with no
+     behavioural change. The one binary that matters here is <code>noctd</code>.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.16-testnet/Nocturnal-Wallet-Setup-0.3.16.exe">Nocturnal-Wallet-Setup-0.3.16.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.17-testnet/Nocturnal-Wallet-Setup-0.3.17.exe">Nocturnal-Wallet-Setup-0.3.17.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.16-testnet/nocturnal-v0.3.16-testnet-linux-x64.tar.gz">nocturnal-v0.3.16-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.17-testnet/nocturnal-v0.3.17-testnet-linux-x64.tar.gz">nocturnal-v0.3.17-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.16-testnet/nocturnal-v0.3.16-testnet-windows-x64.zip">nocturnal-v0.3.16-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.17-testnet/nocturnal-v0.3.17-testnet-windows-x64.zip">nocturnal-v0.3.17-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.16-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.16-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.17-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.17-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
