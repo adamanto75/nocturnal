@@ -432,6 +432,39 @@ pub const BAN_THRESHOLD: u32 = 100;
 /// How long a banned peer stays banned.
 pub const BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 
+/// Whether a validation failure is a verdict about **our** sync state rather
+/// than the sender's honesty — in which case the transaction is still dropped,
+/// but the peer that relayed it is not penalised.
+///
+/// All three of these are judged against this node's own chain:
+///
+/// * `UnknownRingMember` — a ring decoy we have not synced yet.
+/// * `ImmatureCoinbase` — maturity is measured from *our* height.
+/// * `Shielded(UnknownAnchor)` — a bundle proves membership against a recent
+///   note-tree root, and we keep only the last `ANCHOR_DEPTH` (100) roots we
+///   have ourselves computed. A node that is **behind** does not yet have the
+///   anchor an honest wallet, building against the network's tip, signed over.
+///
+/// A node that scored these would ban the peers feeding it — including its only
+/// seed — after five, then sit at zero peers stranded at the height it stopped,
+/// having done it to itself. Seen for the ring case on the live testnet: a fresh
+/// node scored seed1, the load node and a third peer to exactly 100 each and
+/// stalled at height 5350. The shielded anchor case is the identical trap one
+/// pool over, found by auditing the shielded verification path after the ring
+/// path, and left out of this set only because nothing had attacked it yet.
+///
+/// A *spent* nullifier is deliberately **not** here: that is a double-spend we
+/// have actually seen, real regardless of our height, so it stays scored.
+fn is_undecidable_against_our_chain(e: &ChainError) -> bool {
+    use noct_core::shielded_state::ShieldedStateError;
+    matches!(
+        e,
+        ChainError::UnknownRingMember
+            | ChainError::ImmatureCoinbase
+            | ChainError::Shielded(ShieldedStateError::UnknownAnchor(_))
+    )
+}
+
 /// How far past the fork point a single branch collection will pull.
 ///
 /// A reorg is capped at [`MAX_REORG_DEPTH`], so a branch that reaches that far
@@ -1045,26 +1078,13 @@ impl NodeState {
 
         match self.chain.validate_tx(rng, &tx) {
             Ok(()) => {}
-            // "We cannot tell yet" is not misbehaviour.
-            //
-            // Both of these are judged against *our* chain: a ring member we
-            // have not synced yet is unknown to us, and coinbase maturity is
-            // measured from our height. A node that is behind therefore rejects
-            // transactions the rest of the network considers perfectly valid,
-            // and at 20 points a time it bans the peers feeding it after five of
-            // them — including its only seed. It then sits at zero peers,
-            // stranded at the height it stopped, having done it to itself.
-            //
-            // Seen while syncing a fresh node against the live testnet: it
-            // scored seed1, the load node and a third peer to exactly 100 each
-            // and stalled at height 5350 with no peers left.
-            //
-            // This is the same reasoning the block path already applies to
-            // `TimestampTooFarAhead`: a verdict that depends on our own state
-            // says nothing about the sender. Rejection stays — the transaction
-            // is dropped and never relayed — only the penalty goes. It is also
-            // cheap to reject, being a hash lookup before any signature work.
-            Err(ChainError::UnknownRingMember) | Err(ChainError::ImmatureCoinbase) => {
+            // "We cannot tell yet" is not misbehaviour — the transaction is
+            // dropped and never relayed, but the peer keeps its score. Which
+            // failures count as "yet", and the history behind each, is on
+            // `is_undecidable_against_our_chain`. Rejecting them is cheap (a hash
+            // lookup, before any signature work), which is what makes dropping
+            // without penalty safe.
+            Err(e) if is_undecidable_against_our_chain(&e) => {
                 return (Relay::Drop, 0, TxOutcome::Refused(TxRefusal::Undecidable));
             }
             // Anything else is bad regardless of where we are: a failed
@@ -2986,6 +3006,45 @@ mod tests {
     /// outcomes where that is false must all say so. A single wrong arm here is
     /// the whole bug coming back.
     #[test]
+    /// A verdict that depends on our own sync height must not score the peer —
+    /// and a real fault must. The shielded `UnknownAnchor` case is the one this
+    /// test was added for: it was missing from the undecidable set, so a node
+    /// behind the shielded chain state would have banned honest peers relaying
+    /// valid shielded transactions, the same self-inflicted eclipse the ring
+    /// case caused at height 5350.
+    #[test]
+    fn unknown_anchor_is_undecidable_but_a_spent_nullifier_and_bad_proof_are_not() {
+        use noct_core::shielded_state::ShieldedStateError;
+
+        // Undecidable: judged against our height, says nothing about the sender.
+        assert!(is_undecidable_against_our_chain(&ChainError::UnknownRingMember));
+        assert!(is_undecidable_against_our_chain(&ChainError::ImmatureCoinbase));
+        assert!(
+            is_undecidable_against_our_chain(&ChainError::Shielded(
+                ShieldedStateError::UnknownAnchor([0u8; 32])
+            )),
+            "an anchor we have not synced to is 'we are behind', not 'they are lying'"
+        );
+
+        // Scored: real regardless of where we are.
+        assert!(
+            !is_undecidable_against_our_chain(&ChainError::DoubleSpend),
+            "a double-spend of an image already on our chain is genuine misbehaviour"
+        );
+        assert!(
+            !is_undecidable_against_our_chain(&ChainError::Shielded(
+                ShieldedStateError::DuplicateNullifier([0u8; 32])
+            )),
+            "a nullifier we have seen spent is a double-spend, not a sync lag"
+        );
+        assert!(
+            !is_undecidable_against_our_chain(&ChainError::InvalidTx(
+                noct_core::tx::TxError::BadRingSignature
+            )),
+            "a bad signature or proof is invalid at any height"
+        );
+    }
+
     fn only_outcomes_the_network_actually_has_count_as_accepted() {
         assert!(TxOutcome::Pooled.accepted());
         assert!(TxOutcome::Stemmed.accepted());
