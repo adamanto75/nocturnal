@@ -20,6 +20,18 @@
 # The build therefore happens at a FIXED path, and the cargo registry is remapped
 # too, so your home directory does not leak in either.
 #
+# One more thing the linker does on its own: it stamps a GNU build-id into every
+# binary. By default that id is a hash the linker computes over the UNSTRIPPED
+# output — which still carries the symbol table at link time. Rust's symbol table
+# contains LLVM-internal anonymous-constant names whose disambiguator varies
+# between builds even when every byte of compiled code is identical. `strip` then
+# removes the symbol table but NOT the build-id note, so two binaries with
+# identical code ended up differing in exactly those 20 bytes — enough to break a
+# hash comparison for no reason. Measured here: v0.3.17 and v0.3.18 produced
+# byte-identical noct-walletd code that differed only in the build-id. We drop the
+# build-id (`--build-id=none`) so identical code hashes identically; a stripped
+# release binary with no debuginfo server has no use for it anyway.
+#
 # WHAT IT DOES NOT PROMISE
 #
 # The toolchain and the C library are part of the input. A different Rust
@@ -53,7 +65,7 @@ cd "$BUILD_ROOT/src/noct"
 
 # The other half: the dependency sources live under your home directory, which
 # differs per user, so remap that too.
-export RUSTFLAGS="--remap-path-prefix=$BUILD_ROOT/src/noct=/noct --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+export RUSTFLAGS="--remap-path-prefix=$BUILD_ROOT/src/noct=/noct --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo -C link-arg=-Wl,--build-id=none"
 # Timestamps are an input to some build scripts; pin it.
 export SOURCE_DATE_EPOCH=1
 
