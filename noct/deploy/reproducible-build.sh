@@ -42,8 +42,13 @@
 #   Rust      1.85.1  (see rust-toolchain.toml; `orchard` needs it, and every
 #                     release before 0.14.0 is yanked, so there is no build of the
 #                     shielded pool on anything older)
-#   OS        Debian 12 (bookworm), x86_64
-#   Also      cmake and a C++ toolchain, for RandomX
+#   OS        Debian 13 (trixie), x86_64
+#   C++       g++ 14.2.0 (Debian 14.2.0-19) — the RandomX binaries (noctd,
+#             noct-miner, noct-poold) compile C++ through it, so its version is
+#             part of the input and a different g++ yields different — not wrong —
+#             RandomX binaries. noct-cli and noct-walletd are pure Rust and do
+#             not depend on it.
+#   Also      cmake, for RandomX
 set -euo pipefail
 
 TAG="${1:?usage: reproducible-build.sh <git-tag>   e.g. v0.1.3-testnet}"
