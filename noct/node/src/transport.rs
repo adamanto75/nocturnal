@@ -781,6 +781,80 @@ this run will be forgotten on restart, and the next start will have only its see
         }
     }
 
+    /// Learn gossip into a book that may be full, displacing *unreached* hearsay
+    /// to make room rather than refusing the newcomer.
+    ///
+    /// A full book that simply drops new entries (what [`learn`](Self::learn)
+    /// does) freezes discovery: whoever fills it first decides who we can ever
+    /// hear about. The per-source quota keeps *one* peer from doing that, but
+    /// sixteen sources still can — and that bar is cheap (sixteen hosts, or, on
+    /// IPv6 where the quota keys on a source address the attacker has in
+    /// abundance, free). The junk is then persisted to disk and outlives a
+    /// restart.
+    ///
+    /// The split is the address-manager one (Bitcoin's new/tried): an address we
+    /// have actually **reached** is proven and never evicted; a seed the operator
+    /// vouched for and a peer we are connected to are likewise kept. Everything
+    /// else is hearsay, and when the book is full a newcomer displaces one such
+    /// entry. A one-shot junk flood is then diluted by ordinary honest gossip,
+    /// while a peer we depend on is safe.
+    ///
+    /// Eviction deliberately does **not** consider dial-failure history. Removing
+    /// an address because it *failed* is the eclipse lever [`note_dial_failure`]
+    /// (Self::note_dial_failure) refuses to pull: an attacker who could induce
+    /// failures against an honest address would delete it. Reached-ness is not
+    /// attacker-inducible — it takes a real handshake to a listening node — so it
+    /// is the safe thing to privilege. The victim among the unreached is chosen by
+    /// a key salted with our per-process nonce, so an attacker cannot steer which.
+    fn learn_or_evict<I: IntoIterator<Item = SocketAddr>>(&self, addrs: I) {
+        // Snapshot the protected classes (lock order: each of these is taken
+        // before `book` elsewhere — share/dial_candidates/mark_self — so cloning
+        // them first and releasing keeps `book` the only lock held while we
+        // mutate it).
+        let reached = self.reached.lock().unwrap().clone();
+        let connected = self.connected.lock().unwrap().clone();
+        let seeds = self.seeds.lock().unwrap().clone();
+        let selves = self.self_addrs.lock().unwrap().clone();
+        let mut book = self.book.lock().unwrap();
+        for a in addrs {
+            if a == self.self_addr || selves.contains(&a) || book.contains(&a) {
+                continue;
+            }
+            if book.len() < MAX_BOOK {
+                book.insert(a);
+                continue;
+            }
+            let victim = book
+                .iter()
+                .filter(|b| {
+                    !reached.contains(*b)
+                        && !connected.contains(*b)
+                        && !seeds.contains(*b)
+                        && !selves.contains(*b)
+                })
+                .min_by_key(|b| self.evict_key(b))
+                .copied();
+            // If `victim` is None every entry is protected — a healthy,
+            // fully-reached book, not one an attacker filled. There is no hearsay
+            // to displace, so we refuse the newcomer, exactly as before.
+            if let Some(v) = victim {
+                book.remove(&v);
+                book.insert(a);
+            }
+        }
+    }
+
+    /// An attacker-unpredictable, uniform sort key for choosing an eviction
+    /// victim. Salted with our per-process `self_nonce` so the order cannot be
+    /// precomputed off the address alone.
+    fn evict_key(&self, a: &SocketAddr) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.self_nonce.hash(&mut h);
+        a.hash(&mut h);
+        h.finish()
+    }
+
     /// Learn addresses from **untrusted peer gossip** (a `Peers` message), keeping
     /// only routable ones. A node bound to a loopback address is a local/test node
     /// and accepts local peers; a node on a routable address rejects
@@ -836,7 +910,7 @@ this run will be forgotten on restart, and the next start will have only its see
             *used += take;
             take
         };
-        self.learn(ok.into_iter().take(allowed));
+        self.learn_or_evict(ok.into_iter().take(allowed));
     }
 
     /// Is this address inside a private network we could already be part of?
@@ -2649,17 +2723,91 @@ mod adversarial_tests {
 
 /// Can a hostile peer fill our address book with junk?
 ///
-/// This is the eclipse question. `learn()` inserts only while the book is under
-/// `MAX_BOOK`, and drops new addresses once it is full. That refusal is
-/// deliberate — it stops a flood *evicting* honest peers — but it has a mirror
-/// image: if an attacker fills the book first, the node can never learn a real
-/// peer afterwards.
+/// This is the eclipse question. The per-source quota stops *one* peer from
+/// filling the book, but sixteen sources (cheap on IPv4, free on IPv6) could,
+/// and a book that merely *refused* new entries once full then froze discovery:
+/// whoever filled it first decided who we could ever hear about, and the junk
+/// persisted across restarts. `learn_or_evict` closes that — a full book now
+/// displaces *unreached* hearsay to admit a newcomer, so an ongoing trickle of
+/// honest gossip dilutes a one-shot flood, while a peer we have reached, a seed,
+/// or a live connection is never evicted. Eviction never keys on dial failure,
+/// which would re-open the exact lever `note_dial_failure` is written to deny.
 #[cfg(test)]
 mod book_flooding_tests {
     use super::*;
 
     fn disc() -> Discovery {
         Discovery::new("0.0.0.0:19333".parse().unwrap(), [0u8; 32], 1, 8)
+    }
+
+    /// Fill the book to `MAX_BOOK` with routable-but-dead junk, spread across
+    /// enough sources to beat the per-source quota. Returns the node.
+    fn disc_with_a_full_junk_book() -> Discovery {
+        let d = disc();
+        let sources = MAX_BOOK.div_ceil(MAX_BOOK_PER_SOURCE);
+        let mut n = 0u32;
+        for s in 0..sources {
+            let from: std::net::IpAddr = format!("8.8.{}.{}", s / 256, s % 256).parse().unwrap();
+            let batch: Vec<SocketAddr> = (0..MAX_BOOK_PER_SOURCE)
+                .map(|_| {
+                    let a = format!("11.{}.{}.{}:19333", n / 65536, (n / 256) % 256, n % 256);
+                    n += 1;
+                    a.parse().unwrap()
+                })
+                .collect();
+            d.learn_gossip_from(Some(from), batch);
+        }
+        assert_eq!(d.book_len(), MAX_BOOK, "setup: the book should be full of junk");
+        d
+    }
+
+    /// The eclipse the quota alone does not stop: sixteen sources fill the book,
+    /// and before `learn_or_evict` a seventeenth source's honest address was
+    /// refused outright. It must now get in, by displacing unreached hearsay,
+    /// and the book must stay bounded.
+    #[test]
+    fn a_full_book_still_admits_fresh_gossip_by_displacing_unreached_junk() {
+        let d = disc_with_a_full_junk_book();
+        let honest: SocketAddr = "93.184.216.34:19333".parse().unwrap();
+        d.learn_gossip_from(Some("1.1.1.1".parse().unwrap()), [honest]);
+        assert!(
+            d.book.lock().unwrap().contains(&honest),
+            "a full book must admit fresh gossip rather than freeze discovery"
+        );
+        assert_eq!(d.book_len(), MAX_BOOK, "and must stay bounded at MAX_BOOK");
+    }
+
+    /// The property that must hold while we evict: a peer we have actually
+    /// reached is proven, not hearsay, and no volume of junk gossip may displace
+    /// it. Without this the fix would be its own eclipse — an attacker flooding
+    /// honest peers out of a full book.
+    #[test]
+    fn a_reached_peer_is_never_evicted_by_a_junk_flood() {
+        let d = disc_with_a_full_junk_book();
+        // Teach it a real peer and mark it reached (as a successful dial would).
+        let good: SocketAddr = "93.184.216.34:19333".parse().unwrap();
+        d.learn_gossip_from(Some("1.1.1.1".parse().unwrap()), [good]);
+        d.note_dial_success(good);
+        assert!(d.book.lock().unwrap().contains(&good), "setup: the good peer is in the book");
+
+        // Now pour in far more junk than the book can hold, forcing many
+        // evictions, from many fresh sources.
+        let mut n = 100_000u32;
+        for s in 0..40u32 {
+            let from: std::net::IpAddr = format!("9.9.{}.{}", s / 256, s % 256).parse().unwrap();
+            let batch: Vec<SocketAddr> = (0..MAX_BOOK_PER_SOURCE)
+                .map(|_| {
+                    let a = format!("12.{}.{}.{}:19333", n / 65536, (n / 256) % 256, n % 256);
+                    n += 1;
+                    a.parse().unwrap()
+                })
+                .collect();
+            d.learn_gossip_from(Some(from), batch);
+        }
+        assert!(
+            d.book.lock().unwrap().contains(&good),
+            "a reached peer must survive any amount of junk gossip"
+        );
     }
 
     /// Flood the book from a single hostile peer, then try to learn an honest
