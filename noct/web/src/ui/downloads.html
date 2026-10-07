@@ -17,28 +17,29 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.19-testnet</b> — <b>a reproducibility release; the binaries behave exactly as
-     v0.3.18.</b> No Rust source changed — the point is that identical code now hashes
-     identically. The linker had been stamping each binary with a GNU build-id derived from
-     the pre-strip symbol table, so two builds of the very same code differed in 20
-     meaningless bytes and broke a hash comparison for no reason; that id is now dropped.
-     The documented build environment is also corrected to Debian 13 / g++ 14.2.0, and all
-     five Linux binaries were rebuilt <b>byte-identically on two different machines</b> to
-     prove the build survives a change of hardware. v0.3.0 changed consensus: a node older
-     than that cannot follow the current testnet chain, so if you are running v0.2.x or
-     earlier, update or you will simply stop syncing.</p>
-  <p class="note"><b>Already on v0.3.18?</b> The code is identical — only the build-id was
-     removed, so every binary's hash changes while nothing it does changes. Updating is
-     optional; the reason to is a build you can verify yourself.</p>
+  <p><b>v0.3.20-testnet</b> — <b>a gossip-eclipse hardening: a full address book no longer
+     freezes peer discovery.</b> A node's address book is capped, and once full it used to
+     refuse new entries — which let an attacker who filled it first (cheap on IPv4, free on
+     IPv6) decide who the node could ever hear about afterwards, a state that even survived a
+     restart. The book now uses the proven new/tried split: an address the node has actually
+     <b>reached</b> is never evicted, nor is a seed or a live connection, while unreached
+     hearsay is displaced to admit newcomers — so ordinary gossip dilutes a flood. Eviction
+     never keys on dial failure, which would hand an attacker the opposite lever. <b>Any node
+     that accepts connections and discovers peers by gossip should update.</b> v0.3.0 changed
+     consensus: a node older than that cannot follow the current testnet chain, so if you are
+     running v0.2.x or earlier, update or you will simply stop syncing.</p>
+  <p class="note"><b>Already on v0.3.19?</b> Only the node changed: <code>noctd</code>,
+     <code>noct-miner</code> and <code>noct-poold</code> move; <code>noct-cli</code> and
+     <code>noct-walletd</code> are byte-identical to v0.3.19.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.19-testnet/Nocturnal-Wallet-Setup-0.3.19.exe">Nocturnal-Wallet-Setup-0.3.19.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.20-testnet/Nocturnal-Wallet-Setup-0.3.20.exe">Nocturnal-Wallet-Setup-0.3.20.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.19-testnet/nocturnal-v0.3.19-testnet-linux-x64.tar.gz">nocturnal-v0.3.19-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.20-testnet/nocturnal-v0.3.20-testnet-linux-x64.tar.gz">nocturnal-v0.3.20-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.19-testnet/nocturnal-v0.3.19-testnet-windows-x64.zip">nocturnal-v0.3.19-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.20-testnet/nocturnal-v0.3.20-testnet-windows-x64.zip">nocturnal-v0.3.20-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.19-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.19-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.20-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.20-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
