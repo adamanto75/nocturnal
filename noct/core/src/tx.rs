@@ -695,6 +695,40 @@ impl Transaction {
         &self,
         rng: &mut R,
     ) -> Result<(), TxError> {
+        // Everything except the shielded bundle's proof and signatures, then the
+        // bundle on its own. Splitting it this way lets a block defer every
+        // bundle's proof to one batch verification (see `verify_batchable` and
+        // `ShieldedBatch`); verifying a single transaction, as the mempool does,
+        // goes through here and is unchanged.
+        if let Some(sighash) = self.verify_batchable(rng)? {
+            self.shielded
+                .as_ref()
+                .expect("a batchable sighash means a bundle is present")
+                .verify(&sighash)
+                .map_err(TxError::Shielded)?;
+        }
+        Ok(())
+    }
+
+    /// Verify everything except the shielded bundle's proof and signatures,
+    /// returning the `sighash` the bundle (if any) must be verified against.
+    ///
+    /// The expensive, batchable part of a shielded transaction is the Halo2 proof
+    /// and the RedPallas signatures; everything else — structure, version, the
+    /// range proof, the ring signatures, the balance, the crossing — is checked
+    /// here, per transaction, as it always was. A caller validating a whole block
+    /// runs this for each transaction and then verifies all the bundles together
+    /// through a [`ShieldedBatch`](crate::shielded::ShieldedBatch); a caller
+    /// judging one transaction calls [`verify`](Self::verify), which finishes the
+    /// bundle itself.
+    ///
+    /// `Ok(Some(sighash))` means a bundle is present and awaits proof/signature
+    /// verification; `Ok(None)` means the transaction is ring-only and fully
+    /// verified.
+    pub fn verify_batchable<R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        rng: &mut R,
+    ) -> Result<Option<[u8; 32]>, TxError> {
         // A ring-only transaction must have both halves: without inputs it mints
         // and without outputs it destroys, and neither is a payment.
         //
@@ -801,10 +835,10 @@ impl Transaction {
         // thing tying the crossing it claims to the notes it actually created.
         // Signed over the core rather than over `message`, so that the two
         // signature systems do not each have to wait for the other.
-        if let Some(bundle) = &self.shielded {
+        let batchable_sighash = if self.shielded.is_some() {
             let msg_inputs: Vec<(KeyImage, &[RingMember])> =
                 self.inputs.iter().map(|i| (i.signature.key_image, i.ring.as_slice())).collect();
-            let sighash = bundle_sighash(
+            Some(bundle_sighash(
                 self.version,
                 &self.tx_public,
                 &self.additional_tx_public,
@@ -813,9 +847,10 @@ impl Transaction {
                 &self.outputs,
                 self.range_proof.as_ref(),
                 self.cross,
-            );
-            bundle.verify(&sighash).map_err(TxError::Shielded)?;
-        }
+            ))
+        } else {
+            None
+        };
 
         // Balance: Σ pseudo-outs == Σ output commitments + (fee + cross)·H.
         //
@@ -830,7 +865,7 @@ impl Transaction {
             return Err(TxError::Unbalanced);
         }
 
-        Ok(())
+        Ok(batchable_sighash)
     }
 
     /// Scan this transaction for outputs paid to `account`'s **main** address.
@@ -1329,6 +1364,38 @@ pub(crate) mod shielded_tx_tests {
         assert_eq!(tx.cross, 69);
         assert_eq!(tx.shielded.as_ref().unwrap().cross().unwrap(), 69);
         assert_eq!(tx.verify(&mut OsRng), Ok(()));
+    }
+
+    /// The split that lets a block batch its proofs. `verify_batchable` runs
+    /// every check `verify` does except the bundle's proof and signatures, and
+    /// hands back the sighash they must be checked against; the bundle then
+    /// verifies against exactly that sighash. A ring-only transaction has no
+    /// bundle to defer, so it returns `None` and is fully verified already.
+    #[test]
+    fn verify_batchable_defers_only_the_bundle() {
+        // Ring-only: nothing to batch, and `verify` agrees it is valid.
+        let inputs = vec![fabricate_input(100, 4, 1)];
+        let payments = vec![Payment { destination: address(&account()), amount: 99 }];
+        let ring_only =
+            Transaction::build(&mut OsRng, &inputs, &payments, 1, &TxKeypair::random(&mut OsRng))
+                .expect("a balanced ring-only transaction builds");
+        assert_eq!(ring_only.verify_batchable(&mut OsRng), Ok(None));
+        assert_eq!(ring_only.verify(&mut OsRng), Ok(()));
+
+        // Shielded: structurally valid, hands back a sighash, and the bundle
+        // verifies against that very sighash — which is what the block batch
+        // then checks for every bundle at once.
+        let tx = shielding_tx();
+        let sighash = tx
+            .verify_batchable(&mut OsRng)
+            .expect("structurally valid")
+            .expect("a shielded transaction has a bundle to defer");
+        assert_eq!(
+            tx.shielded.as_ref().unwrap().verify(&sighash),
+            Ok(()),
+            "the deferred sighash is the one the bundle is signed over"
+        );
+        assert_eq!(tx.verify(&mut OsRng), Ok(()), "and the one-shot path still accepts it");
     }
 
     /// **The property this whole change rests on.** `cross` decides how much

@@ -32,6 +32,7 @@ use crate::emission::base_reward;
 use crate::keys::PublicKey;
 use crate::pow::{check_hash, next_difficulty, Difficulty, ProofOfWork, MIN_DIFFICULTY};
 use crate::ring::{KeyImage, RingMember};
+use crate::shielded::{ShieldedBatch, ShieldedBundle, ShieldedError};
 use crate::shielded_state::{CoinbaseCredit, ShieldedState, ShieldedStateError};
 use crate::tx::{Transaction, TxError};
 
@@ -531,10 +532,17 @@ impl<P: ProofOfWork> Blockchain<P> {
         // 6. Validate each transaction and gather its key images / fees.
         let mut total_fees: u64 = 0;
         let mut block_images: HashSet<KeyImage> = HashSet::new();
+        let mut shielded_batch: Vec<(&ShieldedBundle, [u8; 32])> = Vec::new();
         for tx in txs {
             // Per-transaction validity against current chain state (internal
-            // verify + ring membership + not-already-spent).
-            self.validate_tx(rng, tx)?;
+            // verify + ring membership + not-already-spent), but the shielded
+            // bundle's proof and signatures are deferred to one batch below.
+            if let Some(sighash) = self.validate_tx_batchable(rng, tx)? {
+                shielded_batch.push((
+                    tx.shielded.as_ref().expect("a batchable sighash means a bundle is present"),
+                    sighash,
+                ));
+            }
 
             // Additionally, no key image may repeat *within* this block.
             for image in tx.key_images() {
@@ -544,6 +552,26 @@ impl<P: ProofOfWork> Blockchain<P> {
             }
 
             total_fees = total_fees.checked_add(tx.fee).ok_or(ChainError::FeeOverflow)?;
+        }
+
+        // Verify every shielded bundle's proof and RedPallas signatures in a
+        // single batch — materially cheaper than one bundle at a time (a Halo2
+        // batch folds the per-proof multi-scalar multiplications together), and
+        // placed here so each transaction's cheap chain-state checks above have
+        // already gated this, the most expensive work in the block. All-or-
+        // nothing: if any proof or signature fails the block is rejected, and
+        // nothing has been committed yet. The mempool still verifies a lone
+        // transaction's bundle on its own, through `validate_tx`.
+        if !shielded_batch.is_empty() {
+            let mut batch = ShieldedBatch::new();
+            for (bundle, sighash) in &shielded_batch {
+                batch
+                    .add(bundle, sighash)
+                    .map_err(|e| ChainError::InvalidTx(TxError::Shielded(e)))?;
+            }
+            if !batch.verify(&mut *rng) {
+                return Err(ChainError::InvalidTx(TxError::Shielded(ShieldedError::BadProof)));
+            }
         }
 
         // 7. No output this block creates may duplicate an existing one, or
@@ -833,6 +861,32 @@ impl<P: ProofOfWork> Blockchain<P> {
         rng: &mut R,
         tx: &Transaction,
     ) -> Result<(), ChainError> {
+        self.check_tx_against_chain(tx)?;
+        tx.verify(rng).map_err(ChainError::InvalidTx)?;
+        Ok(())
+    }
+
+    /// As [`validate_tx`](Self::validate_tx), but defers the shielded bundle's
+    /// proof and signatures so a whole block can verify them in one batch
+    /// ([`ShieldedBatch`](crate::shielded::ShieldedBatch)). Returns the bundle's
+    /// `sighash` to queue into that batch, or `None` for a ring-only transaction.
+    /// The cheap chain-state checks run first, exactly as in `validate_tx`.
+    fn validate_tx_batchable<R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        rng: &mut R,
+        tx: &Transaction,
+    ) -> Result<Option<[u8; 32]>, ChainError> {
+        self.check_tx_against_chain(tx)?;
+        tx.verify_batchable(rng).map_err(ChainError::InvalidTx)
+    }
+
+    /// The chain-state checks a transaction must pass before its expensive
+    /// cryptography is worth doing: ring size and membership, coinbase maturity,
+    /// key images not already spent, and the shielded anchor/nullifier gates.
+    /// Shared by [`validate_tx`](Self::validate_tx) and
+    /// [`validate_tx_batchable`](Self::validate_tx_batchable) so the two cannot
+    /// diverge on what they admit.
+    fn check_tx_against_chain(&self, tx: &Transaction) -> Result<(), ChainError> {
         // Cheap, structural rejections first; the signature check last.
         //
         // Verification is a CLSAG over a ring of 16 plus a Bulletproofs+ range
@@ -888,7 +942,6 @@ impl<P: ProofOfWork> Blockchain<P> {
                 }
             }
         }
-        tx.verify(rng).map_err(ChainError::InvalidTx)?;
         Ok(())
     }
 }
@@ -1617,6 +1670,50 @@ pub(crate) mod tests {
         assert!(chain.is_spent(&received.key_image));
         // Bob can find his payment in the newly-added transaction.
         assert_eq!(tx.scan(&bob)[0].amount, reward - fee);
+    }
+
+    /// A block carrying a real shielded crossing is accepted — which means the
+    /// bundle's proof and signatures were verified through `add_block`'s batch,
+    /// not one at a time, and the crossing landed in the shielded pool. This is
+    /// the end-to-end path the batch optimisation runs on.
+    #[test]
+    fn a_block_with_a_shielded_crossing_is_accepted_via_the_batch() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let miner = Account::random(&mut OsRng);
+        let (received, cb_index) = mine_coinbase(&mut chain, &miner, 1_000);
+        warm_up(&mut chain, 15, 1_200);
+
+        let reward = received.amount;
+        let fee = ATOMIC_UNITS / 100;
+        let cross: i64 = 50;
+        let (ring, signer_index) =
+            chain.select_ring_uniform(&mut OsRng, RING_SIZE, cb_index).expect("ring assembles");
+        let input = received.to_input(ring, signer_index);
+        let bob = Account::random(&mut OsRng);
+        // input = ring change + fee + cross into the shielded pool.
+        let change = reward - fee - cross as u64;
+        let tx = Transaction::build_with_shielded(
+            &mut OsRng,
+            &[input],
+            &[Payment { destination: address(&bob), amount: change }],
+            fee,
+            &TxKeypair::random(&mut OsRng),
+            cross,
+            Some(crate::tx::shielded_tx_tests::authorizing(cross as u64)),
+        )
+        .expect("a shielded crossing builds against the chain");
+        assert!(tx.shielded.is_some(), "it carries a bundle for the batch to verify");
+
+        let shielded_before = chain.shielded().totals().shielded();
+        let (block, _) = make_block(&chain, &miner, std::slice::from_ref(&tx), 5_000);
+        chain
+            .add_block(&mut OsRng, &block, std::slice::from_ref(&tx))
+            .expect("a block whose bundle verifies in the batch is accepted");
+        assert_eq!(
+            chain.shielded().totals().shielded(),
+            shielded_before + cross as u64,
+            "the crossing landed in the shielded pool"
+        );
     }
 
     #[test]
