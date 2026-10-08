@@ -17,28 +17,29 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.22-testnet</b> — <b>the node, pool and wallet daemon now bound the HTTP request
-     head, closing an unauthenticated memory-exhaustion DoS.</b> The request body was capped,
-     but the request line and headers were read without limit — one connection streaming
-     bytes with no newline could make a server allocate hundreds of megabytes before its
-     timeout fired. The head is now capped at 64&nbsp;KiB and an over-long one is refused. The
-     exposed case is the <b>pool</b>, which faces the internet; the node RPC reads the head
-     before authenticating; the wallet daemon is localhost-only but holds the spend key.
-     <b>This is not a consensus change</b> — the same blocks are valid, so update whenever you
-     like. v0.3.0 changed consensus: a node older than that cannot follow the current testnet
-     chain, so if you are running v0.2.x or earlier, update or you will simply stop syncing.</p>
-  <p class="note"><b>Already on v0.3.21?</b> The fix is in the HTTP servers, so
-     <code>noctd</code>, <code>noct-poold</code> and <code>noct-walletd</code> change;
-     <code>noct-cli</code> and <code>noct-miner</code> are byte-identical to v0.3.21.</p>
+  <p><b>v0.3.23-testnet</b> — <b>every client now bounds the HTTP response it reads from a
+     server, closing the client-side half of the memory-exhaustion DoS.</b> v0.3.22 capped the
+     request a server reads; this caps the reply a client reads. The shared response reader —
+     a miner reading a job from its pool, the pool and wallet reading from their node — read
+     the body and header lines without limit, so a hostile upstream could stream an endless
+     body or a never-ending header line and exhaust the client's memory. The head is now
+     capped at 64&nbsp;KiB and the body at 32&nbsp;MiB. The realistic attacker is a
+     <b>pool against the miners pointed at it</b>. <b>Not a consensus change</b> — update
+     whenever you like. v0.3.0 changed consensus: a node older than that cannot follow the
+     current testnet chain, so if you are on v0.2.x or earlier, update or you will stop
+     syncing.</p>
+  <p class="note"><b>Already on v0.3.22?</b> The fix is in the shared TLS/HTTP library, which
+     every binary links, so all five change — but nothing a wallet does changes; it is purely
+     how a client reads a reply.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/Nocturnal-Wallet-Setup-0.3.22.exe">Nocturnal-Wallet-Setup-0.3.22.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.23-testnet/Nocturnal-Wallet-Setup-0.3.23.exe">Nocturnal-Wallet-Setup-0.3.23.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/nocturnal-v0.3.22-testnet-linux-x64.tar.gz">nocturnal-v0.3.22-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.23-testnet/nocturnal-v0.3.23-testnet-linux-x64.tar.gz">nocturnal-v0.3.23-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/nocturnal-v0.3.22-testnet-windows-x64.zip">nocturnal-v0.3.22-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.23-testnet/nocturnal-v0.3.23-testnet-windows-x64.zip">nocturnal-v0.3.23-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.23-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.23-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
