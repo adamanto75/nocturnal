@@ -260,26 +260,41 @@ pub struct Response {
 ///   the declared length has arrived keeps the truncation check while getting
 ///   along with the software that actually exists.
 pub fn read_response(stream: &mut Stream) -> Result<Response, String> {
+    // This is a reply from a server we do not control — a miner's pool, a
+    // client's node. Both the head and the body are read under hard caps:
+    // `read_until` and `read_to_end` are each content to buffer until a newline
+    // or an EOF a hostile server need never send, which would let any upstream
+    // exhaust our memory. The caps are the client-side mirror of the ones the
+    // servers apply to requests.
+    const MAX_HEAD: u64 = 64 * 1024;
+    // Well above any real reply: a block template is a hex-encoded message, and a
+    // message runs to 8 MiB (MAX_MESSAGE_BYTES), so ~16 MiB of hex plus a small
+    // JSON wrapper. Far below what exhausts a client.
+    const MAX_BODY: usize = 32 * 1024 * 1024;
+
     let mut reader = io::BufReader::new(stream);
     let mut head = Vec::new();
-    let mut line = Vec::new();
 
-    // Headers, up to the blank line.
-    loop {
-        line.clear();
-        let n = read_line(&mut reader, &mut line)?;
-        if n == 0 {
-            return Err("the server closed the connection before answering".to_string());
-        }
-        let done = line == b"\r\n" || line == b"\n";
-        head.extend_from_slice(&line);
-        if done {
-            break;
-        }
-        // A response whose headers never end is a resource exhaustion vector,
-        // not a slow server.
-        if head.len() > 64 * 1024 {
-            return Err("response headers are implausibly large".to_string());
+    // Headers, up to the blank line, read through a cap so a single header line
+    // that never ends cannot be buffered without limit — the old check ran only
+    // after each full line had already been read into memory.
+    {
+        let mut capped = (&mut reader).take(MAX_HEAD);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = read_line(&mut capped, &mut line)?;
+            if n == 0 {
+                if capped.limit() == 0 {
+                    return Err("response headers are implausibly large".to_string());
+                }
+                return Err("the server closed the connection before answering".to_string());
+            }
+            let done = line == b"\r\n" || line == b"\n";
+            head.extend_from_slice(&line);
+            if done {
+                break;
+            }
         }
     }
 
@@ -294,9 +309,21 @@ pub fn read_response(stream: &mut Stream) -> Result<Response, String> {
         let (k, v) = l.split_once(':')?;
         k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
     });
+    // Refuse an implausible declared length before reading a byte of the body.
+    if let Some(len) = content_length {
+        if len > MAX_BODY {
+            return Err(format!("response body too large: {len} bytes"));
+        }
+    }
 
+    // Read the body through a cap of MAX_BODY + 1. The extra byte catches an
+    // undeclared or understated length: if it arrives, the body ran past the cap
+    // and the reply is refused rather than buffered on.
     let mut body = Vec::new();
-    let outcome = reader.read_to_end(&mut body);
+    let outcome = (&mut reader).take(MAX_BODY as u64 + 1).read_to_end(&mut body);
+    if body.len() > MAX_BODY {
+        return Err("response body too large".to_string());
+    }
     match (outcome, content_length) {
         (Ok(_), Some(len)) if body.len() < len => {
             return Err(format!("truncated response: {} of {len} bytes", body.len()))
@@ -726,6 +753,76 @@ mod tests {
         s.write_all(b"GET /balance HTTP/1.1\r\n\r\n").unwrap();
         let ok = read_response(&mut s).unwrap();
         assert_eq!((ok.status, ok.body.as_str()), (200, "{\"bal\":1}"));
+    }
+
+    /// A reply that declares an implausible body length is refused before a byte
+    /// of that body is read: a hostile upstream cannot announce a gigabyte and
+    /// make the client try to hold it.
+    #[test]
+    fn a_declared_body_over_the_cap_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 256];
+            let _ = tcp.read(&mut discard);
+            let _ = tcp.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let ep = Endpoint::parse(&format!("127.0.0.1:{port}"), 1).unwrap();
+        let mut s = connect(&ep).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let err = read_response(&mut s).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    /// A reply with no declared length that streams past the cap is refused
+    /// rather than read to EOF without limit.
+    #[test]
+    fn an_undeclared_body_over_the_cap_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 256];
+            let _ = tcp.read(&mut discard);
+            let _ = tcp.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            // No Content-Length; stream more than the 32 MiB cap, then let the
+            // client's refusal close the socket.
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..33 {
+                if tcp.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let ep = Endpoint::parse(&format!("127.0.0.1:{port}"), 1).unwrap();
+        let mut s = connect(&ep).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let err = read_response(&mut s).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    /// A reply whose headers never end is refused at the cap, not buffered
+    /// without limit — one 70 KiB header line with no terminator is enough.
+    #[test]
+    fn a_header_that_never_ends_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 256];
+            let _ = tcp.read(&mut discard);
+            let mut reply = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+            reply.extend(std::iter::repeat(b'a').take(70 * 1024));
+            let _ = tcp.write_all(&reply); // no CRLF, no blank line
+        });
+        let ep = Endpoint::parse(&format!("127.0.0.1:{port}"), 1).unwrap();
+        let mut s = connect(&ep).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let err = read_response(&mut s).unwrap_err();
+        assert!(err.contains("implausibly large"), "{err}");
     }
 
     /// The end-to-end proof: a real socket, a real handshake, a real HTTP
