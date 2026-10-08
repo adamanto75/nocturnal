@@ -276,8 +276,19 @@ fn handle(
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
+    // The request line and headers, read under a hard size cap: `read_line`
+    // otherwise buffers until a newline a client is free never to send, so one
+    // local process could make this (spend-key-holding) daemon allocate without
+    // limit. The body is bounded separately by MAX_BODY. `take` is released by
+    // the `drop` below so the body read is not limited by it.
+    const MAX_HEAD: u64 = 64 * 1024;
+    let too_large = "431 Request Header Fields Too Large";
+    let mut limited = (&mut reader).take(MAX_HEAD);
+
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    if limited.read_line(&mut request_line)? == 0 || !request_line.ends_with('\n') {
+        return http(&mut writer, too_large, "text/plain", "head too large");
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
@@ -285,16 +296,21 @@ fn handle(
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        if limited.read_line(&mut line)? == 0 {
+            return http(&mut writer, too_large, "text/plain", "head too large");
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
             break;
         }
-        if line.trim_end().is_empty() {
-            break;
+        if !line.ends_with('\n') {
+            return http(&mut writer, too_large, "text/plain", "head too large");
         }
-        if let Some(v) = line.trim_end().to_ascii_lowercase().strip_prefix("content-length:") {
+        if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         }
     }
+    drop(limited);
     if content_length > MAX_BODY {
         return http(&mut writer, "413 Payload Too Large", "text/plain", "too large");
     }

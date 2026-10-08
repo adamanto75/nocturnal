@@ -33,6 +33,69 @@ use crate::NodeState;
 /// Reject request bodies larger than this.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// The largest HTTP request head — the request line plus every header line — we
+/// will read before giving up.
+///
+/// `MAX_BODY` bounds the body, but the head was read with `read_line`, which
+/// buffers until a newline it is under no obligation to ever receive. A client
+/// that opens a socket and streams bytes with no `\n` makes the server allocate
+/// without limit — hundreds of megabytes before the I/O timeout fires, once per
+/// connection and so once per connection slot. A real request head is a handful
+/// of short lines; 64 KiB is far above any honest one and far below what hurts.
+pub const MAX_HEAD: usize = 64 * 1024;
+
+/// An HTTP request head: the request line and the header lines after it, each
+/// already trimmed of its trailing CRLF, read under the [`MAX_HEAD`] cap.
+pub struct RequestHead {
+    /// `METHOD TARGET HTTP/x.y`.
+    pub request_line: String,
+    /// The header lines, in order, trimmed — `Name: value`.
+    pub headers: Vec<String>,
+}
+
+/// Read an HTTP request head, bounding the total bytes read at [`MAX_HEAD`].
+///
+/// `Ok(None)` means there is no head to serve — the connection closed before one
+/// completed, or the head exceeded the cap. Either way the caller should stop,
+/// optionally after a `431`. The body (if any) is left unread in `reader` for the
+/// caller to read under its own size limit: the cap applies only to this call, so
+/// a `Content-Length` body is untouched.
+pub fn read_request_head<R: BufRead>(reader: &mut R) -> std::io::Result<Option<RequestHead>> {
+    // `take` caps the bytes this phase may read; it is released when the returned
+    // reader is dropped, so the body read afterwards is not limited by it.
+    let mut limited = reader.take(MAX_HEAD as u64);
+
+    let mut request_line = String::new();
+    if limited.read_line(&mut request_line)? == 0 {
+        return Ok(None);
+    }
+    if !request_line.ends_with('\n') {
+        // The request line alone ran past the cap without ending.
+        return Ok(None);
+    }
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        if limited.read_line(&mut line)? == 0 {
+            // EOF, or the cap was exhausted before the blank line ending the head.
+            return Ok(None);
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            return Ok(Some(RequestHead {
+                request_line: request_line.trim_end().to_string(),
+                headers,
+            }));
+        }
+        if !line.ends_with('\n') {
+            // A header line ran past the cap without ending.
+            return Ok(None);
+        }
+        headers.push(trimmed.to_string());
+    }
+}
+
 /// How long a connection may sit without progress before it is dropped. Ample
 /// for a slow client submitting a large block; short enough that an idle socket
 /// cannot squat on a worker thread indefinitely.
@@ -314,10 +377,22 @@ fn handle_client(
     // and nothing is read after it.
     let mut reader = BufReader::new(stream);
 
+    // The request line and headers, read under a hard size cap so a client that
+    // never ends a line cannot make us buffer without limit. The body is read
+    // afterwards, under MAX_BODY.
+    let head = match read_request_head(&mut reader)? {
+        Some(h) => h,
+        None => {
+            return respond(
+                reader.get_mut(),
+                "431 Request Header Fields Too Large",
+                "{\"error\":\"request head too large\"}",
+            );
+        }
+    };
+
     // Request line: "METHOD PATH HTTP/1.1".
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    let mut parts = request_line.split_whitespace();
+    let mut parts = head.request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
 
     // Split the query off ONCE, and route on the path alone.
@@ -352,15 +427,8 @@ fn handle_client(
     // Headers (Content-Length, and Authorization when a token is configured).
     let mut content_length = 0usize;
     let mut authorization: Option<String> = None;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            break;
-        }
+    for line in &head.headers {
+        let trimmed = line.as_str();
         let lower = trimmed.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
@@ -710,6 +778,44 @@ fn respond(writer: &mut Stream, status: &str, body: &str) -> std::io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A normal head is read whole, split into request line and headers, and the
+    /// body is left in the reader untouched by the head cap.
+    #[test]
+    fn a_request_head_is_read_and_the_body_is_left_behind() {
+        use std::io::Read;
+        let raw = b"POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc".to_vec();
+        let mut r = std::io::Cursor::new(raw);
+        let head = read_request_head(&mut r).unwrap().expect("a complete head");
+        assert_eq!(head.request_line, "POST /submit HTTP/1.1");
+        assert_eq!(head.headers, vec!["Host: x".to_string(), "Content-Length: 3".to_string()]);
+        let mut body = String::new();
+        r.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "abc", "the cap applies to the head only, not the body");
+    }
+
+    /// A request line that never ends is refused, and — the point — only MAX_HEAD
+    /// bytes are ever read, so it cannot make the server allocate without limit.
+    #[test]
+    fn an_unterminated_request_line_is_refused_within_the_cap() {
+        let mut raw = b"GET /".to_vec();
+        raw.extend(std::iter::repeat(b'a').take(MAX_HEAD + 10_000));
+        let mut r = std::io::Cursor::new(raw);
+        assert!(read_request_head(&mut r).unwrap().is_none(), "an unterminated head is refused");
+    }
+
+    /// A flood of header lines with no terminating blank line is refused once the
+    /// cap is reached, rather than read forever.
+    #[test]
+    fn a_header_flood_past_the_cap_is_refused() {
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        while raw.len() < MAX_HEAD * 2 {
+            raw.extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaa\r\n");
+        }
+        // No trailing blank line: the head never completes.
+        let mut r = std::io::Cursor::new(raw);
+        assert!(read_request_head(&mut r).unwrap().is_none(), "a header flood is refused at the cap");
+    }
 
     #[test]
     fn bearer_token_is_required_and_matched_exactly() {

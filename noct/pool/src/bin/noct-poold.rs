@@ -941,27 +941,30 @@ fn handle(
     let socket_peer = stream.peer_addr().map(|a| a.ip()).ok();
     let mut reader = BufReader::new(stream);
 
-    let mut request_line = String::new();
-    // On a TLS connection this is where the handshake actually happens, so a
-    // failure here is normal (a probe, a wrong pin, a port scanner) and simply
-    // ends the connection.
-    reader.read_line(&mut request_line)?;
-    let mut parts = request_line.split_whitespace();
+    // The request line and headers, under a hard size cap. On a TLS connection
+    // the handshake happens inside here, on the first read, so a failure is
+    // normal (a probe, a wrong pin, a port scanner) and simply ends the
+    // connection. The body is read afterwards, under MAX_BODY.
+    let head = match noct_node::rpc::read_request_head(&mut reader)? {
+        Some(h) => h,
+        None => {
+            let mut writer = reader.into_inner();
+            return respond(
+                &mut writer,
+                "431 Request Header Fields Too Large",
+                "{\"error\":\"request head too large\"}",
+            );
+        }
+    };
+    let mut parts = head.request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
 
     let mut content_length = 0usize;
     let mut forwarded_for: Option<String> = None;
     let mut bearer: Option<String> = None;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        if line.trim_end().is_empty() {
-            break;
-        }
-        let lower = line.trim_end().to_ascii_lowercase();
+    for line in &head.headers {
+        let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = lower.strip_prefix("x-forwarded-for:") {
@@ -969,7 +972,7 @@ fn handle(
         } else if lower.starts_with("authorization:") {
             // Taken from the original line, not the lowercased copy: a token is
             // case-sensitive and folding it would reject every valid one.
-            if let Some(v) = line.trim_end().split_once(':') {
+            if let Some(v) = line.split_once(':') {
                 bearer = v.1.trim().strip_prefix("Bearer ").map(|t| t.trim().to_string());
             }
         }
