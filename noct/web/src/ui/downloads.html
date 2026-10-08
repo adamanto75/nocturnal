@@ -17,28 +17,28 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.21-testnet</b> — <b>the node verifies a block's shielded bundles in one batch
-     instead of one at a time.</b> A block can carry many Orchard transactions, and each
-     proof was verified on its own; a Halo2 batch verifier folds the proofs together, which
-     on this circuit is ~3.8x faster at sixteen bundles and never slower even for one. The
-     win lands on initial block download and shielded-heavy blocks, and it removes a cost
-     asymmetry — a miner packing a block with shielded transactions now costs every node far
-     less to validate. <b>This is not a consensus change</b>: the same blocks are valid, so a
-     node can update whenever it likes. v0.3.0 changed consensus: a node older than that
-     cannot follow the current testnet chain, so if you are running v0.2.x or earlier, update
-     or you will simply stop syncing.</p>
-  <p class="note"><b>Already on v0.3.20?</b> This release touches the shared core library, so
-     all five binaries change — but nothing a wallet does changes; the speed-up is in how a
-     node validates blocks.</p>
+  <p><b>v0.3.22-testnet</b> — <b>the node, pool and wallet daemon now bound the HTTP request
+     head, closing an unauthenticated memory-exhaustion DoS.</b> The request body was capped,
+     but the request line and headers were read without limit — one connection streaming
+     bytes with no newline could make a server allocate hundreds of megabytes before its
+     timeout fired. The head is now capped at 64&nbsp;KiB and an over-long one is refused. The
+     exposed case is the <b>pool</b>, which faces the internet; the node RPC reads the head
+     before authenticating; the wallet daemon is localhost-only but holds the spend key.
+     <b>This is not a consensus change</b> — the same blocks are valid, so update whenever you
+     like. v0.3.0 changed consensus: a node older than that cannot follow the current testnet
+     chain, so if you are running v0.2.x or earlier, update or you will simply stop syncing.</p>
+  <p class="note"><b>Already on v0.3.21?</b> The fix is in the HTTP servers, so
+     <code>noctd</code>, <code>noct-poold</code> and <code>noct-walletd</code> change;
+     <code>noct-cli</code> and <code>noct-miner</code> are byte-identical to v0.3.21.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.21-testnet/Nocturnal-Wallet-Setup-0.3.21.exe">Nocturnal-Wallet-Setup-0.3.21.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/Nocturnal-Wallet-Setup-0.3.22.exe">Nocturnal-Wallet-Setup-0.3.22.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.21-testnet/nocturnal-v0.3.21-testnet-linux-x64.tar.gz">nocturnal-v0.3.21-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/nocturnal-v0.3.22-testnet-linux-x64.tar.gz">nocturnal-v0.3.22-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.21-testnet/nocturnal-v0.3.21-testnet-windows-x64.zip">nocturnal-v0.3.21-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/nocturnal-v0.3.22-testnet-windows-x64.zip">nocturnal-v0.3.22-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.21-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.21-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.22-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
