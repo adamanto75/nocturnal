@@ -49,6 +49,10 @@
 #             RandomX binaries. noct-cli and noct-walletd are pure Rust and do
 #             not depend on it.
 #   Also      cmake, for RandomX
+#   tar/gzip  GNU tar 1.35, gzip 1.13 — only for the ARCHIVE (package-dist.sh),
+#             not the binaries. The archive is reproducible, but a tar or gzip of
+#             a different version can lay the same files out differently, so they
+#             are part of the input too. Trixie ships these.
 set -euo pipefail
 
 TAG="${1:?usage: reproducible-build.sh <git-tag>   e.g. v0.1.3-testnet}"
@@ -82,12 +86,14 @@ cd target/release
 strip noctd noct-cli noct-miner noct-walletd noct-poold 2>/dev/null || true
 
 echo
-echo "Built from $TAG. Compare these against the release's SHA256SUMS.txt:"
+echo "Built from $TAG. Compare these against the release's LINUX-BINARY-SHA256SUMS.txt:"
 echo
 sha256sum noctd noct-cli noct-miner noct-walletd noct-poold
 echo
-echo "The release ships a tar.gz, not loose binaries, so its published hash covers"
-echo "the archive. Extract the release archive and compare file-by-file against"
-echo "the hashes above — archive metadata (timestamps, ordering) is not yet"
-echo "reproducible, so the ARCHIVE hash is expected to differ. The binaries are"
-echo "what matter, and they are what this compares."
+echo "The release ships a tar.gz. Its binaries are the ones hashed above; the"
+echo "ARCHIVE itself is reproducible too — from the noct source root, run"
+echo "  deploy/package-dist.sh $TAG target/release"
+echo "and its sha256 matches the tar.gz line in the release's SHA256SUMS.txt, as"
+echo "long as your GNU tar and gzip match the build environment (they are part of"
+echo "the input the same way the C toolchain is). So you can check the published"
+echo "archive hash directly, not only the files inside it."
