@@ -26,7 +26,7 @@ use noct_core::pow::ProofOfWork;
 use noct_core::tx::Transaction;
 use rand_core::OsRng;
 
-use store::{AsyncStore, BlockStore};
+use store::{AsyncStore, BlockReader, BlockStore};
 use transport::Peers;
 
 pub mod miner;
@@ -288,6 +288,15 @@ pub fn run(config: Config) -> std::io::Result<()> {
             node.rewrite_store();
         }
         eprintln!("persisting blocks to {}", path.display());
+        // Turn on body pruning and serve old bodies from the log. Opened after
+        // any rewrite above, so the reader indexes the final file. If it cannot
+        // be opened the node simply keeps the full chain in memory (as before).
+        match BlockReader::open(&path) {
+            Ok(reader) => node.attach_reader(reader),
+            Err(e) => eprintln!(
+                "WARNING: cannot open the block log for reads ({e}); keeping the full chain in memory"
+            ),
+        }
     }
 
     let state = Arc::new(Mutex::new(node));
@@ -814,6 +823,10 @@ pub struct NodeState {
     /// On-disk block log (writes happen off-thread); when present, every accepted
     /// block is queued for persistence.
     store: Option<AsyncStore>,
+    /// Random-access reader over the same block log. Present exactly when body
+    /// pruning is on: it serves the bodies of blocks the chain has dropped from
+    /// memory (see [`Self::block_for_height`]).
+    reader: Option<BlockReader>,
     /// Per-peer branch downloads in flight (fork resolution).
     sync: HashMap<usize, Collect>,
     /// Live-tunable mining state, shared with the miner threads and RPC.
@@ -877,6 +890,7 @@ impl NodeState {
             peer_claims: std::collections::HashMap::new(),
             collect_attempt_best: HashMap::new(),
             store: None,
+            reader: None,
             sync: HashMap::new(),
             shielded_coinbase: None,
             mining: MiningControl::new(false, 1),
@@ -893,6 +907,30 @@ impl NodeState {
     /// existing log, so replayed blocks are not written back.
     pub fn attach_store(&mut self, store: AsyncStore) {
         self.store = Some(store);
+    }
+
+    /// Attach the random-access reader for the on-disk log and turn on body
+    /// pruning, so the chain keeps only recent block bodies in memory while this
+    /// reader serves older ones. Call *after* `attach_store` and after any
+    /// startup rewrite, so the reader indexes the final log.
+    pub fn attach_reader(&mut self, reader: BlockReader) {
+        self.reader = Some(reader);
+        self.chain.enable_body_pruning();
+    }
+
+    /// The full block at `height` — from memory when its body is still kept, or
+    /// from the on-disk log when pruning has dropped it.
+    ///
+    /// `None` if the chain has no such height, or if the body was pruned and
+    /// cannot be read back (no reader, or a read error): serving a block without
+    /// its transactions would be serving an invalid block, so we serve nothing
+    /// and let the peer ask elsewhere.
+    pub(crate) fn block_for_height(&self, height: u64) -> Option<(Block, Vec<Transaction>)> {
+        let stored = self.chain.block_at(height)?;
+        if !stored.body_pruned() {
+            return Some((stored.block.clone(), stored.txs.clone()));
+        }
+        self.reader.as_ref()?.read_at(height).ok().flatten()
     }
 
     /// Replay previously-stored blocks into the chain on startup. Each is fully
@@ -1273,9 +1311,10 @@ impl NodeState {
                     self.begin_branch_collection(peer, &mut out);
                 }
             }
-            // A peer wants a historical block; serve it if we have it.
-            Wire::GetBlock(height) => match self.chain.block_at(height) {
-                Some(stored) => out.reply.push(Wire::Block(stored.block.clone(), stored.txs.clone())),
+            // A peer wants a historical block; serve it if we have it — from
+            // memory, or from the on-disk log if its body was pruned.
+            Wire::GetBlock(height) => match self.block_for_height(height) {
+                Some((block, txs)) => out.reply.push(Wire::Block(block, txs)),
                 None => out.reply.push(Wire::NoBlock(height)),
             },
             Wire::NoBlock(_) => {}
@@ -1603,30 +1642,57 @@ impl NodeState {
     // Rebuild the on-disk log from the canonical chain (after a reorg). Queued to
     // the background writer, so it does not block consensus.
     fn rewrite_store(&mut self) {
-        if let Some(store) = &self.store {
-            // SKIP GENESIS. `Blockchain` keeps genesis as `blocks()[0]`, but a
-            // replaying node already has it: `Blockchain::new` applies genesis
-            // before a single stored block is read.
-            //
-            // Storing it meant replay called `add_block(genesis)` against a
-            // chain whose tip already *was* genesis. Genesis's prev_id is all
-            // zeros, which never matches that tip, so the very first stored
-            // block failed BadPrevId and replay discarded **everything after
-            // it** — the whole chain, on every start.
-            //
-            // The append path never wrote genesis, so a store built only by
-            // appends replayed fine. That is why this stayed hidden: a node was
-            // healthy until its first reorg triggered a rewrite, and poisoned
-            // from then on. It cost this testnet thousands of blocks across
-            // several restarts before the cause was found.
-            let blocks: Vec<_> = self
-                .chain
-                .blocks()
-                .iter()
-                .skip(1)
-                .map(|s| (s.block.clone(), s.txs.clone()))
-                .collect();
-            store.rewrite(blocks);
+        if self.store.is_none() {
+            return;
+        }
+        // Gather the full canonical chain's bodies, then write it. SKIP GENESIS:
+        // `Blockchain` keeps genesis as `blocks()[0]`, but a replaying node
+        // already has it (`Blockchain::new` applies genesis before any stored
+        // block is read). Storing it made replay call `add_block(genesis)`
+        // against a tip that already *was* genesis; its all-zero prev_id never
+        // matched, the first stored block failed BadPrevId, and replay discarded
+        // everything after it — healthy until the first reorg's rewrite, poisoned
+        // after. It cost this testnet thousands of blocks before it was found.
+        //
+        // With body pruning on, old blocks have no body in memory — read it back
+        // from the log we are about to replace. That log holds the *old*
+        // canonical chain, whose deep prefix (everything below the reorg point)
+        // is the unchanged common history, so its bodies are exactly right; the
+        // recent blocks the reorg actually changed are still whole in memory.
+        let n = self.chain.blocks().len();
+        let mut blocks: Vec<(Block, Vec<Transaction>)> = Vec::with_capacity(n.saturating_sub(1));
+        for height in 1..n as u64 {
+            let stored = self.chain.block_at(height).expect("height below len exists");
+            if stored.body_pruned() {
+                match self.reader.as_ref().and_then(|r| r.read_at(height).ok().flatten()) {
+                    Some(full) => blocks.push(full),
+                    None => {
+                        // Better to leave the old log than write one missing
+                        // bodies, which replay would reject and truncate on.
+                        eprintln!(
+                            "WARNING: cannot rebuild block {height} to rewrite the log; \
+                             leaving the existing log in place"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                blocks.push((stored.block.clone(), stored.txs.clone()));
+            }
+        }
+        let path = self.store.as_ref().unwrap().path().to_path_buf();
+        self.store.as_ref().unwrap().rewrite(blocks);
+        // The log file was replaced, so the reader's handle and offsets are
+        // stale — re-open it against the new file. (Only when pruning is on, i.e.
+        // a reader is present; otherwise there is nothing to refresh.)
+        if self.reader.is_some() {
+            match BlockReader::open(&path) {
+                Ok(r) => self.reader = Some(r),
+                Err(e) => eprintln!(
+                    "WARNING: could not re-open the block log for reads after a rewrite ({e}); \
+                     history serving is degraded until restart"
+                ),
+            }
         }
     }
 
@@ -2663,6 +2729,138 @@ mod tests {
         assert_eq!(restored.height(), 7);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Mine a chain with body pruning on, carrying one real transaction, and
+    // bury that transaction well past the keep-recent window. Returns the node
+    // (store + reader still attached), the buried tx's hash, the index of the
+    // tx-bearing block, and the final chain height. Shared by the two pruning
+    // tests below.
+    fn pruned_chain_with_a_buried_tx(
+        path: &std::path::Path,
+    ) -> (NodeState, [u8; 32], u64, u64) {
+        // The node mines to `view`, so that wallet owns the coinbases it spends.
+        let mut view = wallet();
+        let mut node = test_node(view.address());
+        node.attach_store(store::AsyncStore::open(path).unwrap());
+        // attach_reader turns body pruning on.
+        node.attach_reader(store::BlockReader::open(path).unwrap());
+
+        // A base of mature coinbases, then one block that carries a spend — the
+        // only thing pruning ever drops (coinbase-only blocks keep empty bodies).
+        mine_n(&mut node, &mut view, 16);
+        let bob = wallet();
+        let spendable = view.unspent().next().cloned().unwrap();
+        let fee = noct_core::emission::ATOMIC_UNITS / 100;
+        let tx = view
+            .build_transaction(
+                &mut OsRng,
+                &node.chain,
+                &[noct_core::tx::Payment {
+                    destination: bob.address(),
+                    amount: spendable.amount() - fee,
+                }],
+                fee,
+                DEFAULT_RING_SIZE,
+            )
+            .unwrap();
+        let spend_hash = tx.hash();
+        let (_, outcome) = node.originate_tx_reported(&mut OsRng, tx, false);
+        assert!(outcome.accepted(), "the spend should pool");
+        mine_n(&mut node, &mut view, 1); // the block carrying the spend
+        let spend_idx = node.height() - 1; // its index == coinbase height
+
+        // Bury it beyond the keep-recent window so its body is pruned from memory.
+        mine_n(&mut node, &mut view, noct_core::chain::KEEP_RECENT_BODIES as usize + 8);
+        let height = node.height();
+
+        // In memory the buried block has lost its body...
+        let stored = node.chain.block_at(spend_idx).expect("the spend block exists");
+        assert!(stored.body_pruned(), "the buried tx-bearing block should be pruned in memory");
+        (node, spend_hash, spend_idx, height)
+    }
+
+    /// Body pruning must not corrupt the on-disk log. With pruning on the chain
+    /// drops buried block *bodies* from memory, but the log must still hold every
+    /// block whole — otherwise a restart replays a bodies-less block, it fails
+    /// validation, and the chain truncates. (That failure mode, from an unrelated
+    /// bug, once cost this testnet ~2,750 blocks.)
+    #[test]
+    fn a_pruned_chain_still_persists_a_fully_replayable_log() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("noct-prune-replay-{nanos}.dat"));
+
+        let (height, tip, spend_hash) = {
+            let (node, spend_hash, _spend_idx, height) = pruned_chain_with_a_buried_tx(&path);
+            let tip = node.tip_id();
+            (height, tip, spend_hash)
+            // `node` (and its AsyncStore) drops here, flushing the log to disk.
+        };
+
+        // The log kept the buried block whole, bodies and all.
+        let stored = store::BlockStore::load_all(&path).unwrap();
+        assert!(
+            stored.iter().any(|(_, txs)| txs.iter().any(|t| t.hash() == spend_hash)),
+            "the persisted log must still hold the pruned block's transaction"
+        );
+
+        // And replaying it rebuilds the identical chain — no truncation. (The
+        // restored node only replays, so its miner address is immaterial.)
+        let mut restored = test_node(wallet().address());
+        let restored_height = restored.replay(&mut OsRng, stored).unwrap();
+        assert_eq!(restored_height, height, "the pruned log replays to the same height");
+        assert_eq!(restored.tip_id(), tip, "and the same tip");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A reorg rewrites the log from the canonical chain. Under pruning the buried
+    /// blocks have no body in memory, so `rewrite_store` must read them back from
+    /// the old log (its deep prefix is unchanged common history). If it instead
+    /// wrote bodies-less blocks, the next replay would reject one and truncate —
+    /// so the rewritten log must still be whole and replayable.
+    #[test]
+    fn a_rewrite_under_pruning_keeps_buried_bodies_from_the_log() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("noct-prune-rewrite-{nanos}.dat"));
+
+        let (mut node, spend_hash, spend_idx, height) = pruned_chain_with_a_buried_tx(&path);
+
+        // Flush the queued appends deterministically by dropping and re-opening
+        // the store + reader in place, so the reader sees the whole log on disk.
+        let p = node.store.as_ref().unwrap().path().to_path_buf();
+        let _ = node.store.take(); // drop joins the writer thread -> all appends land
+        node.attach_store(store::AsyncStore::open(&p).unwrap());
+        node.attach_reader(store::BlockReader::open(&p).unwrap());
+
+        // The buried body now reads back from the log through the reader.
+        let served = node.block_for_height(spend_idx).expect("served from the reader");
+        assert!(
+            served.1.iter().any(|t| t.hash() == spend_hash),
+            "block_for_height must serve the pruned block whole from the log"
+        );
+
+        // Rewrite the log from the canonical chain (what a reorg does).
+        node.rewrite_store();
+
+        // The rewritten log is still whole: the pruned body survived the rewrite...
+        let stored = store::BlockStore::load_all(&p).unwrap();
+        assert!(
+            stored.iter().any(|(_, txs)| txs.iter().any(|t| t.hash() == spend_hash)),
+            "rewrite must keep the pruned block's body (read back from the old log)"
+        );
+        // ...and the whole thing still replays to the same height.
+        let mut restored = test_node(wallet().address());
+        let restored_height = restored.replay(&mut OsRng, stored).unwrap();
+        assert_eq!(restored_height, height, "the rewritten log replays to the same height");
+
+        let _ = std::fs::remove_file(&p);
     }
 
     // Drive messages between two nodes until nothing more is in flight.

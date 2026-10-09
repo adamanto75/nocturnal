@@ -15,9 +15,10 @@
 //! check, so it is deliberately not done here.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use noct_core::block::Block;
@@ -144,6 +145,120 @@ impl BlockStore {
     }
 }
 
+/// Random-access reader over a block log, by height.
+///
+/// Serving an old block to a syncing peer should not require the whole chain in
+/// memory — the body is on disk already. This keeps a height→offset index, built
+/// by scanning only the length prefixes (it never decodes a frame it was not
+/// asked for), and reads one frame on demand. The index is extended lazily as the
+/// log grows, so a reader opened at startup keeps serving blocks appended since.
+/// A torn or still-being-written trailing frame is left unindexed, exactly as
+/// [`BlockStore::load_all`] discards it — and a buried block (the only kind this
+/// serves) is never the trailing frame, so that race is harmless.
+///
+/// Frame `i` is block height `i + 1`: genesis (height 0) is not stored.
+///
+/// State is behind a `Mutex` so reads are `&self`: the node serves old blocks
+/// from read paths that only hold a shared reference to its state, and a read is
+/// rare (it happens only for a block buried past the in-memory window), so the
+/// lock is never contended on a hot path.
+pub struct BlockReader {
+    inner: Mutex<ReaderInner>,
+}
+
+struct ReaderInner {
+    file: File,
+    offsets: Vec<u64>,
+    /// Byte position scanning reached, so the index extends without rescanning.
+    scanned_to: u64,
+}
+
+impl ReaderInner {
+    /// Record the offset of each complete frame from where scanning left off.
+    /// Stops at EOF or a short trailing frame, which is left unindexed.
+    fn extend_index(&mut self) -> io::Result<()> {
+        let end = self.file.seek(SeekFrom::End(0))?;
+        let mut pos = self.scanned_to;
+        while pos + 4 <= end {
+            self.file.seek(SeekFrom::Start(pos))?;
+            let mut lenb = [0u8; 4];
+            if self.file.read_exact(&mut lenb).is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(lenb) as u64;
+            if len > MAX_FRAME_BYTES as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupt frame length {len} in block log"),
+                ));
+            }
+            let frame_end = pos + 4 + len;
+            if frame_end > end {
+                break; // torn or still-being-written trailing frame
+            }
+            self.offsets.push(pos);
+            pos = frame_end;
+        }
+        self.scanned_to = pos;
+        Ok(())
+    }
+
+    fn read_at(&mut self, height: u64) -> io::Result<Option<(Block, Vec<Transaction>)>> {
+        if height == 0 {
+            return Ok(None);
+        }
+        let idx = (height - 1) as usize;
+        if idx >= self.offsets.len() {
+            // It may have been appended since the last scan.
+            self.extend_index()?;
+            if idx >= self.offsets.len() {
+                return Ok(None);
+            }
+        }
+        self.file.seek(SeekFrom::Start(self.offsets[idx]))?;
+        let mut lenb = [0u8; 4];
+        self.file.read_exact(&mut lenb)?;
+        let len = u32::from_le_bytes(lenb) as usize;
+        if len > MAX_FRAME_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt frame length in block log"));
+        }
+        let mut frame = vec![0u8; len];
+        self.file.read_exact(&mut frame)?;
+        match wire::decode_message(&frame) {
+            Ok(Wire::Block(b, txs)) => Ok(Some((b, txs))),
+            Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected message in block log")),
+            Err(e) => {
+                Err(io::Error::new(io::ErrorKind::InvalidData, format!("malformed block in log ({e:?})")))
+            }
+        }
+    }
+}
+
+impl BlockReader {
+    /// Open the log at `path` for reading and index what is already there.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let mut inner = ReaderInner { file, offsets: Vec::new(), scanned_to: 0 };
+        inner.extend_index()?;
+        Ok(BlockReader { inner: Mutex::new(inner) })
+    }
+
+    /// Read the block at `height` (≥ 1), or `None` if the log does not hold it.
+    /// Genesis (height 0) is never stored, so it returns `None`.
+    pub fn read_at(&self, height: u64) -> io::Result<Option<(Block, Vec<Transaction>)>> {
+        self.inner.lock().unwrap().read_at(height)
+    }
+
+    /// How many blocks the index currently covers (heights `1..=len`).
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().offsets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().offsets.is_empty()
+    }
+}
+
 /// Command sent to the background writer.
 enum StoreCmd {
     Append(Block, Vec<Transaction>),
@@ -166,11 +281,13 @@ enum StoreCmd {
 pub struct AsyncStore {
     tx: Option<Sender<StoreCmd>>,
     handle: Option<JoinHandle<()>>,
+    path: PathBuf,
 }
 
 impl AsyncStore {
     /// Open the log at `path` and spawn its writer thread.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let log_path = path.as_ref().to_path_buf();
         let mut store = BlockStore::open(path)?;
         let (tx, rx) = mpsc::channel::<StoreCmd>();
         let handle = std::thread::spawn(move || {
@@ -193,7 +310,12 @@ impl AsyncStore {
                 }
             }
         });
-        Ok(AsyncStore { tx: Some(tx), handle: Some(handle) })
+        Ok(AsyncStore { tx: Some(tx), handle: Some(handle), path: log_path })
+    }
+
+    /// The log's path, so a reader can be re-opened against it after a rewrite.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Queue a block to be appended (returns immediately).
@@ -327,6 +449,55 @@ mod tests {
         let loaded = BlockStore::load_all(&path).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0.id(), blocks[0].0.id());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reader_reads_blocks_by_height() {
+        let path = temp_path("reader");
+        let blocks = mined(5);
+        {
+            let mut store = BlockStore::open(&path).unwrap();
+            for (b, txs) in &blocks {
+                store.append(b, txs).unwrap();
+            }
+        }
+        let reader = BlockReader::open(&path).unwrap();
+        assert_eq!(reader.len(), 5);
+        assert!(reader.read_at(0).unwrap().is_none(), "genesis is not stored");
+        for (i, (b, _)) in blocks.iter().enumerate() {
+            let h = i as u64 + 1;
+            let (got, _) = reader.read_at(h).unwrap().expect("block present");
+            assert_eq!(got.id(), b.id(), "height {h}");
+            assert_eq!(got.coinbase.height, h);
+        }
+        assert!(reader.read_at(6).unwrap().is_none(), "beyond the log");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reader_extends_its_index_as_the_log_grows() {
+        let path = temp_path("reader-grow");
+        let blocks = mined(4);
+        {
+            let mut store = BlockStore::open(&path).unwrap();
+            for (b, txs) in &blocks[..2] {
+                store.append(b, txs).unwrap();
+            }
+        }
+        let reader = BlockReader::open(&path).unwrap();
+        assert_eq!(reader.len(), 2);
+        assert!(reader.read_at(3).unwrap().is_none(), "not appended yet");
+        {
+            let mut store = BlockStore::open(&path).unwrap();
+            for (b, txs) in &blocks[2..] {
+                store.append(b, txs).unwrap();
+            }
+        }
+        // The reader learns the frames appended since it was opened.
+        let (got, _) = reader.read_at(4).unwrap().expect("now present");
+        assert_eq!(got.id(), blocks[3].0.id());
+        assert_eq!(reader.len(), 4);
         let _ = std::fs::remove_file(&path);
     }
 }

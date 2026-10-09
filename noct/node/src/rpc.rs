@@ -537,9 +537,10 @@ fn handle_client(
                 Err(_) => return respond(reader.get_mut(), "400 Bad Request", "{\"error\":\"bad height\"}"),
             };
             let node = state.lock().unwrap();
-            match node.chain.block_at(height) {
-                Some(stored) => {
-                    let msg = Wire::Block(stored.block.clone(), stored.txs.clone());
+            // From memory, or from the on-disk log if the body was pruned.
+            match node.block_for_height(height) {
+                Some((block, txs)) => {
+                    let msg = Wire::Block(block, txs);
                     let data = hex::encode(wire::encode_message(&msg));
                     drop(node);
                     respond(

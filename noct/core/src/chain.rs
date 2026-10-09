@@ -120,6 +120,17 @@ pub const GAMMA_SCALE: f64 = 1.0 / GAMMA_RATE;
 /// half hours at a two-minute target, against Bitcoin's sixteen.
 pub const COINBASE_MATURITY: u64 = 100;
 
+/// How many of the most recent blocks keep their full transaction bodies in
+/// memory when body pruning is on (see [`Blockchain::enable_body_pruning`]).
+///
+/// It **must be ≥ the deepest reorg the node will perform** (`MAX_REORG_DEPTH`,
+/// 100, in `noct-node`), because a reorg rolls bodies back and returns their
+/// transactions to the mempool. Set above it, with margin, and pinned against
+/// [`COINBASE_MATURITY`] (which is itself `≥ MAX_REORG_DEPTH`, by the invariant
+/// in §13.1) so the relationship cannot silently regress. Everything older is
+/// served from the on-disk block log instead of memory.
+pub const KEEP_RECENT_BODIES: u64 = 128;
+
 /// Errors from validating a block against the chain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChainError {
@@ -187,6 +198,19 @@ pub struct StoredBlock {
     pub txs: Vec<Transaction>,
 }
 
+impl StoredBlock {
+    /// True when the transaction bodies were dropped by body pruning but the
+    /// block carried transactions (its header still lists their hashes). The
+    /// caller must fetch the bodies from the on-disk log to serve this block.
+    ///
+    /// A genuinely transaction-less block (a coinbase-only block) has no tx
+    /// hashes either, so it is *not* reported as pruned — there is nothing to
+    /// fetch, and it can be served as it stands.
+    pub fn body_pruned(&self) -> bool {
+        self.txs.is_empty() && !self.block.tx_hashes.is_empty()
+    }
+}
+
 /// What a block changed, so it can be undone during a reorg. The key images and
 /// output *contents* are re-derivable from the stored block itself; only these
 /// two scalars cannot be recovered after the fact (`emitted` is not invertible
@@ -250,6 +274,13 @@ pub struct Blockchain<P: ProofOfWork> {
     /// [`COINBASE_MATURITY`] in production; tests may lower it via
     /// [`Blockchain::with_maturity`] so they need not mine 60 warm-up blocks.
     maturity: u64,
+    /// When set, the decoded transactions of blocks buried deeper than
+    /// [`KEEP_RECENT_BODIES`] are dropped from memory (their `block` header and
+    /// tx-hash list stay). A node enables this once it has a disk log to serve
+    /// those bodies from; off by default, so a wallet or a disk-less/test chain
+    /// keeps every body in memory exactly as before. See [`Self::block_at`] and
+    /// [`StoredBlock::body_pruned`].
+    prune_bodies: bool,
 }
 
 /// Per-output data the chain needs beyond the `[P, C]` ring member itself:
@@ -328,6 +359,7 @@ impl<P: ProofOfWork> Blockchain<P> {
             emitted: 0,
             shielded: ShieldedState::new(),
             maturity,
+            prune_bodies: false,
         };
         chain.apply_genesis();
         chain
@@ -655,7 +687,35 @@ impl<P: ProofOfWork> Blockchain<P> {
         self.block_ids.push(block.id());
         self.timestamps.push(block.header.timestamp);
         self.cumulative_difficulties.push(self.cumulative_difficulty() + difficulty as u128);
+
+        // Body pruning: the single block that just fell outside the recent
+        // window no longer needs its transactions in memory. A reorg cannot
+        // reach it (`KEEP_RECENT_BODIES >= MAX_REORG_DEPTH`) and anything older
+        // is served from the on-disk log; the header and tx-hash list stay.
+        if self.prune_bodies {
+            if let Some(i) = self.blocks.len().checked_sub(1 + KEEP_RECENT_BODIES as usize) {
+                self.blocks[i].txs = Vec::new();
+            }
+        }
         Ok(())
+    }
+
+    /// Drop the transaction bodies of blocks buried deeper than
+    /// [`KEEP_RECENT_BODIES`], and keep doing so as the chain grows, so resident
+    /// memory tracks the validation state rather than the whole chain. A node
+    /// turns this on once it has a disk log (`blocks.dat`) to serve old bodies
+    /// from; a wallet or test chain leaves it off and keeps every body.
+    ///
+    /// Enabling sweeps the existing blocks once, so turning it on part-way
+    /// through a chain (e.g. right before replaying a stored log) bounds memory
+    /// immediately rather than only for blocks added afterwards.
+    pub fn enable_body_pruning(&mut self) {
+        self.prune_bodies = true;
+        if let Some(keep_from) = self.blocks.len().checked_sub(KEEP_RECENT_BODIES as usize) {
+            for b in &mut self.blocks[..keep_from] {
+                b.txs = Vec::new();
+            }
+        }
     }
 
     fn push_output(&mut self, member: RingMember, height: u64, coinbase: bool) {
@@ -1433,6 +1493,9 @@ impl<P: ProofOfWork> Blockchain<P> {
             emitted: state.emitted,
             shielded,
             maturity: state.maturity,
+            // No bodies are kept here (blocks is empty), so there is nothing to
+            // prune; the flag is immaterial for a forward-only validation chain.
+            prune_bodies: false,
         })
     }
 }
@@ -1716,7 +1779,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// With body pruning on, a transaction-carrying block has its bodies dropped
+    /// once buried past the window, while recent blocks keep theirs and the chain
+    /// stays valid. `block_at` still returns the pruned block (header intact), so
+    /// the node can tell it apart and fetch the bodies from disk.
     #[test]
+    fn body_pruning_drops_buried_bodies_keeps_recent_and_the_chain() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        chain.enable_body_pruning();
+        let miner = Account::random(&mut OsRng);
+        let (received, cb_index) = mine_coinbase(&mut chain, &miner, 1_000);
+        warm_up(&mut chain, 15, 1_100);
+
+        // A block carrying a real transaction.
+        let bob = Account::random(&mut OsRng);
+        let fee = ATOMIC_UNITS / 100;
+        let tx = build_spend(
+            &chain,
+            &received,
+            cb_index,
+            vec![Payment { destination: address(&bob), amount: received.amount - fee }],
+            fee,
+        );
+        let (block, _) = make_block(&chain, &miner, std::slice::from_ref(&tx), 5_000);
+        chain.add_block(&mut OsRng, &block, std::slice::from_ref(&tx)).unwrap();
+        let tx_height = chain.height() - 1;
+
+        // While recent, the body is intact.
+        assert!(!chain.block_at(tx_height).unwrap().body_pruned(), "a recent tx block keeps its body");
+        assert_eq!(chain.block_at(tx_height).unwrap().txs.len(), 1);
+
+        // Bury it past the window.
+        warm_up(&mut chain, KEEP_RECENT_BODIES as usize + 3, 6_000);
+
+        let buried = chain.block_at(tx_height).expect("block_at still returns a buried block");
+        assert!(buried.body_pruned(), "a buried tx block has its body dropped");
+        assert!(buried.txs.is_empty(), "the decoded transactions are gone");
+        assert!(!buried.block.tx_hashes.is_empty(), "but the header still lists the transaction");
+
+        // A block inside the window is still whole, and the chain is intact.
+        let tip = chain.height() - 1;
+        assert!(chain.block_at(tip - 1).unwrap().txs.is_empty() || !chain.block_at(tip - 1).unwrap().body_pruned());
+        assert_eq!(
+            chain.shielded().totals().total().unwrap(),
+            chain.emitted(),
+            "the turnstile still holds after pruning"
+        );
+    }
+
+    /// Pruning must never reach a block a reorg could roll back: the window is
+    /// `KEEP_RECENT_BODIES`, which is `>= MAX_REORG_DEPTH`, so a rollback of up to
+    /// the maximum depth returns full bodies. Here, after pruning, rolling back
+    /// well within the window yields blocks whose transactions are present.
+    #[test]
+    fn a_rollback_within_the_window_keeps_full_bodies_after_pruning() {
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        chain.enable_body_pruning();
+        let miner = Account::random(&mut OsRng);
+        mine_coinbase(&mut chain, &miner, 1_000);
+        warm_up(&mut chain, KEEP_RECENT_BODIES as usize + 20, 1_100);
+
+        let before = chain.height();
+        // Roll back a chunk that is well within the window (<= MAX_REORG_DEPTH).
+        let depth = 50u64;
+        let discarded = chain.rollback_to(before - depth);
+        assert_eq!(discarded.len() as u64, depth, "rolled back the requested depth");
+        for d in &discarded {
+            // These are coinbase-only filler blocks, so no bodies to return, but
+            // crucially none was a pruned body masquerading as empty: a reorg
+            // never reaches a pruned height.
+            assert!(!d.body_pruned(), "a rolled-back block must have its real body");
+        }
+    }
     fn double_spend_is_rejected() {
         let mut chain = Blockchain::with_maturity(KeccakPow, 1);
         let miner = Account::random(&mut OsRng);
@@ -2376,6 +2510,11 @@ pub(crate) mod tests {
             pow: _,
             network: _,
             maturity: _,
+            // A mode flag, fixed once a node turns it on: it changes which old
+            // bodies are kept, never the validation state `pop_block` reverses,
+            // and pruning only ever touches blocks outside the reorg window. Not
+            // fingerprinted, for the same reason as the configuration above.
+            prune_bodies: _,
             // Everything below is mutable state that `add_block` writes and
             // `pop_block` must reverse exactly.
             blocks,
