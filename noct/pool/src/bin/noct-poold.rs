@@ -50,7 +50,7 @@
 //! still wants per-miner credentials so one miner cannot claim another's name.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
