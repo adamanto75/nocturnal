@@ -88,14 +88,19 @@ chain, so they must not move after launch.
   work: 6 (deep-partition resync is manual by design), 8 (atomic-swap crate ships
   in nothing). **Only two items still need action, both tracked above:** §16.4
   (ratify the address tag `0x13`, now locked by the published premine — §2; set
-  `GENESIS_TIMESTAMP` near launch — §5) and §16.11 (node holds the whole chain in
-  memory — the next item below).
-- [ ] **Node memory (§16.11).** Every block is kept in RAM with its decoded
-  transactions (~23 KB/block measured), so resident memory grows with chain
-  length; only the output set and spent-key-image set are strictly needed.
-  Interim mitigation is a raised memory cap on the fleet; the real fix is serving
-  blocks from the on-disk log. It sets node hardware requirements, so decide
-  before mainnet whether to fix it or document the requirement.
+  `GENESIS_TIMESTAMP` near launch — §5). §16.11 (node memory) is now fixed — see
+  the next item.
+- [x] **Node memory (§16.11) — fixed 2026-10-09 (`f7a77f5`).** Blocks were kept in
+  RAM with their decoded transactions (~23 KB/block measured), so resident memory
+  grew with chain length even though only the output set and spent-key-image set
+  are strictly needed. The node now **prunes buried block bodies** (keeping headers
+  and the most recent `KEEP_RECENT_BODIES = 128` whole, a window ≥ `MAX_REORG_DEPTH`)
+  and serves older blocks from the on-disk log via a random-access `BlockReader`;
+  coinbase-only blocks are never pruned, so the saving tracks transaction volume.
+  A reorg's log rewrite reads any pruned body back from the old log and aborts
+  rather than ever write a bodies-less block (which replay would truncate on).
+  Covered by core + node integration tests. **Still to deploy to the fleet** with a
+  future release cut, after which the interim raised memory cap can be reverted.
 - [ ] **Windows installer: code-signing and the reproducibility gap.** The
   installer is unsigned (SmartScreen warns) and not reproducible — acceptable on
   testnet, weaker for software people will hand real keys to. Decide whether to
