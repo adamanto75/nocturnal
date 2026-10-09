@@ -134,6 +134,22 @@ const COST_READ: u32 = 1;
 /// Generous for a real pool, fatal for a socket flood.
 const MAX_CONNECTIONS: usize = 512;
 
+/// Maximum simultaneous connections from a single source IP.
+///
+/// The total cap alone lets one address hold every slot and lock out every
+/// honest miner — the same shape the node's p2p layer fixed with a per-source
+/// cap. This bounds any one IP to a fraction of the pool while leaving room for
+/// a real miner, or a modest farm behind one NAT, to keep several short
+/// `Connection: close` requests in flight.
+///
+/// It is skipped for a `--trusted-proxy`: behind one, *every* connection arrives
+/// from the proxy's address, so capping per TCP-peer would cap the whole pool to
+/// this number. The real client is in `X-Forwarded-For`, which is not known
+/// until the request head has been read — too late for an accept-time decision —
+/// so a proxied pool leans on the proxy for per-client fairness and this guards
+/// only the directly-exposed case.
+const MAX_CONNECTIONS_PER_IP: usize = 32;
+
 /// How long a connection may sit without progress before it is dropped. Ample
 /// for a miner on a slow link submitting a share; short enough that an idle
 /// socket cannot squat on a connection slot indefinitely.
@@ -264,6 +280,62 @@ struct Shared {
     /// Payment is decided entirely by `pool.weights()`; this exists so someone
     /// running several rigs under one address can tell them apart.
     worker_work: HashMap<String, u128>,
+}
+
+/// A held connection slot. Dropping it releases the slot from the total count and
+/// from its source IP's count — by every exit path at once, so no error path can
+/// leak a slot and wedge the pool shut after [`MAX_CONNECTIONS`] failures.
+struct ConnSlot {
+    total: Arc<AtomicUsize>,
+    /// The per-IP entry to decrement, unless this connection was exempt from the
+    /// per-IP cap (a trusted proxy, or a peer whose address we could not read).
+    by_ip: Option<(Arc<Mutex<HashMap<IpAddr, usize>>>, IpAddr)>,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.total.fetch_sub(1, Ordering::Relaxed);
+        if let Some((map, ip)) = &self.by_ip {
+            let mut m = map.lock().unwrap();
+            if let Some(n) = m.get_mut(ip) {
+                *n -= 1;
+                if *n == 0 {
+                    // Prune, so the map stays bounded by the live connection
+                    // count rather than by every address ever seen.
+                    m.remove(ip);
+                }
+            }
+        }
+    }
+}
+
+/// Admit a connection against the total and per-IP caps, returning a slot that
+/// releases both when dropped, or `None` when a cap is reached. The per-IP cap is
+/// skipped for a trusted proxy (every connection would otherwise count as the
+/// proxy) and for a peer whose address could not be read.
+fn admit_connection(
+    total: &Arc<AtomicUsize>,
+    by_ip: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer_ip: Option<IpAddr>,
+    is_trusted_proxy: bool,
+) -> Option<ConnSlot> {
+    if total.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+        return None;
+    }
+    let slot_ip = match peer_ip {
+        Some(ip) if !is_trusted_proxy => {
+            let mut m = by_ip.lock().unwrap();
+            let n = m.entry(ip).or_insert(0);
+            if *n >= MAX_CONNECTIONS_PER_IP {
+                return None;
+            }
+            *n += 1;
+            Some(ip)
+        }
+        _ => None,
+    };
+    total.fetch_add(1, Ordering::Relaxed);
+    Some(ConnSlot { total: Arc::clone(total), by_ip: slot_ip.map(|ip| (Arc::clone(by_ip), ip)) })
 }
 
 fn main() {
@@ -613,18 +685,25 @@ fn main() {
     let listener = TcpListener::bind(&listen).unwrap_or_else(|e| fail(&format!("bind {listen}: {e}")));
     let limiter = Arc::new(RateLimiter::new(rate_limit));
     let live = Arc::new(AtomicUsize::new(0));
+    let by_ip: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let trusted_proxies = Arc::new(trusted_proxies);
     let miner_auth = Arc::new(miner_auth);
     for tcp in listener.incoming().flatten() {
-        // Refuse past the connection cap rather than spawning a thread we cannot
-        // afford. Done before any work — before the TLS handshake in particular,
-        // which is the most expensive thing an anonymous caller can make us do
-        // before it has said anything at all.
-        if live.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-            let mut s = Stream::Plain(tcp);
-            let _ = respond(&mut s, "503 Service Unavailable", "{\"error\":\"pool busy\"}");
-            continue;
-        }
+        // Refuse past the connection caps — total, and per source IP — rather
+        // than spawning a thread we cannot afford. Done before any work, before
+        // the TLS handshake in particular, which is the most expensive thing an
+        // anonymous caller can make us do before it has said anything at all. The
+        // returned slot releases both counts however the connection ends.
+        let peer_ip = tcp.peer_addr().ok().map(|a| a.ip());
+        let is_proxy = peer_ip.map(|ip| trusted_proxies.contains(&ip)).unwrap_or(false);
+        let slot = match admit_connection(&live, &by_ip, peer_ip, is_proxy) {
+            Some(s) => s,
+            None => {
+                let mut s = Stream::Plain(tcp);
+                let _ = respond(&mut s, "503 Service Unavailable", "{\"error\":\"pool busy\"}");
+                continue;
+            }
+        };
         // Bound how long a connection may sit without progress. The per-IP rate
         // limiter cannot substitute for this: it is consulted only after a full
         // request head has been read, so a client that opens a socket and never
@@ -635,7 +714,8 @@ fn main() {
 
         // A TLS session is created here but its handshake runs on the worker
         // thread, on first read: doing it inline would let one slow client stall
-        // every other connection waiting to be accepted.
+        // every other connection waiting to be accepted. (`slot` dropping on this
+        // `continue` releases the counts.)
         let stream = match &acceptor {
             Some(a) => match a.accept(tcp) {
                 Ok(s) => s,
@@ -643,21 +723,19 @@ fn main() {
             },
             None => Stream::Plain(tcp),
         };
-        live.fetch_add(1, Ordering::Relaxed);
 
         let shared = Arc::clone(&shared);
         let node = node.clone();
         let token = token.clone();
         let limiter = Arc::clone(&limiter);
-        let live_guard = Arc::clone(&live);
         let proxies = Arc::clone(&trusted_proxies);
         let miner_auth = Arc::clone(&miner_auth);
         let info = Arc::clone(&info);
         thread::spawn(move || {
+            // Held for the connection's life; its Drop releases the total and
+            // per-IP counts by every exit path, including a panic in `handle`.
+            let _slot = slot;
             let _ = handle(stream, shared, &node, &token, &limiter, &vardiff_params, &proxies, (*miner_auth).as_ref(), fee_bps, &info);
-            // Always released, including on an error path — a leak here would
-            // wedge the pool shut after MAX_CONNECTIONS failures.
-            live_guard.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -2020,6 +2098,83 @@ mod hardening_tests {
     fn the_connection_cap_is_finite_and_sane() {
         assert!(MAX_CONNECTIONS >= 128, "too small for a pool with real miners");
         assert!(MAX_CONNECTIONS <= 4096, "large enough to exhaust threads");
+        assert!(MAX_CONNECTIONS_PER_IP < MAX_CONNECTIONS, "a per-IP cap above the total is no cap");
+    }
+
+    fn caps() -> (Arc<AtomicUsize>, Arc<Mutex<HashMap<IpAddr, usize>>>) {
+        (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(HashMap::new())))
+    }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// One source IP is bounded to the per-IP cap, and the slots come back when
+    /// its connections close — a flooder cannot hold them past the drop.
+    #[test]
+    fn one_ip_is_capped_and_slots_free_on_drop() {
+        let (total, by_ip) = caps();
+        let a = ip("203.0.113.9");
+        let held: Vec<ConnSlot> = (0..MAX_CONNECTIONS_PER_IP)
+            .map(|_| admit_connection(&total, &by_ip, Some(a), false).expect("under the cap"))
+            .collect();
+        assert!(
+            admit_connection(&total, &by_ip, Some(a), false).is_none(),
+            "the {}th connection from one IP must be refused",
+            MAX_CONNECTIONS_PER_IP + 1
+        );
+        drop(held);
+        // Every slot — and the pruned map entry — is back.
+        assert!(by_ip.lock().unwrap().is_empty(), "closing all of an IP's connections prunes it");
+        assert!(admit_connection(&total, &by_ip, Some(a), false).is_some(), "room after they close");
+    }
+
+    /// A flood from one IP must not shut other IPs out: the per-IP cap leaves the
+    /// rest of the pool for everyone else.
+    #[test]
+    fn a_flood_from_one_ip_leaves_room_for_others() {
+        let (total, by_ip) = caps();
+        let flooder = ip("203.0.113.7");
+        let _flood: Vec<ConnSlot> = (0..MAX_CONNECTIONS_PER_IP)
+            .map(|_| admit_connection(&total, &by_ip, Some(flooder), false).unwrap())
+            .collect();
+        assert!(admit_connection(&total, &by_ip, Some(flooder), false).is_none(), "flooder is capped");
+        assert!(
+            admit_connection(&total, &by_ip, Some(ip("198.51.100.4")), false).is_some(),
+            "a different source still gets in while one IP floods"
+        );
+    }
+
+    /// A trusted proxy is exempt from the per-IP cap: behind one, every
+    /// connection is the proxy, so the cap would otherwise throttle the whole
+    /// pool. Only the total cap applies to it.
+    #[test]
+    fn a_trusted_proxy_is_exempt_from_the_per_ip_cap() {
+        let (total, by_ip) = caps();
+        let proxy = ip("10.10.10.81");
+        let held: Vec<ConnSlot> = (0..MAX_CONNECTIONS_PER_IP + 50)
+            .map(|_| admit_connection(&total, &by_ip, Some(proxy), true).expect("proxy is not per-IP capped"))
+            .collect();
+        assert_eq!(held.len(), MAX_CONNECTIONS_PER_IP + 50);
+        assert!(by_ip.lock().unwrap().is_empty(), "a proxy's connections are not tracked per-IP");
+    }
+
+    /// The total cap still bounds a distributed flood, even one spread across so
+    /// many IPs that no single per-IP cap ever trips.
+    #[test]
+    fn the_total_cap_bounds_a_distributed_flood() {
+        let (total, by_ip) = caps();
+        // One connection from each of MAX_CONNECTIONS distinct IPs exactly fills
+        // the total; none comes near the per-IP cap.
+        let _held: Vec<ConnSlot> = (0..MAX_CONNECTIONS)
+            .map(|i| {
+                let addr = ip(&format!("100.{}.{}.1", (i / 256) % 256, i % 256));
+                admit_connection(&total, &by_ip, Some(addr), false).expect("under the total")
+            })
+            .collect();
+        assert!(
+            admit_connection(&total, &by_ip, Some(ip("1.2.3.4")), false).is_none(),
+            "a fresh source is refused once the total is full"
+        );
     }
 }
 
