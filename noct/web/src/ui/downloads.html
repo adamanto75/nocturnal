@@ -17,26 +17,28 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.24-testnet</b> — <b>the mining pool now caps connections per source IP, so one
-     address cannot hold every slot and lock honest miners out.</b> The pool limited its total
-     connections but not how many any one source could hold; it now admits at most 32 at a
-     time from a single IP. The cap is skipped behind a <code>--trusted-proxy</code> (where
-     every connection is the proxy), so it guards a directly-exposed pool. <b>Only the pool
-     changed</b> — if you are not running one, there is nothing to update. <b>Not a consensus
-     change.</b> v0.3.0 changed consensus: a node older than that cannot follow the current
-     testnet chain, so if you are on v0.2.x or earlier, update or you will stop syncing.</p>
-  <p class="note"><b>Already on v0.3.23?</b> The fix is in <code>noct-poold</code> alone;
-     <code>noctd</code>, <code>noct-cli</code>, <code>noct-miner</code> and
-     <code>noct-walletd</code> are byte-identical to v0.3.23.</p>
+  <p><b>v0.3.25-testnet</b> — <b>a node no longer keeps the whole chain in memory.</b> Until
+     now <code>noctd</code> held every block, with its decoded transactions, in RAM for the
+     life of the process, so memory grew without limit as the chain did. It now keeps only
+     recent block bodies in memory and reads older ones back from the on-disk log when a peer
+     asks for them, while still holding the small state it needs to validate. Memory stops
+     tracking chain length. <b>If you run a node, update</b> — it is the fix that lets a node
+     stay up on a long chain. <b>Not a consensus change</b>: a pruning node and an older node
+     agree on every block, so nodes update independently. v0.3.0 changed consensus: a node
+     older than that cannot follow the current testnet chain, so if you are on v0.2.x or
+     earlier, update or you will stop syncing.</p>
+  <p class="note"><b>Already on v0.3.24?</b> The change is in <code>noctd</code> (and the
+     binaries that link it); <code>noct-cli</code> and <code>noct-walletd</code> are
+     unaffected.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.24-testnet/Nocturnal-Wallet-Setup-0.3.24.exe">Nocturnal-Wallet-Setup-0.3.24.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/Nocturnal-Wallet-Setup-0.3.25.exe">Nocturnal-Wallet-Setup-0.3.25.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.24-testnet/nocturnal-v0.3.24-testnet-linux-x64.tar.gz">nocturnal-v0.3.24-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/nocturnal-v0.3.25-testnet-linux-x64.tar.gz">nocturnal-v0.3.25-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.24-testnet/nocturnal-v0.3.24-testnet-windows-x64.zip">nocturnal-v0.3.24-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/nocturnal-v0.3.25-testnet-windows-x64.zip">nocturnal-v0.3.25-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.24-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.24-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
