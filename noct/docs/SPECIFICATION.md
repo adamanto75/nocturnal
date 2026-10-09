@@ -671,6 +671,13 @@ These are the gaps to close, or decisions to ratify, before mainnet. They are
 called out here so an audit covers them explicitly. Items marked **CLOSED** are
 recorded so a reviewer can check the resolution rather than rediscover the gap.
 
+**Status as of v0.3.24-testnet.** Closed: 1, 2, 3, 5, 9, 10. Reviewed/sound: 7.
+Accepted decisions, not work: 6 (deep-partition resync is manual by design), 8
+(the atomic-swap crate ships in nothing). Still requiring action before mainnet:
+**4** — ratify the address tag `0x13` (now locked by the published premine) and
+set `GENESIS_TIMESTAMP` near launch; and **11** — the node holds the whole chain
+in memory. See the companion [MAINNET-LAUNCH-CHECKLIST.md](MAINNET-LAUNCH-CHECKLIST.md).
+
 1. **CLOSED — coinbase maturity.** `COINBASE_MATURITY = 100` (§13.1), raised from
    60 so that it is never shallower than `MAX_REORG_DEPTH` (100). Below that
    depth a reorg between the two values could invalidate a coinbase that had
@@ -690,19 +697,24 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
    now states what each network needs and the node refuses to start otherwise.
    Mainnet has no override; `--allow-pow-mismatch` exists for local Keccak
    networks and is ignored on mainnet.
-4. **OPEN — two mainnet identity constants are still placeholders.** Both are
-   immutable once mainnet genesis exists.
-   * **Address tag** (`Network::tag`, mainnet `0x13`) — the source calls it an
-     "arbitrary, stable placeholder". It decides what every address *looks
-     like*: `0x13` is why the published premine address begins `C4do37…`, as
-     Monero's tag makes its addresses begin `4`.
+4. **OPEN at launch — two mainnet identity constants.** Both are immutable once
+   mainnet genesis exists, so they are settled *as* the launch, not before it.
+   * **Address tag** (`Network::tag`, mainnet `0x13`) — decides what every
+     address *looks like* (`0x13` is why the published premine address begins
+     `C4do37…`, as Monero's tag makes its begin `4`). No longer a free
+     placeholder: it is **already locked by the published premine address**, so
+     changing it now would change that address. The remaining action is to
+     **ratify `0x13` as final** — a founder/identity decision, not an engineering
+     one — and drop the "placeholder" wording in the source.
    * **Genesis timestamp** (`GENESIS_TIMESTAMP = 1_750_000_000`, ≈ 15 June 2025)
-     — a round number rather than a real date. Besides chain identity it feeds
-     the difficulty cold-start (item 7): a genesis far behind the first mined
-     block makes the first retarget window span that whole gap, collapsing
-     difficulty to `MIN_DIFFICULTY` and needing roughly twenty 2x steps to
-     recover — a window in which blocks are close to free. Setting genesis near
-     actual launch removes the problem rather than managing it.
+     — the one constant that must actually *change* at launch. Besides chain
+     identity it feeds the difficulty cold-start (item 7): a genesis far behind
+     the first mined block makes the first retarget window span that whole gap,
+     collapsing difficulty to `MIN_DIFFICULTY` and needing roughly twenty 2x
+     steps to recover — a window in which blocks are close to free. At ~16 months
+     behind today it *will* trigger. **Set `GENESIS_TIMESTAMP` near the actual
+     launch time** in the mainnet-enabling release; that removes the problem
+     rather than managing it.
 
    **Not a placeholder, despite earlier drafts of this section saying so: the
    RandomX seed.** Epoch seeds are chain-derived — `seed_for_height` returns the
@@ -713,8 +725,8 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
    The premine keys are likewise **not** placeholders: they are real, published,
    and pinned by a test that fails the build if the founder keys change without
    every published copy being updated.
-5. **PARTLY CLOSED — wallet state.**
-   * **Issued subaddresses are now remembered.** `Wallet::new` pre-derives a
+5. **CLOSED — wallet state.**
+   * **Issued subaddresses are remembered.** `Wallet::new` pre-derives a
      lookahead window of `SUBADDRESS_LOOKAHEAD` (200) on account 0 and nothing
      else, so anything outside it was known only to the wallet that issued it.
      A wallet rebuilt from the seed scanned without those keys registered and
@@ -726,14 +738,21 @@ recorded so a reviewer can check the resolution rather than rediscover the gap.
      everything up to its resumed counter, and both hand them to
      `Wallet::register_issued` before the first scan. A test pins the failure
      and the recovery.
-   * **OPEN — scan state is still not persisted.** The block *cache* means a
-     command no longer re-downloads the chain (an earlier draft of this section
-     claimed it did; that had not been true for some time), but the wallet still
-     re-derives every cached block on each run. That is O(chain) local work per
-     command: fine at testnet length, not at mainnet length. Persisting the
-     scanned state — owned outputs, spent flags, the subaddress map — is the
-     remaining half, and it needs care around reorgs: the wallet currently gets
-     its reorg safety from rebuilding, which persisted state would remove.
+   * **Scan state is now persisted** (`wallet/src/state.rs`, with the shielded
+     half in `wallet/src/shielded.rs`). A command no longer re-derives every
+     cached block: the wallet carries forward the validating `ChainState`, its
+     owned outputs (as the public data they were found with — nothing derived
+     from the spend key), spent flags, the subaddress map, and the Orchard
+     note/witness tree. Measured on the testnet bots this cut a run from ~386 s
+     to ~10.6 s. **Reorg safety is kept without the rebuild it used to rely on:**
+     the state file stores the chain state it was scanned against, every output
+     record is re-derived and re-opened against it on load (and the spent flag
+     checked), a checksum refuses accidental damage, and any mismatch — damaged
+     file, another build, another account/network, or a node that has
+     reorganised below the scanned tip (`node_must_still_have_our_chain`) — is
+     refused and the wallet rebuilds, which costs time and never correctness.
+     Nothing on disk can spend: the one-time spend secret and key image are
+     re-derived from the account on load, and the file is written owner-only.
 6. **OPEN by decision — deep-partition resync.** A node that diverges by more
    than `MAX_REORG_DEPTH` cannot rejoin by reorganising and must be resynced.
    Automatic recovery was considered and rejected: a node that discarded its

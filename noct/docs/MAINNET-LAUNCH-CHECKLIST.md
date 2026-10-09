@@ -80,12 +80,22 @@ chain, so they must not move after launch.
 
 ## 4. Should-fix before mainnet — trust & quality, not consensus
 
-- [ ] **Walk `SPECIFICATION.md §16` (pre-mainnet gaps) line by line** and mark
-  each closed or consciously accepted. Known-closed since §16 was written:
-  coinbase maturity, gamma decoys, real genesis/keys, the serai→monero-oxide
-  migration. Confirm the residuals (e.g. subaddress lookahead bound; whether a
-  Keccak-built `noctd` is adequately excluded — today it simply can't validate a
-  RandomX chain and rejects every block, which is implicit exclusion).
+- [x] **`SPECIFICATION.md §16` walked (2026-10-09).** Closed: 1 (coinbase
+  maturity), 2 (gamma decoys), 3 (PoW gating — `network_requires_randomx`, no
+  mainnet override, pinned by a test), 5 (wallet scan state now persisted in
+  `wallet/src/state.rs` with reorg-safe refuse-and-rebuild), 9 (min relay fee),
+  10 (accepted-not-kept). Reviewed/sound: 7 (difficulty). Accepted decisions, not
+  work: 6 (deep-partition resync is manual by design), 8 (atomic-swap crate ships
+  in nothing). **Only two items still need action, both tracked above:** §16.4
+  (ratify the address tag `0x13`, now locked by the published premine — §2; set
+  `GENESIS_TIMESTAMP` near launch — §5) and §16.11 (node holds the whole chain in
+  memory — the next item below).
+- [ ] **Node memory (§16.11).** Every block is kept in RAM with its decoded
+  transactions (~23 KB/block measured), so resident memory grows with chain
+  length; only the output set and spent-key-image set are strictly needed.
+  Interim mitigation is a raised memory cap on the fleet; the real fix is serving
+  blocks from the on-disk log. It sets node hardware requirements, so decide
+  before mainnet whether to fix it or document the requirement.
 - [ ] **Windows installer: code-signing and the reproducibility gap.** The
   installer is unsigned (SmartScreen warns) and not reproducible — acceptable on
   testnet, weaker for software people will hand real keys to. Decide whether to

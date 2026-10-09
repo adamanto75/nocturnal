@@ -32,7 +32,10 @@ impl Network {
     /// Tag for a standard (main) address on this network.
     pub fn tag(self) -> u8 {
         match self {
-            Network::Mainnet => 0x13, // arbitrary, stable placeholder
+            // Locked: the published premine address derives from 0x13, so this
+            // cannot change without changing that address. Final pending founder
+            // ratification of the mainnet address identity (SPECIFICATION §16.4).
+            Network::Mainnet => 0x13,
             Network::Testnet => 0x35,
         }
     }
