@@ -27,9 +27,10 @@
      agree on every block, so nodes update independently. v0.3.0 changed consensus: a node
      older than that cannot follow the current testnet chain, so if you are on v0.2.x or
      earlier, update or you will stop syncing.</p>
-  <p class="note"><b>Already on v0.3.24?</b> The change is in <code>noctd</code> (and the
-     binaries that link it); <code>noct-cli</code> and <code>noct-walletd</code> are
-     unaffected.</p>
+  <p class="note"><b>Already on v0.3.24?</b> <code>noctd</code> carries the fix.
+     <code>noct-poold</code>, <code>noct-cli</code> and <code>noct-walletd</code> were
+     rebuilt because they link the same libraries but behave identically, and
+     <code>noct-miner</code> is byte-identical to v0.3.24.</p>
   <ul>
     <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/Nocturnal-Wallet-Setup-0.3.25.exe">Nocturnal-Wallet-Setup-0.3.25.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
