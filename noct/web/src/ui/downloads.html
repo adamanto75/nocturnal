@@ -17,29 +17,26 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.25-testnet</b> — <b>a node no longer keeps the whole chain in memory.</b> Until
-     now <code>noctd</code> held every block, with its decoded transactions, in RAM for the
-     life of the process, so memory grew without limit as the chain did. It now keeps only
-     recent block bodies in memory and reads older ones back from the on-disk log when a peer
-     asks for them, while still holding the small state it needs to validate. Memory stops
-     tracking chain length. <b>If you run a node, update</b> — it is the fix that lets a node
-     stay up on a long chain. <b>Not a consensus change</b>: a pruning node and an older node
-     agree on every block, so nodes update independently. v0.3.0 changed consensus: a node
-     older than that cannot follow the current testnet chain, so if you are on v0.2.x or
-     earlier, update or you will stop syncing.</p>
-  <p class="note"><b>Already on v0.3.24?</b> <code>noctd</code> carries the fix.
-     <code>noct-poold</code>, <code>noct-cli</code> and <code>noct-walletd</code> were
-     rebuilt because they link the same libraries but behave identically, and
-     <code>noct-miner</code> is byte-identical to v0.3.24.</p>
+  <p><b>v0.3.26-testnet</b> — <b>a peer can no longer stall a node by asking for old blocks.</b>
+     The v0.3.25 memory fix reads a long-buried block back from disk when a peer requests it;
+     that read was happening while the node held its consensus lock, so a peer asking for many
+     scattered old blocks could freeze the node on disk I/O. Block requests are now served
+     without holding that lock, so consensus keeps running no matter what a peer asks for.
+     <b>If you run a node, update.</b> <b>Not a consensus change</b> — nodes update independently.
+     v0.3.0 changed consensus: a node older than that cannot follow the current testnet chain,
+     so if you are on v0.2.x or earlier, update or you will stop syncing.</p>
+  <p class="note"><b>Already on v0.3.25?</b> The fix is in <code>noctd</code> (and the binaries
+     that link it); <code>noct-cli</code> and <code>noct-walletd</code> are byte-identical to
+     v0.3.25.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/Nocturnal-Wallet-Setup-0.3.25.exe">Nocturnal-Wallet-Setup-0.3.25.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/Nocturnal-Wallet-Setup-0.3.26.exe">Nocturnal-Wallet-Setup-0.3.26.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/nocturnal-v0.3.25-testnet-linux-x64.tar.gz">nocturnal-v0.3.25-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/nocturnal-v0.3.26-testnet-linux-x64.tar.gz">nocturnal-v0.3.26-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/nocturnal-v0.3.25-testnet-windows-x64.zip">nocturnal-v0.3.25-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/nocturnal-v0.3.26-testnet-windows-x64.zip">nocturnal-v0.3.26-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.25-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
