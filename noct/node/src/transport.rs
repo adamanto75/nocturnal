@@ -33,7 +33,7 @@ use noct_core::p2p::Wire;
 use noct_core::wire;
 use rand_core::{OsRng, RngCore};
 
-use crate::{NodeState, Relay, BAN_DURATION, BAN_THRESHOLD};
+use crate::{GetBlockServe, NodeState, Relay, BAN_DURATION, BAN_THRESHOLD};
 
 /// A peer sending more than this many messages per second is treated as flooding
 /// and dropped + banned. Set generously: normal sync is request/response bounded
@@ -1410,6 +1410,26 @@ fn spawn_peer_reader(
                     // reaching us over a private link is about a network we can
                     // already reach.
                     disc.learn_gossip_from(peer_ip, addrs);
+                    continue;
+                }
+                Wire::GetBlock(height) => {
+                    // Serve a block request WITHOUT holding the consensus lock
+                    // across the disk read. The height is classified under a brief
+                    // lock (O(1), no I/O); a pruned body is then read from the log
+                    // off the lock, so a peer asking for scattered buried heights
+                    // cannot stall consensus on disk I/O. (This is the inbound
+                    // serve; `react` still generates GetBlock as sync *requests*.)
+                    let served = { state.lock().unwrap().serve_get_block(height) };
+                    let reply = match served {
+                        GetBlockServe::Reply(w) => w,
+                        GetBlockServe::FromDisk(reader, h) => reader
+                            .read_at(h)
+                            .ok()
+                            .flatten()
+                            .map(|(b, txs)| Wire::Block(b, txs))
+                            .unwrap_or(Wire::NoBlock(h)),
+                    };
+                    send_via(&writer, &reply);
                     continue;
                 }
                 _ => {}

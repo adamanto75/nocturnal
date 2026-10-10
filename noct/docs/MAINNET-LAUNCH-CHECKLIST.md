@@ -99,8 +99,9 @@ chain, so they must not move after launch.
   coinbase-only blocks are never pruned, so the saving tracks transaction volume.
   A reorg's log rewrite reads any pruned body back from the old log and aborts
   rather than ever write a bodies-less block (which replay would truncate on).
-  Covered by core + node integration tests. **Still to deploy to the fleet** with a
-  future release cut, after which the interim raised memory cap can be reverted.
+  Covered by core + node integration tests. **Shipped as v0.3.25-testnet
+  (2026-10-09) and rolled to all four fleet nodes**; the interim raised memory cap
+  on seed1 was reverted to the container limit afterward.
 - [ ] **Windows installer: code-signing and the reproducibility gap.** The
   installer is unsigned (SmartScreen warns) and not reproducible — acceptable on
   testnet, weaker for software people will hand real keys to. Decide whether to

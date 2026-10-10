@@ -758,6 +758,18 @@ pub struct Reaction {
     pub misbehavior: u32,
 }
 
+/// How to answer a peer's `GetBlock`, decided under the node lock but carried out
+/// (for the disk case) after it is released. See [`NodeState::serve_get_block`].
+pub(crate) enum GetBlockServe {
+    /// Send this reply as-is: an in-memory block, or `NoBlock` for a height we do
+    /// not have (or cannot serve).
+    Reply(Wire),
+    /// The body is pruned from memory; read it from the log with this reader
+    /// **without holding the node lock**, then reply `Block` (or `NoBlock` if the
+    /// read fails).
+    FromDisk(Arc<BlockReader>, u64),
+}
+
 /// All consensus state for one node. Guard with a `Mutex` when shared.
 pub struct NodeState {
     pub chain: Blockchain<NodePow>,
@@ -826,7 +838,7 @@ pub struct NodeState {
     /// Random-access reader over the same block log. Present exactly when body
     /// pruning is on: it serves the bodies of blocks the chain has dropped from
     /// memory (see [`Self::block_for_height`]).
-    reader: Option<BlockReader>,
+    reader: Option<Arc<BlockReader>>,
     /// Per-peer branch downloads in flight (fork resolution).
     sync: HashMap<usize, Collect>,
     /// Live-tunable mining state, shared with the miner threads and RPC.
@@ -914,7 +926,7 @@ impl NodeState {
     /// reader serves older ones. Call *after* `attach_store` and after any
     /// startup rewrite, so the reader indexes the final log.
     pub fn attach_reader(&mut self, reader: BlockReader) {
-        self.reader = Some(reader);
+        self.reader = Some(Arc::new(reader));
         self.chain.enable_body_pruning();
     }
 
@@ -925,12 +937,43 @@ impl NodeState {
     /// cannot be read back (no reader, or a read error): serving a block without
     /// its transactions would be serving an invalid block, so we serve nothing
     /// and let the peer ask elsewhere.
+    ///
+    /// This reads the disk **while the caller holds the node lock**, so it is for
+    /// the node's own paths (replay, the local RPC). A remote peer's `GetBlock` is
+    /// served through [`Self::serve_get_block`] instead, which keeps the disk read
+    /// off the consensus lock.
     pub(crate) fn block_for_height(&self, height: u64) -> Option<(Block, Vec<Transaction>)> {
         let stored = self.chain.block_at(height)?;
         if !stored.body_pruned() {
             return Some((stored.block.clone(), stored.txs.clone()));
         }
         self.reader.as_ref()?.read_at(height).ok().flatten()
+    }
+
+    /// Decide how to answer a peer's `GetBlock` **without touching the disk under
+    /// the node lock**.
+    ///
+    /// Classifying a height is O(1) and never reads the disk: the body is either
+    /// kept in memory (serve it straight away) or pruned (hand back a reader to
+    /// read it with *after* the lock is released). The disk read is the one part
+    /// that can block — a slow disk, a seek storm from a peer asking for scattered
+    /// buried heights — and the whole point of the async store is that such I/O
+    /// must never freeze consensus. The returned reader is the node's current one,
+    /// so a log rewritten by a reorg is picked up on the next call; reading a stale
+    /// handle for one buried block is safe, because buried blocks (below the
+    /// keep-window, which is ≥ the max reorg depth) are identical in the old and
+    /// new logs.
+    pub(crate) fn serve_get_block(&self, height: u64) -> GetBlockServe {
+        match self.chain.block_at(height) {
+            Some(stored) if !stored.body_pruned() => {
+                GetBlockServe::Reply(Wire::Block(stored.block.clone(), stored.txs.clone()))
+            }
+            Some(_) => match &self.reader {
+                Some(reader) => GetBlockServe::FromDisk(Arc::clone(reader), height),
+                None => GetBlockServe::Reply(Wire::NoBlock(height)),
+            },
+            None => GetBlockServe::Reply(Wire::NoBlock(height)),
+        }
     }
 
     /// Replay previously-stored blocks into the chain on startup. Each is fully
@@ -1687,7 +1730,7 @@ impl NodeState {
         // a reader is present; otherwise there is nothing to refresh.)
         if self.reader.is_some() {
             match BlockReader::open(&path) {
-                Ok(r) => self.reader = Some(r),
+                Ok(r) => self.reader = Some(Arc::new(r)),
                 Err(e) => eprintln!(
                     "WARNING: could not re-open the block log for reads after a rewrite ({e}); \
                      history serving is degraded until restart"
@@ -2861,6 +2904,64 @@ mod tests {
         assert_eq!(restored_height, height, "the rewritten log replays to the same height");
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// `serve_get_block` must classify a request without touching the disk: a
+    /// recent block is returned straight from memory, a pruned one hands back a
+    /// reader to read *after* the lock is dropped (never under it), and an absent
+    /// height is a plain `NoBlock`. This is what keeps a `GetBlock` flood for
+    /// scattered buried heights from stalling consensus on disk I/O.
+    #[test]
+    fn serve_get_block_keeps_the_disk_read_off_the_lock() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("noct-serve-{nanos}.dat"));
+
+        let (mut node, spend_hash, spend_idx, height) = pruned_chain_with_a_buried_tx(&path);
+
+        // A recent block's body is in memory → served directly, no reader handed out.
+        let tip_idx = node.height() - 1;
+        match node.serve_get_block(tip_idx) {
+            GetBlockServe::Reply(Wire::Block(b, _)) => {
+                assert_eq!(b.coinbase.height, tip_idx, "served the right in-memory block")
+            }
+            _ => panic!("a recent block must be served from memory, not the disk"),
+        }
+
+        // The buried, pruned block does NOT read under the lock: it hands back a
+        // reader (and the height to read) for an off-lock read.
+        match node.serve_get_block(spend_idx) {
+            GetBlockServe::FromDisk(_, h) => assert_eq!(h, spend_idx),
+            _ => panic!("a pruned block must defer to an off-lock disk read"),
+        }
+
+        // A height we do not have is a plain NoBlock.
+        match node.serve_get_block(height + 50) {
+            GetBlockServe::Reply(Wire::NoBlock(h)) => assert_eq!(h, height + 50),
+            _ => panic!("an absent height must answer NoBlock"),
+        }
+
+        // And the deferred read, once the log is flushed, really yields the block
+        // whole — the same bytes a peer would receive, read off the lock.
+        let p = node.store.as_ref().unwrap().path().to_path_buf();
+        let _ = node.store.take(); // drop joins the writer → all appends land
+        node.attach_store(store::AsyncStore::open(&p).unwrap());
+        node.attach_reader(store::BlockReader::open(&p).unwrap());
+        match node.serve_get_block(spend_idx) {
+            GetBlockServe::FromDisk(reader, h) => {
+                let (_, txs) = reader.read_at(h).unwrap().expect("the buried block reads back");
+                assert!(
+                    txs.iter().any(|t| t.hash() == spend_hash),
+                    "the off-lock read returns the block whole, transactions and all"
+                );
+            }
+            _ => panic!("still pruned, so still an off-lock read"),
+        }
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&path);
     }
 
     // Drive messages between two nodes until nothing more is in flight.
