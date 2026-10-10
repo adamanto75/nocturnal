@@ -64,8 +64,8 @@ chain, so they must not move after launch.
   genesis premine output. It printed the founder address + key image (no
   refusal), so the premine is addressed to, and spendable by, the held key. The
   private key stayed off-tree throughout (never entered the repo, a build host,
-  or a cloud-synced folder). Remaining human check is identity-only: the founder
-  confirms the printed address is the one they intend.
+  or a cloud-synced folder). The founder also confirmed the printed address
+  matches their own records — so the identity is the intended one. Fully closed.
 
 ## 3. Outstanding requirements — the whitepaper's own bar
 
