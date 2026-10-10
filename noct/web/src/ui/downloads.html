@@ -17,26 +17,26 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.26-testnet</b> — <b>a peer can no longer stall a node by asking for old blocks.</b>
-     The v0.3.25 memory fix reads a long-buried block back from disk when a peer requests it;
-     that read was happening while the node held its consensus lock, so a peer asking for many
-     scattered old blocks could freeze the node on disk I/O. Block requests are now served
-     without holding that lock, so consensus keeps running no matter what a peer asks for.
-     <b>If you run a node, update.</b> <b>Not a consensus change</b> — nodes update independently.
-     v0.3.0 changed consensus: a node older than that cannot follow the current testnet chain,
-     so if you are on v0.2.x or earlier, update or you will stop syncing.</p>
-  <p class="note"><b>Already on v0.3.25?</b> <code>noctd</code> carries the fix and
+  <p><b>v0.3.27-testnet</b> — <b>the same off-the-lock block serving, now on the local RPC.</b>
+     v0.3.26 moved peer block requests off the consensus lock; the node's own HTTP interface
+     (<code>GET /block</code>, used by the explorer and sync tools) had the same disk read under
+     the lock. It is now served the same way — classify the height under a brief lock, read a
+     pruned body from disk after releasing it — so no block request, over the wire or the RPC,
+     can stall consensus. <b>If you run a node, update.</b> <b>Not a consensus change</b> — nodes
+     update independently. v0.3.0 changed consensus: a node older than that cannot follow the
+     current testnet chain, so if you are on v0.2.x or earlier, update or you will stop syncing.</p>
+  <p class="note"><b>Already on v0.3.26?</b> <code>noctd</code> carries the fix and
      <code>noct-poold</code> was rebuilt with it; <code>noct-cli</code>,
-     <code>noct-walletd</code> and <code>noct-miner</code> are byte-identical to v0.3.25.</p>
+     <code>noct-walletd</code> and <code>noct-miner</code> are byte-identical to v0.3.26.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/Nocturnal-Wallet-Setup-0.3.26.exe">Nocturnal-Wallet-Setup-0.3.26.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.27-testnet/Nocturnal-Wallet-Setup-0.3.27.exe">Nocturnal-Wallet-Setup-0.3.27.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/nocturnal-v0.3.26-testnet-linux-x64.tar.gz">nocturnal-v0.3.26-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.27-testnet/nocturnal-v0.3.27-testnet-linux-x64.tar.gz">nocturnal-v0.3.27-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/nocturnal-v0.3.26-testnet-windows-x64.zip">nocturnal-v0.3.26-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.27-testnet/nocturnal-v0.3.27-testnet-windows-x64.zip">nocturnal-v0.3.27-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.26-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.27-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.27-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and

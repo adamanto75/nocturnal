@@ -1,6 +1,6 @@
 {
   "name": "noct-wallet-desktop",
-  "version": "0.3.26",
+  "version": "0.3.27",
   "description": "Noct desktop wallet",
   "author": "Noct",
   "main": "main.js",
