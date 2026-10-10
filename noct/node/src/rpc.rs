@@ -28,7 +28,7 @@ use noct_core::wire;
 use rand_core::OsRng;
 
 use crate::transport::Peers;
-use crate::NodeState;
+use crate::{GetBlockServe, NodeState};
 
 /// Reject request bodies larger than this.
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -536,13 +536,20 @@ fn handle_client(
                 Ok(h) => h,
                 Err(_) => return respond(reader.get_mut(), "400 Bad Request", "{\"error\":\"bad height\"}"),
             };
-            let node = state.lock().unwrap();
-            // From memory, or from the on-disk log if the body was pruned.
-            match node.block_for_height(height) {
+            // Classify under a brief lock, then read a pruned body from the log
+            // WITHOUT holding it — a client asking for scattered buried heights
+            // must not stall consensus on disk I/O (the same reason the p2p
+            // GetBlock serve goes through `serve_get_block`).
+            let served = { state.lock().unwrap().serve_get_block(height) };
+            let block = match served {
+                GetBlockServe::Reply(Wire::Block(block, txs)) => Some((block, txs)),
+                GetBlockServe::Reply(_) => None, // NoBlock — height we do not have
+                GetBlockServe::FromDisk(reader, h) => reader.read_at(h).ok().flatten(),
+            };
+            match block {
                 Some((block, txs)) => {
                     let msg = Wire::Block(block, txs);
                     let data = hex::encode(wire::encode_message(&msg));
-                    drop(node);
                     respond(
                         reader.get_mut(),
                         "200 OK",
