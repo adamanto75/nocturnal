@@ -56,13 +56,16 @@ chain, so they must not move after launch.
 - [ ] **Fill `MAINNET_SEEDS`** with those hostnames, update the test that
   currently pins it empty, and cut the release built from that tag. This is the
   launch.
-- [ ] **Confirm the baked founder public keys correspond to the securely-held
-  private key** at its off-tree location (per memory:
-  `C:\Users\MINE\Noct-Founder\mainnet-founder.key`). Verify by deriving the
-  public keys from the private key and diffing against the baked constants —
-  **do this yourself; the private key must never enter the repo, a build host, or
-  a cloud-synced folder.** If the baked keys are ever wrong, the premine is
-  unspendable and genesis cannot change after launch.
+- [x] **Baked founder public keys confirmed against the securely-held private
+  key (2026-10-10).** Verified by the founder on their own machine with
+  `noct-cli premine-key-image --wallet <off-tree key>`: it derives the public
+  keys from the private key, refuses unless both match the baked
+  `PREMINE_SPEND_PUBLIC`/`PREMINE_VIEW_PUBLIC`, **and** confirms the key opens the
+  genesis premine output. It printed the founder address + key image (no
+  refusal), so the premine is addressed to, and spendable by, the held key. The
+  private key stayed off-tree throughout (never entered the repo, a build host,
+  or a cloud-synced folder). Remaining human check is identity-only: the founder
+  confirms the printed address is the one they intend.
 
 ## 3. Outstanding requirements — the whitepaper's own bar
 
