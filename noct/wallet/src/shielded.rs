@@ -863,9 +863,15 @@ impl ShieldedWallet {
             keys: &self.keys,
             spends: Vec::new(),
             outputs: vec![(to.inner(), amount)],
-            // No spends, so no membership to prove and nothing for the anchor to
-            // mean. The empty-tree root is what Orchard uses for this case.
-            anchor: Anchor::empty_tree(),
+            // No real spends, but Orchard still pads the bundle with dummy spends
+            // that prove against this anchor. It must be an anchor the chain still
+            // accepts: the empty-tree root is only accepted for the first
+            // ~ANCHOR_DEPTH blocks and then ages out of the node's recent-roots
+            // window, so a shield built against it on a mature chain is rejected
+            // as an UnknownAnchor. Prove against the current tree root instead,
+            // which the node always keeps (and tolerates minor sync lag within the
+            // window). See `anchor_of`.
+            anchor: Anchor::from(self.tree.root()),
             cross: i64::try_from(amount).map_err(|_| ShieldedWalletError::AmountTooLarge)?,
         })
     }
@@ -895,7 +901,7 @@ impl ShieldedWallet {
             keys: &self.keys,
             spends: Vec::new(),
             outputs,
-            anchor: Anchor::empty_tree(),
+            anchor: Anchor::from(self.tree.root()),
             cross: i64::try_from(crossing).map_err(|_| ShieldedWalletError::AmountTooLarge)?,
         })
     }
@@ -920,7 +926,7 @@ impl ShieldedWallet {
             keys: &self.keys,
             spends: Vec::new(),
             outputs: payments.iter().map(|(a, v)| (a.inner(), *v)).collect(),
-            anchor: Anchor::empty_tree(),
+            anchor: Anchor::from(self.tree.root()),
             cross: i64::try_from(total).map_err(|_| ShieldedWalletError::AmountTooLarge)?,
         })
     }
@@ -1061,7 +1067,7 @@ impl ShieldedWallet {
             Some((note, path)) => {
                 Ok(path.root(ExtractedNoteCommitment::from(note.commitment())))
             }
-            None => Ok(Anchor::empty_tree()),
+            None => Ok(Anchor::from(self.tree.root())),
         }
     }
 }

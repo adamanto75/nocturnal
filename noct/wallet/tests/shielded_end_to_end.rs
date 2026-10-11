@@ -774,3 +774,60 @@ fn a_pool_mining_into_the_pool_pays_shielded_miners_privately() {
         "and the turnstile still adds up: ring + shielded == emitted"
     );
 }
+
+/// Regression for F4: a shield built on a **mature** chain must prove against a
+/// current anchor, not the empty-tree root.
+///
+/// The bug: a shield (an output-only Orchard bundle) proved its dummy spends
+/// against `Anchor::empty_tree()`. A node pushes a note-tree root every block and
+/// keeps only the last `ANCHOR_DEPTH` of them, so once the tree is non-empty the
+/// empty-tree root ages out of that window after `ANCHOR_DEPTH` blocks — and every
+/// shield after that was rejected as `UnknownAnchor`. On the live testnet this
+/// broke the shielded pool's main on-ramp from block ~100 on; the short-chain
+/// tests above never reached the window, so it slipped through. The fix proves
+/// against the current tree root, which the node always accepts.
+#[test]
+fn a_shield_on_a_mature_chain_still_validates() {
+    let mut f = Fixture::new();
+    let alice_account = Account::random(&mut OsRng);
+    let mut alice = Wallet::new(alice_account, Network::Mainnet);
+    alice.scan_block(&Block::genesis(), &[]);
+    let alice_addr = alice.address();
+    let mut alice_sh = shielded_wallet(1);
+
+    // Put a note in the tree so it is non-empty (its root then differs from the
+    // empty-tree root, which is the condition under which the empty-tree root can
+    // age out).
+    let note_miner_addr = shielded_wallet(7).address();
+    f.mine(&alice_addr, &[], &mut [&mut alice], &mut [&mut alice_sh]);
+    f.mine_shielded(&note_miner_addr, &[], &mut [&mut alice], &mut [&mut alice_sh]);
+
+    // Warm the chain well past ANCHOR_DEPTH so the empty-tree root the old code
+    // proved against has aged out of the node's accepted-anchor window.
+    let depth = noct_core::shielded_state::ANCHOR_DEPTH;
+    f.warm_up(depth + 20, &mut [&mut alice], &mut [&mut alice_sh]);
+    assert!(alice.balance() > 0, "Alice has ring funds to shield");
+    assert!(
+        f.chain.shielded().notes() > 0,
+        "the tree must be non-empty, or the empty-tree root could not have aged out",
+    );
+
+    let shield_tx = alice
+        .build_shielding(
+            &mut OsRng,
+            &f.chain,
+            &alice_sh,
+            &alice_sh.address(),
+            alice.balance() / 4,
+            10,
+            DEFAULT_RING_SIZE,
+            true,
+        )
+        .expect("a shielding transaction builds");
+    assert!(shield_tx.shielded.is_some());
+    // Before the fix this failed with Shielded(UnknownAnchor): the bundle proved
+    // against the empty-tree root, which the chain no longer accepts.
+    f.chain
+        .validate_tx(&mut OsRng, &shield_tx)
+        .expect("a shield on a mature chain must prove against a current anchor");
+}
