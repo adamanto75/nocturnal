@@ -2688,6 +2688,61 @@ pub(crate) mod tests {
         chain
     }
 
+    /// Regression for F4: spending a RECENT output (as a freshly-funded wallet
+    /// does) must never produce a ring the chain rejects. The recency-biased
+    /// selector draws decoys near the tip, where almost every output is an
+    /// immature coinbase; if any slips its `spendable_at` filter, the node
+    /// rejects the whole transaction as `ImmatureCoinbase`. Built with a real
+    /// maturity window and a chain long enough for the bias to actually reach
+    /// the immature tip region.
+    #[test]
+    fn recency_biased_rings_for_a_recent_output_are_always_spendable() {
+        let maturity = 100u64;
+        let mut chain = Blockchain::with_maturity(KeccakPow, maturity);
+        let miner = Account::random(&mut OsRng);
+        // A mature coinbase to spend, then a long run so the gamma bias reaches
+        // the recent region, with the last `maturity` blocks' coinbases immature.
+        let (received, index) = mine_coinbase(&mut chain, &miner, 1_000);
+        warm_up(&mut chain, 1_200, 1_200);
+        // A recent NON-coinbase output, surrounded by immature coinbases — the
+        // exact shape a just-funded wallet spends in.
+        let fee = ATOMIC_UNITS / 100;
+        let bob = Account::random(&mut OsRng);
+        let tx = build_spend(
+            &chain,
+            &received,
+            index,
+            vec![Payment { destination: address(&bob), amount: received.amount - fee }],
+            fee,
+        );
+        let (block, _) = make_block(&chain, &miner, std::slice::from_ref(&tx), 160_000);
+        chain.add_block(&mut OsRng, &block, std::slice::from_ref(&tx)).unwrap();
+        extend(&mut chain, &miner, 10, 161_000); // bury it under immature coinbases
+
+        // Bob's output is the recent non-coinbase one; find its global index.
+        let bob_member = RingMember::new(tx.outputs[0].one_time_key, tx.outputs[0].commitment);
+        let real = chain.output_index(&bob_member).expect("bob's output is on-chain");
+
+        let tip = chain.height();
+        for _ in 0..5_000 {
+            let (ring, signer) = chain
+                .select_ring_recency_biased(&mut OsRng, RING_SIZE, real)
+                .expect("assembles");
+            for (i, m) in ring.iter().enumerate() {
+                if i == signer {
+                    continue;
+                }
+                let idx = chain.output_index(m).expect("member exists on-chain");
+                assert!(
+                    chain.output_spendable_at(idx, tip),
+                    "selector chose an UNSPENDABLE decoy at index {idx}: meta {:?}, tip {tip}, \
+                     maturity {maturity} — the node would reject the ring as ImmatureCoinbase",
+                    chain.output_meta.get(idx as usize),
+                );
+            }
+        }
+    }
+
     /// Count decoys landing in the newest quarter of the output set, for a
     /// given selector.
     fn near_tip_fraction(
