@@ -289,6 +289,26 @@ impl Mempool {
         self.txs.values().take(max).cloned().collect()
     }
 
+    /// Drop every pooled transaction for which `keep` returns false, each removal
+    /// running through [`remove`](Self::remove) so the byte accounting and the
+    /// key-image index stay consistent. Block-template building calls this with a
+    /// chain-connectivity test so a transaction the chain has outgrown — a spent
+    /// input, or a shielded anchor that has aged out of the node's recent-root
+    /// window — is evicted rather than offered into every template and rejected
+    /// with the block. [`on_block`](Self::on_block) already removes double-spends;
+    /// this covers the rejections `on_block` cannot see.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Transaction) -> bool) {
+        let doomed: Vec<[u8; 32]> = self
+            .txs
+            .iter()
+            .filter(|(_, tx)| !keep(tx))
+            .map(|(h, _)| *h)
+            .collect();
+        for hash in doomed {
+            self.remove(&hash);
+        }
+    }
+
     /// Get a pooled transaction by hash.
     pub fn get(&self, hash: &[u8; 32]) -> Option<&Transaction> {
         self.txs.get(hash)
@@ -375,6 +395,57 @@ mod tests {
 
         // Re-adding is rejected as already-known.
         assert_eq!(pool.add(&mut OsRng, &chain, tx), Err(MempoolError::AlreadyKnown));
+    }
+
+    /// `retain` is what keeps a block template mineable: it must drop the
+    /// transactions a `keep` predicate rejects (the real one being "no longer
+    /// connects to the chain"), and every removal must run through `remove` so
+    /// the byte accounting and the key-image index stay consistent — otherwise
+    /// the pool drifts toward believing itself full, or an evicted
+    /// transaction's input stays wrongly claimed and its replacement is refused.
+    #[test]
+    fn retain_evicts_dropped_transactions_and_frees_their_inputs() {
+        // Two independent spendable coinbase outputs, plus fillers for the ring.
+        let mut chain = Blockchain::with_maturity(KeccakPow, 1);
+        let a1 = Account::random(&mut OsRng);
+        let a2 = Account::random(&mut OsRng);
+        let (src1, idx1) = mine(&mut chain, &a1, 1_000);
+        let (src2, idx2) = mine(&mut chain, &a2, 1_100);
+        let filler = Account::random(&mut OsRng);
+        for i in 0..15 {
+            mine(&mut chain, &filler, 1_300 + i * 130);
+        }
+
+        let bob = Account::random(&mut OsRng);
+        let fee = ATOMIC_UNITS / 100;
+        let tx1 = spend(&chain, &src1, idx1, &bob, src1.amount - fee, fee);
+        let tx2 = spend(&chain, &src2, idx2, &bob, src2.amount - fee, fee);
+        let (h1, h2) = (tx1.hash(), tx2.hash());
+
+        let mut pool = Mempool::new();
+        pool.add(&mut OsRng, &chain, tx1).unwrap();
+        pool.add(&mut OsRng, &chain, tx2).unwrap();
+        assert_eq!(pool.len(), 2);
+        let bytes_before = pool.bytes;
+
+        // Keep only tx2 — as the template builder does when tx1 stops connecting.
+        pool.retain(|tx| tx.hash() == h2);
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.contains(&h1));
+        assert!(pool.contains(&h2));
+        assert!(pool.bytes < bytes_before, "byte accounting must drop on eviction");
+        assert!(
+            pool.select(10).iter().all(|t| t.hash() != h1),
+            "an evicted transaction must never be offered into a template"
+        );
+
+        // The evicted transaction's input is free again: a fresh spend of the
+        // same output is admitted, proving `remove` released the key-image claim.
+        let carol = Account::random(&mut OsRng);
+        let tx1b = spend(&chain, &src1, idx1, &carol, src1.amount - fee * 2, fee * 2);
+        pool.add(&mut OsRng, &chain, tx1b)
+            .expect("the freed input must accept a replacement");
+        assert_eq!(pool.len(), 2);
     }
 
     /// **The floor is relay policy, and the chain must not care about it.**

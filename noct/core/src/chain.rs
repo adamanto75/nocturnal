@@ -926,6 +926,23 @@ impl<P: ProofOfWork> Blockchain<P> {
         Ok(())
     }
 
+    /// Whether `tx` still connects to the current chain state — the cheap,
+    /// proof-free half of [`validate_tx`](Self::validate_tx): its ring members
+    /// still exist, no input is already spent, and (for a shielded spend) its
+    /// anchor is still one the chain will accept. A transaction that passed this
+    /// at mempool admission can stop passing it later: a shielded anchor ages out
+    /// of the recent-root window after `ANCHOR_DEPTH` blocks, and an input can be
+    /// spent by another block. Such a transaction is not a double-spend, so
+    /// [`Mempool::on_block`](crate::mempool::Mempool::on_block) never evicts it —
+    /// yet it can no longer go into a block. Block-template building uses this to
+    /// leave it out (and the mempool to evict it), so one transaction the chain
+    /// has outgrown cannot ride into every template and wedge block production.
+    /// The bundle's proof is not re-verified here: a proof that verified once does
+    /// not later fail — only its anchor can age out, which this checks.
+    pub fn tx_connectable(&self, tx: &Transaction) -> bool {
+        self.check_tx_against_chain(tx).is_ok()
+    }
+
     /// As [`validate_tx`](Self::validate_tx), but defers the shielded bundle's
     /// proof and signatures so a whole block can verify them in one batch
     /// ([`ShieldedBatch`](crate::shielded::ShieldedBatch)). Returns the bundle's

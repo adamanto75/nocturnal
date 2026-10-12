@@ -1808,6 +1808,17 @@ impl NodeState {
         rng: &mut R,
         miner_address: &AnyAddress,
     ) -> Result<MiningJob, CoinbaseError> {
+        // Evict any pooled transaction the chain has outgrown before selecting,
+        // so the template is always mineable. A transaction valid at admission
+        // can become unconnectable later — most importantly a shielded spend
+        // whose anchor has aged out of the node's recent-root window — and it is
+        // not a double-spend, so `Mempool::on_block` never removes it. Left in,
+        // it would ride into every template and make the node reject its own
+        // mined block, wedging the whole network (every node gossips the same
+        // transaction). `chain` is borrowed read-only and `mempool` mutably —
+        // disjoint fields, so this is one borrow each, not a conflict.
+        let chain = &self.chain;
+        self.mempool.retain(|tx| chain.tx_connectable(tx));
         let txs = self.mempool.select(MAX_BLOCK_TXS);
         let fees: u64 = txs.iter().map(|t| t.fee).sum();
         let subsidy = base_reward(self.chain.emitted());
