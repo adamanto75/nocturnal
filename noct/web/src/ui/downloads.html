@@ -17,28 +17,30 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.28-testnet</b> — <b>shielding into the privacy pool works again on a mature chain.</b>
-     A transfer from the transparent (ring) pool into the shielded pool proved its Orchard bundle
-     against the empty note-tree root. A node keeps only its 100 most recent tree roots, so once
-     the shielded tree is non-empty that empty root ages out after 100 blocks, and every such
-     shield was then refused as an unknown anchor. The wallet now proves against the current tree
-     root, which the node always accepts. <b>If you send into the shielded pool, update your
-     wallet</b> — nothing else was affected (shielded coinbase rewards and ring transactions were
-     always fine). <b>Not a consensus change.</b> v0.3.0 changed consensus: a node older than that
-     cannot follow the current testnet chain, so if you are on v0.2.x or earlier, update or you
-     will stop syncing.</p>
-  <p class="note"><b>Already on v0.3.27?</b> The fix is in the wallet — <code>noct-cli</code> and
-     <code>noct-walletd</code> (and the desktop wallet). <code>noctd</code>, <code>noct-poold</code>
-     and <code>noct-miner</code> carry no behavioural change.</p>
+  <p><b>v0.3.29-testnet</b> — <b>a single stuck transaction can no longer wedge the whole
+     network.</b> A node builds each block template from its mempool, but did not re-check that
+     those transactions still connect to the current chain. A transaction valid when it arrived
+     can stop being mineable later — most importantly a shielded transfer whose anchor has aged
+     out of the node's 100-root window — and it is not a double-spend, so nothing evicted it. It
+     then rode into every template, and the node rejected its own mined block, so no one could
+     extend the chain. The node now drops such transactions from the template (and the mempool)
+     before mining, so every template is always mineable. <b>If you run a node or a pool,
+     update.</b> <b>Not a consensus change</b> — the rules for which blocks are valid are
+     unchanged, so updated and un-updated nodes agree about the chain. v0.3.0 changed consensus:
+     a node older than that cannot follow the current testnet chain, so if you are on v0.2.x or
+     earlier, update or you will stop syncing.</p>
+  <p class="note"><b>Already on v0.3.28?</b> The fix is in the node — <code>noctd</code> (and
+     <code>noct-poold</code> by linkage). <code>noct-cli</code> and <code>noct-walletd</code>
+     carry no behavioural change.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.28-testnet/Nocturnal-Wallet-Setup-0.3.28.exe">Nocturnal-Wallet-Setup-0.3.28.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/Nocturnal-Wallet-Setup-0.3.29.exe">Nocturnal-Wallet-Setup-0.3.29.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.28-testnet/nocturnal-v0.3.28-testnet-linux-x64.tar.gz">nocturnal-v0.3.28-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/nocturnal-v0.3.29-testnet-linux-x64.tar.gz">nocturnal-v0.3.29-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.28-testnet/nocturnal-v0.3.28-testnet-windows-x64.zip">nocturnal-v0.3.28-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/nocturnal-v0.3.29-testnet-windows-x64.zip">nocturnal-v0.3.29-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.28-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.28-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
