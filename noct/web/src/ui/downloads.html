@@ -17,30 +17,32 @@
     <a class="btn primary" href="https://github.com/adamanto75/nocturnal/releases">GitHub Releases</a>
     <a class="btn" href="https://github.com/adamanto75/nocturnal">Browse the source</a>
   </div>
-  <p><b>v0.3.29-testnet</b> — <b>a single stuck transaction can no longer wedge the whole
-     network.</b> A node builds each block template from its mempool, but did not re-check that
-     those transactions still connect to the current chain. A transaction valid when it arrived
-     can stop being mineable later — most importantly a shielded transfer whose anchor has aged
-     out of the node's 100-root window — and it is not a double-spend, so nothing evicted it. It
-     then rode into every template, and the node rejected its own mined block, so no one could
-     extend the chain. The node now drops such transactions from the template (and the mempool)
-     before mining, so every template is always mineable. <b>If you run a node or a pool,
-     update.</b> <b>Not a consensus change</b> — the rules for which blocks are valid are
-     unchanged, so updated and un-updated nodes agree about the chain. v0.3.0 changed consensus:
-     a node older than that cannot follow the current testnet chain, so if you are on v0.2.x or
-     earlier, update or you will stop syncing.</p>
-  <p class="note"><b>Already on v0.3.28?</b> The fix is in the node — <code>noctd</code> (and
+  <p><b>v0.3.30-testnet</b> — <b>a reorg no longer corrupts the shielded anchor history, and the
+     testnet is reset.</b> When the chain switched to a heavier branch, the list of note-tree
+     roots a shielded spend may prove against was rolled back by length instead of restored
+     wholesale. Once that list is full it drops its oldest entry as each block adds one, so the
+     length-only undo left the abandoned branch's root in the accepted set and lost a real one. A
+     node that had reorged could then accept a shielded spend proving against a root from a branch
+     that no longer exists — and a node syncing from scratch, which never saw that branch, rejects
+     the block as an unknown anchor. The result was a chain that could not be synced from genesis
+     and that stranded any node on restart (startup re-validates the stored chain). The anchor
+     history is now restored wholesale on every rollback, exactly as the tree and balances already
+     were. <b>If you run a node or a pool, update</b> — and because the broken chain cannot be
+     repaired, <b>the testnet is reset to a fresh chain from genesis</b>: delete your old testnet
+     data directory and resync. Coins on the old chain are gone (they were always valueless
+     testnet coins).</p>
+  <p class="note"><b>Already on v0.3.29?</b> The fix is in the node — <code>noctd</code> (and
      <code>noct-poold</code> by linkage). <code>noct-cli</code> and <code>noct-walletd</code>
-     carry no behavioural change.</p>
+     carry no behavioural change. You must still wipe and resync: the chain itself is new.</p>
   <ul>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/Nocturnal-Wallet-Setup-0.3.29.exe">Nocturnal-Wallet-Setup-0.3.29.exe</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.30-testnet/Nocturnal-Wallet-Setup-0.3.30.exe">Nocturnal-Wallet-Setup-0.3.30.exe</a>
         — <b>Windows desktop wallet</b> (installer)</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/nocturnal-v0.3.29-testnet-linux-x64.tar.gz">nocturnal-v0.3.29-testnet-linux-x64.tar.gz</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.30-testnet/nocturnal-v0.3.30-testnet-linux-x64.tar.gz">nocturnal-v0.3.30-testnet-linux-x64.tar.gz</a>
         — Linux command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/nocturnal-v0.3.29-testnet-windows-x64.zip">nocturnal-v0.3.29-testnet-windows-x64.zip</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.30-testnet/nocturnal-v0.3.30-testnet-windows-x64.zip">nocturnal-v0.3.30-testnet-windows-x64.zip</a>
         — Windows command-line tools</li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
-    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.29-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.30-testnet/SHA256SUMS.txt">SHA256SUMS.txt</a></li>
+    <li><a href="https://github.com/adamanto75/nocturnal/releases/download/v0.3.30-testnet/LINUX-BINARY-SHA256SUMS.txt">LINUX-BINARY-SHA256SUMS.txt</a>
         — the hashes you can <b>reproduce yourself</b></li>
   </ul>
   <p class="note"><b>The installer is not code-signed</b>, so SmartScreen will warn, and
