@@ -99,8 +99,13 @@ pub struct ShieldedUndo {
     totals_before: PoolTotals,
     /// Nullifiers this block added, so they can be taken back out.
     nullifiers_added: Vec<[u8; 32]>,
-    /// How many roots the anchor history held before this block.
-    anchors_before: usize,
+    /// The anchor history exactly as it stood before this block. Stored whole
+    /// (like `frontier_before` and `totals_before`) rather than as a length:
+    /// `apply_block` both appends a root and, once the history is full, drops the
+    /// oldest, so a length cannot rebuild it — truncating to the old length keeps
+    /// the appended (now-orphaned) root and loses a real one, which is a reorg
+    /// hazard, not the safe direction it looks like.
+    anchors_before: Vec<[u8; 32]>,
     /// Whether this block queued a coinbase note, so undo knows to unqueue it.
     coinbase_queued: bool,
     /// Coinbase notes that matured in this block, oldest first, so undo can put
@@ -328,7 +333,7 @@ impl ShieldedState {
             frontier_before: self.tree.clone(),
             totals_before: self.totals,
             nullifiers_added: Vec::new(),
-            anchors_before: self.anchors.len(),
+            anchors_before: self.anchors.clone(),
             coinbase_queued: false,
             coinbase_matured: Vec::new(),
         };
@@ -436,14 +441,14 @@ impl ShieldedState {
     /// Undos must be applied in reverse order, newest first — the same
     /// discipline the rest of the chain's rollback already follows.
     ///
-    /// The anchor history is rebuilt rather than restored: only its length is
-    /// recorded, because the roots themselves are re-derivable and keeping a
-    /// hundred copies of a hundred roots per block is not worth it. Truncating
-    /// to the recorded length is exact whenever the history has not yet been
-    /// trimmed; once it has, the oldest entries are gone and the rebuilt history
-    /// is shorter. That is safe in the only direction that matters: it can make
-    /// the chain refuse an old anchor it would once have accepted, never accept
-    /// one it should not.
+    /// The anchor history is restored wholesale from the copy taken before the
+    /// block, exactly as the frontier and totals are. An earlier version kept
+    /// only the length and truncated to it; that is wrong once the history is
+    /// full, because `apply_block` drops the oldest root as it appends the new
+    /// one, so the appended (now-orphaned) root slides into the kept window and
+    /// truncation leaves it there while losing a genuine old root. A node that
+    /// reorged could then accept a shielded spend against an orphaned root — a
+    /// block a from-scratch replay rejects, which strands the chain on restart.
     pub fn undo_block(&mut self, undo: ShieldedUndo) {
         self.tree = undo.frontier_before;
         self.totals = undo.totals_before;
@@ -459,10 +464,7 @@ impl ShieldedState {
         for entry in undo.coinbase_matured.into_iter().rev() {
             self.pending_coinbase.push_front(entry);
         }
-        self.anchors.truncate(undo.anchors_before.min(self.anchors.len()));
-        if self.anchors.is_empty() {
-            self.anchors.push(self.root());
-        }
+        self.anchors = undo.anchors_before;
     }
 }
 
@@ -905,6 +907,74 @@ mod tests {
         s.undo_block(undo);
         assert!(s.pending_coinbase.is_empty(), "the note must not survive the reorg");
         assert_eq!(s.totals(), PoolTotals::default(), "nor the coins it minted");
+    }
+
+    /// A reorg must restore the anchor history *exactly*, even once it is full
+    /// and `apply_block` has begun dropping its oldest entry as it appends the
+    /// new one. The old length-only undo failed here: truncating to the previous
+    /// length left the undone block's own (now-orphaned) root in the accepted set
+    /// and lost a genuine old one, because the drop-and-append had slid the new
+    /// root into the kept window. A reorged node could then accept a shielded
+    /// spend proving against an orphaned root — a block a from-scratch replay
+    /// rejects as UnknownAnchor, which strands the chain on restart. This is the
+    /// bug that froze the live testnet at height 11125.
+    #[test]
+    fn undo_restores_the_full_anchor_history_once_trimming_has_begun() {
+        // A distinct, valid commitment per block without the cost of proving a
+        // real bundle: `apply_block` only requires the note parse as a field
+        // element (it verifies no proof — that is the chain's batch step), and a
+        // small integer is always a valid Pallas base field element.
+        fn note_for(i: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&(i + 1).to_le_bytes());
+            b
+        }
+        let mut s = ShieldedState::new();
+        let maturity = 1u64;
+        // Grow the history past ANCHOR_DEPTH, a distinct note every block (so
+        // every root differs and any position change is visible), which puts
+        // apply_block firmly into the drop-the-oldest regime.
+        for i in 0..(ANCHOR_DEPTH as u64 + 5) {
+            s.apply_block(std::iter::empty(), CoinbaseCredit::shielded(1_000, 0, note_for(i)), i, maturity)
+                .expect("applies");
+        }
+        assert_eq!(
+            s.accepted_anchors_for_test().len(),
+            ANCHOR_DEPTH,
+            "the history should be full and trimming"
+        );
+        let before = s.accepted_anchors_for_test();
+        let oldest_before = before[0];
+
+        // One more block, then undo it — a single-block reorg.
+        let undo = s
+            .apply_block(
+                std::iter::empty(),
+                CoinbaseCredit::shielded(1_000, 0, note_for(10_000)),
+                ANCHOR_DEPTH as u64 + 5,
+                maturity,
+            )
+            .expect("applies");
+        let orphaned_root = s.root();
+        assert!(
+            s.accepts_anchor(&orphaned_root),
+            "sanity: a live block's root is accepted while it is applied"
+        );
+        s.undo_block(undo);
+
+        assert_eq!(
+            s.accepted_anchors_for_test(),
+            before,
+            "undo must restore the anchor history byte-for-byte"
+        );
+        assert!(
+            !s.accepts_anchor(&orphaned_root),
+            "the undone block's root must NOT survive as an acceptable anchor"
+        );
+        assert!(
+            s.accepts_anchor(&oldest_before),
+            "undo must not drop a genuine old anchor it had before the block"
+        );
     }
 
     /// Undo restores the totals as well as the tree — a reorg that unwound the
