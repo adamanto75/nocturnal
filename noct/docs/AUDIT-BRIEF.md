@@ -1,7 +1,7 @@
 # Nocturnal (NOCT) — third-party security audit brief
 
 Prepared for prospective auditors. Grounded in the code at tag
-`v0.3.27-testnet` (commit `8384b5c`). This document exists so a reviewer can
+`v0.3.30-testnet` (commit `4683c8d`). This document exists so a reviewer can
 scope and quote the engagement accurately, and so budget is spent on the code
 that actually carries risk rather than on re-reviewing audited upstream crates.
 
@@ -92,9 +92,13 @@ Scope is the main lever on price. A sensible engagement is P0+P1 on the code in
 
 - **P0 — monetary integrity & consensus.** Emission curve and total-supply cap;
   the turnstile invariant; the premine (exactly 50%, inside the curve,
-  founder-only); coinbase maturity; double-spend / key-image uniqueness; reorg
-  and rollback correctness; the block store + pruning (serve-from-disk must
-  never corrupt or truncate the chain).
+  founder-only); coinbase maturity; double-spend / key-image uniqueness; **reorg
+  and rollback correctness** — every piece of consensus state (outputs, key
+  images, emission, and especially the shielded pool's tree, anchor window, and
+  nullifiers) must restore *exactly* across a reorg, and a from-genesis replay
+  must accept precisely what online nodes accepted; this is where our most serious
+  finding lived (§5). The block store + pruning (serve-from-disk must never
+  corrupt or truncate the chain) belongs here too.
 - **P0 — the crypto integration glue.** Stealth/one-time key derivation, amount
   commitments and balance, the ring↔shielded boundary, decoy selection
   (anonymity-set quality), nothing-spendable-on-disk guarantees.
@@ -115,6 +119,32 @@ post-mainnet and **not** part of this review.
 We run a continuous adversarial testnet; sharing the fixed-finding history so you
 can calibrate and avoid rediscovery (details in the test suites and commit log):
 
+- **Shielded-anchor reorg-safety — the most instructive finding, and exactly the
+  class this engagement should hunt (consensus).** A reorg restored the shielded
+  pool's accepted-anchor history (the window of recent note-tree roots a spend may
+  prove against) by *length* rather than wholesale. Once that window was full and
+  dropping its oldest entry as each block appended one, the length-only rollback
+  left the abandoned branch's root in the accepted set and dropped a genuine one.
+  A node that had reorged could then accept a shielded spend proving against a root
+  from a branch that no longer exists; that transaction bakes into the canonical
+  chain, but a node syncing from genesis never reproduces the orphaned root and
+  rejects the block as an unknown anchor — so the chain became **un-syncable from
+  scratch and every node stranded on restart** (startup re-validates the stored
+  chain). Valid-when-produced, invalid-on-replay. **Found on the live testnet (a
+  node stranded), not by code review** — the kind of subtle reorg-state bug that
+  only surfaces under real multi-party mining. Fixed by restoring the anchor
+  history wholesale, exactly as the commitment tree and pool balances already
+  were; pinned by a regression test, and the remaining reorg-undo paths were then
+  reviewed for the same class (no other instance: the anchor window was the only
+  append-and-front-prune structure rolled back by a proxy).
+- **Mempool/template liveness deadlock (consensus-adjacent).** The node built each
+  block template straight from the mempool without re-checking that the chosen
+  transactions still connect to the current chain; a transaction that had become
+  unconnectable (an aged-out shielded anchor) rode into every template, so the
+  node rejected its own mined block — and because every node gossips the same
+  transaction, the whole network wedged with no block extending the chain. Fixed
+  by dropping unconnectable transactions from the template (and the mempool)
+  before mining.
 - P2P **address-book eclipse** via gossip flooding (per-source quota added).
 - **Unbounded mempool** (bounded).
 - **HTTP request-head and response head/body** unbounded reads on every server
